@@ -1,0 +1,6 @@
+/target
+*.nanograph
+*.lance
+.DS_Store
+docs/
+.claude/

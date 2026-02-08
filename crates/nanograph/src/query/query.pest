@@ -1,0 +1,83 @@
+// NanoGraph Query Grammar (.gq files)
+
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+COMMENT = _{ LINE_COMMENT | BLOCK_COMMENT }
+LINE_COMMENT = _{ "//" ~ (!"\n" ~ ANY)* }
+BLOCK_COMMENT = _{ "/*" ~ (!"*/" ~ ANY)* ~ "*/" }
+
+query_file = { SOI ~ query_decl* ~ EOI }
+
+query_decl = {
+    "query" ~ ident ~ "(" ~ param_list? ~ ")" ~ "{"
+        ~ match_clause
+        ~ return_clause
+        ~ order_clause?
+        ~ limit_clause?
+    ~ "}"
+}
+
+param_list = { param ~ ("," ~ param)* }
+param = { variable ~ ":" ~ type_ref }
+
+type_ref = { base_type ~ "?"? }
+base_type = { "String" | "Bool" | "I32" | "I64" | "U32" | "U64" | "F32" | "F64" | "DateTime" | "Date" }
+
+match_clause = { "match" ~ "{" ~ clause+ ~ "}" }
+
+clause = { negation | binding | filter | traversal }
+
+// Binding: $p: Person { name: "Alice" }
+binding = { variable ~ ":" ~ type_name ~ ("{" ~ prop_match_list ~ "}")? }
+
+prop_match_list = { prop_match ~ ("," ~ prop_match)* ~ ","? }
+prop_match = { ident ~ ":" ~ match_value }
+match_value = { literal | variable }
+
+// Traversal: $p knows $f
+traversal = { variable ~ edge_ident ~ variable }
+
+// Filter: $f.age > 25
+filter = { expr ~ comp_op ~ expr }
+
+// Negation: not { ... }
+negation = { "not" ~ "{" ~ clause+ ~ "}" }
+
+// Return clause — projections separated by commas or newlines
+return_clause = { "return" ~ "{" ~ projection+ ~ "}" }
+projection = { expr ~ ("as" ~ ident)? ~ ","? }
+
+// Order clause
+order_clause = { "order" ~ "{" ~ ordering ~ ("," ~ ordering)* ~ "}" }
+ordering = { expr ~ order_dir? }
+order_dir = { "asc" | "desc" }
+
+// Limit clause
+limit_clause = { "limit" ~ integer }
+
+// Expressions
+expr = { agg_call | prop_access | variable | literal | ident }
+
+prop_access = { variable ~ "." ~ ident }
+
+agg_call = { agg_func ~ "(" ~ expr ~ ")" }
+agg_func = { "count" | "sum" | "avg" | "min" | "max" }
+
+comp_op = { ">=" | "<=" | "!=" | ">" | "<" | "=" }
+
+// Terminals
+variable = @{ "$" ~ (ident_chars | "_") }
+ident_chars = @{ (ASCII_ALPHA_LOWER | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+
+// Edge identifier — lowercase start, same as ident but used in traversal context
+// Must not match keywords
+edge_ident = @{ !("not" ~ !ASCII_ALPHANUMERIC) ~ (ASCII_ALPHA_LOWER | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+
+type_name = @{ ASCII_ALPHA_UPPER ~ (ASCII_ALPHANUMERIC | "_")* }
+ident = @{ (ASCII_ALPHA_LOWER | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+
+literal = { string_lit | float_lit | integer | bool_lit }
+string_lit = @{ "\"" ~ string_char* ~ "\"" }
+string_char = @{ !("\"" | "\\") ~ ANY | "\\" ~ ANY }
+float_lit = @{ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
+integer = @{ ASCII_DIGIT+ }
+bool_lit = { "true" | "false" }

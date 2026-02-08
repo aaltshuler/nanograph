@@ -1,0 +1,118 @@
+// Star Wars Knowledge Graph — NanoGraph Schema
+// 8 node types, 23 edge types, 59 nodes, 120 edges
+
+// ── Nodes ───────────────────────────────────────────────────────────────────
+
+node Character {
+    name: String
+    note: String
+    species: String
+    gender: String
+    rank: String?
+    era: String
+    alignment: String
+}
+
+node Droid {
+    name: String
+    note: String
+    model: String
+}
+
+node Faction {
+    name: String
+    note: String
+}
+
+node Planet {
+    name: String
+    note: String
+    terrain: String
+}
+
+node Starship {
+    name: String
+    note: String
+    model: String
+    class: String
+    manufacturer: String
+}
+
+node Weapon {
+    name: String
+    note: String
+    weapon_type: String
+    color: String
+}
+
+node Battle {
+    name: String
+    note: String
+    era: String
+    outcome: String
+}
+
+node Location {
+    name: String
+    note: String
+    location_type: String
+}
+
+// ── Family & Personal ───────────────────────────────────────────────────────
+
+edge HasParent: Character -> Character
+edge SiblingOf: Character -> Character
+edge MarriedTo: Character -> Character
+edge ClonedFrom: Character -> Character
+
+// ── Training ────────────────────────────────────────────────────────────────
+
+edge HasMentor: Character -> Character
+
+// ── Affiliation & Ownership ─────────────────────────────────────────────────
+
+edge AffiliatedWith: Character -> Faction
+edge Owns: Character -> Starship
+edge FactionOwns: Faction -> Starship
+edge RulesFaction: Character -> Faction {
+    title: String
+}
+edge RulesPlanet: Character -> Planet {
+    title: String
+}
+
+// ── Origin & Location ───────────────────────────────────────────────────────
+
+edge OriginatesFrom: Character -> Planet
+edge DroidOriginatesFrom: Droid -> Planet
+edge LocatedIn: Character -> Planet {
+    status: String
+}
+edge LocatedAt: Location -> Planet
+
+// ── Conflict & Action ───────────────────────────────────────────────────────
+
+edge Fought: Character -> Character {
+    location: String
+}
+edge Captured: Character -> Character
+edge HiredBy: Character -> Character {
+    purpose: String
+}
+edge ParticipatedIn: Character -> Battle {
+    role: String
+}
+edge TookPlaceOn: Battle -> Planet
+
+// ── Transformation ──────────────────────────────────────────────────────────
+
+edge Becomes: Character -> Character {
+    event: String
+}
+
+// ── Droid & Equipment ───────────────────────────────────────────────────────
+
+edge BuiltBy: Droid -> Character
+edge HasCompanion: Droid -> Droid
+edge HasCoPilot: Character -> Character
+edge Wields: Character -> Weapon

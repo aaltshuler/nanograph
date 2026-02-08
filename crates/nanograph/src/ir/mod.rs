@@ -1,0 +1,71 @@
+pub mod lower;
+
+use std::collections::HashMap;
+
+use crate::query::ast::{AggFunc, CompOp, Literal, Param};
+use crate::types::Direction;
+
+#[derive(Debug, Clone)]
+pub struct QueryIR {
+    pub name: String,
+    pub params: Vec<Param>,
+    pub pipeline: Vec<IROp>,
+    pub return_exprs: Vec<IRProjection>,
+    pub order_by: Vec<IROrdering>,
+    pub limit: Option<u64>,
+}
+
+/// Resolved runtime parameters: param name → literal value.
+pub type ParamMap = HashMap<String, Literal>;
+
+#[derive(Debug, Clone)]
+pub enum IROp {
+    NodeScan {
+        variable: String,
+        type_name: String,
+        filters: Vec<IRFilter>,
+    },
+    Expand {
+        src_var: String,
+        dst_var: String,
+        edge_type: String,
+        direction: Direction,
+        dst_type: String,
+    },
+    Filter(IRFilter),
+    AntiJoin {
+        /// The outer variable whose id is used for the join key
+        outer_var: String,
+        /// The inner pipeline that produces rows to anti-join against
+        inner: Vec<IROp>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct IRFilter {
+    pub left: IRExpr,
+    pub op: CompOp,
+    pub right: IRExpr,
+}
+
+#[derive(Debug, Clone)]
+pub enum IRExpr {
+    PropAccess { variable: String, property: String },
+    Variable(String),
+    Param(String),
+    Literal(Literal),
+    Aggregate { func: AggFunc, arg: Box<IRExpr> },
+    AliasRef(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct IRProjection {
+    pub expr: IRExpr,
+    pub alias: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IROrdering {
+    pub expr: IRExpr,
+    pub descending: bool,
+}

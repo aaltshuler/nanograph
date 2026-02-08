@@ -1,0 +1,250 @@
+// Star Wars Knowledge Graph — NanoGraph Queries
+
+// ── Faction queries ─────────────────────────────────────────────────────────
+
+// All Jedi: characters affiliated with the Jedi Order
+query jedi() {
+    match {
+        $c: Character
+        $c affiliatedWith $f
+        $f.name = "Jedi Order"
+    }
+    return { $c.name, $c.rank, $c.era }
+    order { $c.name asc }
+}
+
+// All Sith
+query sith() {
+    match {
+        $c: Character
+        $c affiliatedWith $f
+        $f.name = "Sith Order"
+    }
+    return { $c.name, $c.rank }
+}
+
+// All Rebels
+query rebels() {
+    match {
+        $c: Character
+        $c affiliatedWith $f
+        $f.name = "Rebel Alliance"
+    }
+    return { $c.name }
+    order { $c.name asc }
+}
+
+// Members of a named faction
+query faction_members($faction: String) {
+    match {
+        $f: Faction { name: $faction }
+        $c affiliatedWith $f
+    }
+    return { $c.name, $c.rank }
+    order { $c.name asc }
+}
+
+// ── Mentor queries ──────────────────────────────────────────────────────────
+
+// Who trained a given character
+query mentors_of($name: String) {
+    match {
+        $c: Character { name: $name }
+        $c hasMentor $m
+    }
+    return { $m.name, $m.rank }
+}
+
+// Students of a given master
+query students_of($name: String) {
+    match {
+        $m: Character { name: $name }
+        $s hasMentor $m
+    }
+    return { $s.name, $s.era }
+    order { $s.name asc }
+}
+
+// Jedi lineage: Yoda's students' students (2-hop)
+query yoda_grand_students() {
+    match {
+        $y: Character { name: "Yoda" }
+        $s hasMentor $y
+        $gs hasMentor $s
+    }
+    return { $s.name, $gs.name }
+    order { $s.name asc }
+}
+
+// ── Family queries ──────────────────────────────────────────────────────────
+
+// Children of a character
+query children_of($name: String) {
+    match {
+        $parent: Character { name: $name }
+        $child hasParent $parent
+    }
+    return { $child.name }
+}
+
+// Parents of a character
+query parents_of($name: String) {
+    match {
+        $child: Character { name: $name }
+        $child hasParent $parent
+    }
+    return { $parent.name }
+}
+
+// ── Combat queries ──────────────────────────────────────────────────────────
+
+// All duels
+query all_duels() {
+    match {
+        $a: Character
+        $a fought $b
+    }
+    return { $a.name, $b.name }
+    order { $a.name asc }
+}
+
+// Who a specific character fought
+query opponents_of($name: String) {
+    match {
+        $c: Character { name: $name }
+        $c fought $opp
+    }
+    return { $opp.name }
+}
+
+// ── Starship queries ────────────────────────────────────────────────────────
+
+// Who owns what starship
+query ship_owners() {
+    match {
+        $c: Character
+        $c owns $s
+    }
+    return { $c.name, $s.name, $s.class }
+    order { $c.name asc }
+}
+
+// ── Weapon queries ──────────────────────────────────────────────────────────
+
+// Character and their weapons
+query wielders() {
+    match {
+        $c: Character
+        $c wields $w
+    }
+    return { $c.name, $w.name, $w.color }
+    order { $c.name asc }
+}
+
+// ── Planet queries ──────────────────────────────────────────────────────────
+
+// Characters from a planet
+query from_planet($planet: String) {
+    match {
+        $p: Planet { name: $planet }
+        $c originatesFrom $p
+    }
+    return { $c.name, $c.species }
+    order { $c.name asc }
+}
+
+// ── Heroes vs Villains ──────────────────────────────────────────────────────
+
+// All heroes
+query heroes() {
+    match {
+        $c: Character
+        $c.alignment = "Hero"
+    }
+    return { $c.name, $c.species, $c.era }
+    order { $c.name asc }
+}
+
+// All villains
+query villains() {
+    match {
+        $c: Character
+        $c.alignment = "Villain"
+    }
+    return { $c.name, $c.species, $c.rank }
+    order { $c.name asc }
+}
+
+// ── Aggregation queries ─────────────────────────────────────────────────────
+
+// Count members per faction
+query faction_sizes() {
+    match {
+        $c: Character
+        $c affiliatedWith $f
+    }
+    return {
+        $f.name
+        count($c) as members
+    }
+    order { members desc }
+}
+
+// Most-mentored characters (who has the most students)
+query top_mentors() {
+    match {
+        $s: Character
+        $s hasMentor $m
+    }
+    return {
+        $m.name
+        count($s) as students
+    }
+    order { students desc }
+}
+
+// Most-battled characters (participated in most battles)
+query battle_veterans() {
+    match {
+        $c: Character
+        $c participatedIn $b
+    }
+    return {
+        $c.name
+        count($b) as battles
+    }
+    order { battles desc }
+    limit 5
+}
+
+// ── Cross-domain queries ────────────────────────────────────────────────────
+
+// Jedi who own starships
+query jedi_pilots() {
+    match {
+        $c: Character
+        $c affiliatedWith $f
+        $f.name = "Jedi Order"
+        $c owns $s
+    }
+    return { $c.name, $s.name }
+}
+
+// Characters not affiliated with any faction
+query unaffiliated() {
+    match {
+        $c: Character
+        not { $c affiliatedWith $_ }
+    }
+    return { $c.name }
+    order { $c.name asc }
+}
+
+// Locations on Tatooine
+query tatooine_locations() {
+    match {
+        $p: Planet { name: "Tatooine" }
+        $loc locatedAt $p
+    }
+    return { $loc.name, $loc.location_type }
+}

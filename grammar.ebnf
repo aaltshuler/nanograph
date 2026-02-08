@@ -1,0 +1,478 @@
+(* ================================================================ *)
+(* NanoGraph Query Language — Formal Grammar (EBNF)                  *)
+(* Version: 0.1                                                      *)
+(*                                                                    *)
+(* Two sub-languages sharing a common lexical base:                  *)
+(*   1. Schema language  (.pg files)                                 *)
+(*   2. Query language   (.gq files)                                 *)
+(*                                                                    *)
+(* Design principles:                                                *)
+(*   - Datalog semantics (conjunctive clauses, variable unification) *)
+(*   - GraphQL-shaped syntax (curly braces, minimal keywords)        *)
+(*   - Compile-time type safety (all queries validated vs. schema)   *)
+(*   - Compiled queries (named, parameterized, checked, then run)    *)
+(* ================================================================ *)
+
+
+(* ================================================================ *)
+(* 1. SCHEMA LANGUAGE                                                *)
+(*                                                                    *)
+(*   node Person {                                                   *)
+(*     name: String                                                  *)
+(*     age:  I32?                                                    *)
+(*   }                                                               *)
+(*                                                                    *)
+(*   node Employee : Person {                                        *)
+(*     employee_id: String @unique                                   *)
+(*   }                                                               *)
+(*                                                                    *)
+(*   edge Knows: Person -> Person {                                  *)
+(*     since: Date?                                                  *)
+(*   }                                                               *)
+(*                                                                    *)
+(*   check valid_age(p: Person) {                                    *)
+(*     p.age >= 0                                                    *)
+(*   }                                                               *)
+(* ================================================================ *)
+
+schema_file     = { schema_decl } ;
+
+schema_decl     = node_decl
+                | edge_decl
+                | check_decl ;
+
+
+(* -- Node type declaration ---------------------------------------- *)
+(*                                                                    *)
+(*   node TypeName { props }                                         *)
+(*   node TypeName : ParentType { props }                            *)
+(*                                                                    *)
+
+node_decl       = "node" , type_name , [ ":" , type_name ] ,
+                  "{" , { prop_decl } , "}" ;
+
+
+(* -- Edge type declaration ---------------------------------------- *)
+(*                                                                    *)
+(*   edge Knows: Person -> Person { props }                          *)
+(*   edge WorksAt: Person -> Company {}                              *)
+(*   edge WorksAt: Person -> Company                                 *)
+(*                                                                    *)
+
+edge_decl       = "edge" , type_name , ":" ,
+                  type_name , "->" , type_name ,
+                  [ "{" , { prop_decl } , "}" ] ;
+
+
+(* -- Property declaration ----------------------------------------- *)
+(*                                                                    *)
+(*   name: String                                                    *)
+(*   age: I32?                  (nullable)                           *)
+(*   email: String @unique                                           *)
+(*   id: U64 @key                                                    *)
+(*                                                                    *)
+
+prop_decl       = ident , ":" , type_ref , { annotation } ;
+
+type_ref        = base_type , [ "?" ] ;
+
+base_type       = "String" | "Bool"
+                | "I32" | "I64" | "U32" | "U64"
+                | "F32" | "F64"
+                | "Date" | "DateTime"
+                | type_name ;               (* user-defined types *)
+
+annotation      = "@" , ident ,
+                  [ "(" , literal , ")" ] ;  (* e.g. @key, @unique, @default("x") *)
+
+
+(* -- Integrity constraint ----------------------------------------- *)
+(*                                                                    *)
+(*   check valid_age(p: Person) {                                    *)
+(*     p.age >= 0                                                    *)
+(*   }                                                               *)
+(*                                                                    *)
+
+check_decl      = "check" , ident ,
+                  "(" , param_list , ")" ,
+                  "{" , expr , "}" ;
+
+
+(* ================================================================ *)
+(* 2. QUERY LANGUAGE                                                 *)
+(*                                                                    *)
+(*   query friends_of($name: String) {                               *)
+(*     match {                                                       *)
+(*       $p: Person { name: $name }                                  *)
+(*       $p knows $f                                                 *)
+(*       $f.age > 25                                                 *)
+(*     }                                                             *)
+(*     return {                                                      *)
+(*       $f.name                                                     *)
+(*       $f.age                                                      *)
+(*     }                                                             *)
+(*     order { $f.name asc }                                         *)
+(*     limit 10                                                      *)
+(*   }                                                               *)
+(*                                                                    *)
+(* A query file contains one or more named queries.                  *)
+(* ================================================================ *)
+
+query_file      = { query_decl } ;
+
+query_decl      = "query" , ident ,
+                  "(" , [ param_list ] , ")" ,
+                  "{" ,
+                    match_clause ,
+                    return_clause ,
+                    [ order_clause ] ,
+                    [ limit_clause ] ,
+                  "}" ;
+
+
+(* -- Match clause ------------------------------------------------- *)
+(*                                                                    *)
+(* Contains one or more clauses, implicitly conjoined (AND).         *)
+(* This is standard Datalog: all clauses must hold simultaneously.   *)
+(*                                                                    *)
+
+match_clause    = "match" , "{" , clause , { clause } , "}" ;
+
+clause          = binding
+                | traversal
+                | filter
+                | negation
+                | optional
+                | disjunction ;
+
+
+(* -- Binding ------------------------------------------------------ *)
+(*                                                                    *)
+(* Bind a variable to a node type, optionally matching properties.   *)
+(*                                                                    *)
+(*   $p: Person                                                      *)
+(*   $p: Person { name: "Alice" }                                    *)
+(*   $p: Person { name: $n, age: 30 }                               *)
+(*                                                                    *)
+
+binding         = variable , ":" , type_name ,
+                  [ "{" , prop_match_list , "}" ] ;
+
+prop_match_list = prop_match , { "," , prop_match } , [ "," ] ;
+
+prop_match      = ident , ":" , ( literal | variable ) ;
+
+
+(* -- Traversal ---------------------------------------------------- *)
+(*                                                                    *)
+(* Edge traversal as a Datalog predicate.                            *)
+(* Direction is inferred from schema (edge endpoint types).          *)
+(*                                                                    *)
+(*   $p knows $f                     basic traversal                 *)
+(*   $p knows $f via $k              with edge binding               *)
+(*   $a knows{1,3} $b               bounded expansion               *)
+(*                                                                    *)
+(* Given  edge Knows: Person -> Person                               *)
+(*   $p knows $f   means  Knows($p, $f)  where $p is src, $f is dst *)
+(*                                                                    *)
+(* Bounded expansion  $a knows{1,3} $b  compiles to:                 *)
+(*   Knows¹($a,$b) ∨ Knows²($a,$b) ∨ Knows³($a,$b)                 *)
+(*   (finite union, no recursion)                                    *)
+(*                                                                    *)
+
+traversal       = variable , edge_ref , variable ,
+                  [ "via" , variable ] ;
+
+edge_ref        = ident , [ bound ] ;
+
+bound           = "{" , integer , "," , integer , "}" ;
+
+
+(* -- Filter ------------------------------------------------------- *)
+(*                                                                    *)
+(* Boolean expression over bound variables and their properties.     *)
+(*                                                                    *)
+(*   $f.age > 25                                                     *)
+(*   $p.name != "Bob"                                                *)
+(*   $k.since > date("2020-01-01")                                   *)
+(*                                                                    *)
+
+filter          = expr , comp_op , expr ;
+
+
+(* -- Negation (stratified) ---------------------------------------- *)
+(*                                                                    *)
+(* At least one variable in the negated block must be bound outside. *)
+(*                                                                    *)
+(*   not { $p worksAt $_ }                                           *)
+(*                                                                    *)
+(* Semantics: ¬∃ matching tuples for the inner clauses.              *)
+(*                                                                    *)
+
+negation        = "not" , "{" , clause , { clause } , "}" ;
+
+
+(* -- Optional (left join) ----------------------------------------- *)
+(*                                                                    *)
+(* Variables bound inside are nullable in the return clause.         *)
+(*                                                                    *)
+(*   maybe { $p worksAt $c }                                         *)
+(*                                                                    *)
+(* If no match, $c is null.                                          *)
+(*                                                                    *)
+
+optional        = "maybe" , "{" , clause , { clause } , "}" ;
+
+
+(* -- Disjunction -------------------------------------------------- *)
+(*                                                                    *)
+(* Each branch is a block of clauses. At least one must match.       *)
+(* At least one variable must be shared across branches.             *)
+(*                                                                    *)
+(*   or {                                                            *)
+(*     { $p.age > 65 }                                               *)
+(*     { $p worksAt $c                                               *)
+(*       $c: Company { name: "Retired" } }                           *)
+(*   }                                                               *)
+(*                                                                    *)
+
+disjunction     = "or" , "{" , branch , branch , { branch } , "}" ;
+
+branch          = "{" , clause , { clause } , "}" ;
+
+
+(* -- Return clause ------------------------------------------------ *)
+(*                                                                    *)
+(*   return {                                                        *)
+(*     $f.name                                                       *)
+(*     $f.age                                                        *)
+(*     $c.name as company                                            *)
+(*     count($f) as num_friends                                      *)
+(*   }                                                               *)
+(*                                                                    *)
+
+return_clause   = "return" , "{" , projection , { projection } , "}" ;
+
+projection      = expr , [ "as" , ident ] ;
+
+
+(* -- Order clause ------------------------------------------------- *)
+(*                                                                    *)
+(*   order { $f.age desc }                                           *)
+(*   order { $p.name asc, $p.age desc }                              *)
+(*                                                                    *)
+
+order_clause    = "order" , "{" ,
+                  ordering , { "," , ordering } ,
+                  "}" ;
+
+ordering        = expr , [ "asc" | "desc" ] ;
+
+
+(* -- Limit clause ------------------------------------------------- *)
+(*                                                                    *)
+(*   limit 10                                                        *)
+(*                                                                    *)
+
+limit_clause    = "limit" , integer ;
+
+
+(* ================================================================ *)
+(* 3. EXPRESSIONS                                                    *)
+(*                                                                    *)
+(*  Expressions appear in filters, check constraints, projections,   *)
+(*  and orderings.                                                   *)
+(*                                                                    *)
+(*  Minimal for v1: property access, literals, comparisons,          *)
+(*  arithmetic, and aggregate functions.                             *)
+(* ================================================================ *)
+
+expr            = primary , [ arith_op , primary ] ;
+
+primary         = agg_call
+                | func_call
+                | prop_access
+                | variable
+                | literal
+                | "(" , expr , ")" ;
+
+
+(* -- Property access ---------------------------------------------- *)
+(*                                                                    *)
+(*   $p.name          node property                                  *)
+(*   $k.since         edge property (via binding)                    *)
+(*                                                                    *)
+
+prop_access     = variable , "." , ident ;
+
+
+(* -- Function / aggregate calls ----------------------------------- *)
+(*                                                                    *)
+(*   count($f)                                                       *)
+(*   sum($p.age)                                                     *)
+(*   avg($p.age)                                                     *)
+(*   min($k.since)                                                   *)
+(*   max($k.since)                                                   *)
+(*   date("2020-01-01")                                              *)
+(*                                                                    *)
+
+agg_call        = agg_func , "(" , expr , ")" ;
+agg_func        = "count" | "sum" | "avg" | "min" | "max" ;
+
+func_call       = ident , "(" , [ expr , { "," , expr } ] , ")" ;
+
+
+(* -- Operators ---------------------------------------------------- *)
+
+comp_op         = "=" | "!=" | ">" | "<" | ">=" | "<=" ;
+arith_op        = "+" | "-" | "*" | "/" ;
+
+
+(* ================================================================ *)
+(* 4. SHARED TERMINALS                                               *)
+(* ================================================================ *)
+
+(* -- Parameters --------------------------------------------------- *)
+
+param_list      = param , { "," , param } ;
+param           = ( variable | ident ) , ":" , type_ref ;
+
+
+(* -- Variables ---------------------------------------------------- *)
+(*                                                                    *)
+(*   $p    named variable                                            *)
+(*   $_    anonymous variable (wildcard, don't-bind)                 *)
+(*                                                                    *)
+
+variable        = "$" , ( ident | "_" ) ;
+
+
+(* -- Identifiers -------------------------------------------------- *)
+(*                                                                    *)
+(*   Lowercase start: property names, edge names, query names.       *)
+(*   Uppercase start: type names.                                    *)
+(*                                                                    *)
+
+ident           = lower , { alpha_num | "_" } ;
+type_name       = upper , { alpha_num } ;
+
+lower           = "a" | ... | "z" | "_" ;
+upper           = "A" | ... | "Z" ;
+alpha_num       = lower | upper | digit ;
+digit           = "0" | ... | "9" ;
+
+
+(* -- Literals ----------------------------------------------------- *)
+
+literal         = string_lit
+                | integer
+                | float_lit
+                | bool_lit ;
+
+string_lit      = '"' , { string_char } , '"' ;
+string_char     = (* any char except " and \, or escape sequence *) ;
+integer         = digit , { digit } ;
+float_lit       = integer , "." , integer ;
+bool_lit        = "true" | "false" ;
+
+
+(* -- Whitespace & comments ---------------------------------------- *)
+(*                                                                    *)
+(*   Whitespace (space, tab, newline) is insignificant between       *)
+(*   tokens. Clauses in match/return blocks are newline-separated    *)
+(*   or comma-separated (both allowed).                              *)
+(*                                                                    *)
+(*   // line comment                                                 *)
+(*   /* block comment */                                             *)
+(*                                                                    *)
+
+WHITESPACE      = " " | "\t" | "\n" | "\r" ;
+LINE_COMMENT    = "//" , { (* any except newline *) } , "\n" ;
+BLOCK_COMMENT   = "/*" , { (* any *) } , "*/" ;
+
+
+(* ================================================================ *)
+(* 5. KEYWORD SUMMARY                                                *)
+(*                                                                    *)
+(*   Schema:  node  edge  check                                      *)
+(*   Query:   query  match  return  order  limit                     *)
+(*   Clause:  not  maybe  or  via  as                                *)
+(*   Order:   asc  desc                                              *)
+(*   Aggr:    count  sum  avg  min  max                              *)
+(*   Literal: true  false                                            *)
+(*                                                                    *)
+(*   Total: 18 reserved words                                        *)
+(* ================================================================ *)
+
+
+(* ================================================================ *)
+(* 6. DESUGARING RULES                                               *)
+(*                                                                    *)
+(* The surface syntax desugars to standard Datalog predicates:       *)
+(*                                                                    *)
+(*   Surface                          Internal                       *)
+(*   ───────────────────────────────  ──────────────────────────     *)
+(*   $p: Person                       Person($p)                     *)
+(*   $p: Person { name: "Alice" }     Person($p), name($p, "Alice") *)
+(*   $p knows $f                      knows($p, $f)                  *)
+(*   $p knows $f via $k               knows($p, $f, $k)             *)
+(*   $f.age > 25                      age($f, ?a), ?a > 25          *)
+(*   not { $p worksAt $_ }            ¬∃c: worksAt($p, c)           *)
+(*   maybe { $p worksAt $c }          worksAt($p, $c)?  (nullable)  *)
+(*   $a knows{1,3} $b                 knows¹($a,$b) ∨ knows²($a,$b) *)
+(*                                    ∨ knows³($a,$b)               *)
+(*                                                                    *)
+(* After desugaring, standard Datalog evaluation applies:            *)
+(*   - Conjunctive clauses (implicit AND)                            *)
+(*   - Variable unification (shared variables = joins)               *)
+(*   - Stratified negation                                           *)
+(*   - Set-at-a-time evaluation                                      *)
+(* ================================================================ *)
+
+
+(* ================================================================ *)
+(* 7. COMPILE-TIME TYPE RULES                                        *)
+(*                                                                    *)
+(* The compiler enforces these rules during  `graph check`:          *)
+(*                                                                    *)
+(* T1. Binding type must exist in schema.                            *)
+(*       $p: Foo    → error if Foo is not a node type                *)
+(*                                                                    *)
+(* T2. Property match fields must exist on the bound type.           *)
+(*       $p: Person { salary: 100 }   → error, no Person.salary     *)
+(*                                                                    *)
+(* T3. Property match values must match declared types.              *)
+(*       $p: Person { age: "old" }    → error, age is I32 not String*)
+(*                                                                    *)
+(* T4. Traversal edge must exist in schema.                          *)
+(*       $p foo $f                    → error if no edge `foo`       *)
+(*                                                                    *)
+(* T5. Traversal endpoints must match edge declaration.              *)
+(*       edge Knows: Person -> Person                                *)
+(*       $c: Company  ...  $c knows $f   → error, Company ≠ Person  *)
+(*                                                                    *)
+(* T6. Property access must reference bound variable's type.         *)
+(*       $p: Person  ...  $p.salary      → error, no Person.salary  *)
+(*                                                                    *)
+(* T7. Comparison operands must have compatible types.               *)
+(*       $p.age > "old"               → error, I32 vs String        *)
+(*                                                                    *)
+(* T8. Aggregations must wrap valid expressions.                     *)
+(*       count($f)   → ok if $f is bound                            *)
+(*       sum($p.name) → error, sum requires numeric type            *)
+(*                                                                    *)
+(* T9. Variables in `not` / `or` blocks:                             *)
+(*       - not: at least one var must be bound outside               *)
+(*       - or: at least one var must be shared across all branches   *)
+(*                                                                    *)
+(* T10. `maybe` bindings are nullable in return clause.              *)
+(*        The compiler tracks nullability through the query.         *)
+(*                                                                    *)
+(* T11. Inheritance: $e: Employee matches Employee and subtypes.     *)
+(*       Property access on $e can use Employee props + Person props *)
+(*       (inherited).                                                *)
+(*                                                                    *)
+(* T12. Bounded expansion {n,m}: n >= 1, m >= n, m is finite.       *)
+(*       No {0,...} (would require optional matching).               *)
+(*       No {n,} (unbounded = recursion, not supported in v1).       *)
+(* ================================================================ *)

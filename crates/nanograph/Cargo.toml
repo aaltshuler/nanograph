@@ -1,0 +1,20 @@
+[package]
+name = "nanograph"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arrow = { workspace = true }
+datafusion = { workspace = true }
+pest = { workspace = true }
+pest_derive = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+lance = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
