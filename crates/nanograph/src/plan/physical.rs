@@ -290,15 +290,17 @@ impl ExpandExec {
             return Ok(RecordBatch::new_empty(self.output_schema.clone()));
         }
 
-        // Filter out entries with unresolvable dst IDs (skip orphaned edges)
-        let valid_indices: Vec<(usize, usize)> = output_row_indices
-            .iter()
-            .filter_map(|(src_idx, dst_id)| {
-                dst_id_to_row
-                    .get(dst_id)
-                    .map(|&dst_row| (*src_idx, dst_row))
-            })
-            .collect();
+        // Resolve destination rows and fail fast if edge references a missing destination.
+        let mut valid_indices: Vec<(usize, usize)> = Vec::with_capacity(output_row_indices.len());
+        for (src_idx, dst_id) in &output_row_indices {
+            let dst_row = dst_id_to_row.get(dst_id).copied().ok_or_else(|| {
+                datafusion::error::DataFusionError::Execution(format!(
+                    "edge {} references missing destination node id {}",
+                    self.edge_type, dst_id
+                ))
+            })?;
+            valid_indices.push((*src_idx, dst_row));
+        }
 
         if valid_indices.is_empty() {
             return Ok(RecordBatch::new_empty(self.output_schema.clone()));

@@ -33,6 +33,32 @@ pub async fn execute_query(
         .execute(0, task_ctx)
         .map_err(|e| NanoError::Execution(e.to_string()))?;
 
+    let has_aggregation = ir
+        .return_exprs
+        .iter()
+        .any(|p| matches!(&p.expr, IRExpr::Aggregate { .. }));
+    let can_stream_batchwise =
+        !has_aggregation && ir.order_by.is_empty() && ir.limit.is_none();
+
+    if can_stream_batchwise {
+        use futures::StreamExt;
+        let mut out = Vec::new();
+        let mut stream = stream;
+        while let Some(batch) = stream.next().await {
+            let batch = batch.map_err(|e| NanoError::Execution(e.to_string()))?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let filtered = apply_ir_filters(&ir.pipeline, &[batch], params)?;
+            if filtered.is_empty() {
+                continue;
+            }
+            let projected = apply_projection(&ir.return_exprs, &filtered, params)?;
+            out.extend(projected.into_iter().filter(|b| b.num_rows() > 0));
+        }
+        return Ok(out);
+    }
+
     let batches: Vec<RecordBatch> = {
         use futures::StreamExt;
         let mut batches = Vec::new();
@@ -52,8 +78,6 @@ pub async fn execute_query(
     let filtered = apply_ir_filters(&ir.pipeline, &batches, params)?;
 
     // Apply return projections
-    let has_aggregation = ir.return_exprs.iter().any(|p| matches!(&p.expr, IRExpr::Aggregate { .. }));
-
     if has_aggregation {
         let result = apply_aggregation(&ir.return_exprs, &filtered, params)?;
         let result = apply_order_and_limit(&result, &ir.order_by, ir.limit)?;
@@ -888,54 +912,110 @@ impl ExecutionPlan for CrossJoinExec {
         partition: usize,
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
-        let left = self.left.clone();
-        let right = self.right.clone();
-        let schema = self.output_schema.clone();
+        enum CrossJoinState {
+            Init {
+                left_stream: SendableRecordBatchStream,
+                right_stream: SendableRecordBatchStream,
+                schema: SchemaRef,
+            },
+            Running {
+                left_stream: SendableRecordBatchStream,
+                right_batches: Vec<RecordBatch>,
+                current_left: Option<RecordBatch>,
+                right_idx: usize,
+                schema: SchemaRef,
+            },
+        }
 
-        let stream = futures::stream::once(async move {
-            use datafusion::physical_plan::common::collect;
-            let left_batches = collect(left.execute(partition, context.clone())?).await?;
-            let right_batches = collect(right.execute(partition, context)?).await?;
+        let left_stream = self.left.execute(partition, context.clone())?;
+        let right_stream = self.right.execute(partition, context)?;
 
-            let mut result_columns: Vec<Vec<arrow::array::ArrayRef>> = Vec::new();
-            let mut total_rows = 0usize;
+        let init = CrossJoinState::Init {
+            left_stream,
+            right_stream,
+            schema: self.output_schema.clone(),
+        };
 
-            for lb in &left_batches {
-                for rb in &right_batches {
-                    let cross = cross_join_batches(lb, rb, &schema)?;
-                    if cross.num_rows() > 0 {
-                        if result_columns.is_empty() {
-                            result_columns.resize(cross.num_columns(), Vec::new());
+        let stream = futures::stream::try_unfold(init, |state| async move {
+            use futures::StreamExt;
+
+            let mut state = state;
+            loop {
+                match state {
+                    CrossJoinState::Init {
+                        left_stream,
+                        mut right_stream,
+                        schema,
+                    } => {
+                        let mut right_batches = Vec::new();
+                        while let Some(batch) = right_stream.next().await {
+                            right_batches.push(batch?);
                         }
-                        total_rows += cross.num_rows();
-                        for (i, col) in cross.columns().iter().enumerate() {
-                            result_columns[i].push(col.clone());
+
+                        if right_batches.is_empty() {
+                            return Ok(None);
                         }
+
+                        state = CrossJoinState::Running {
+                            left_stream,
+                            right_batches,
+                            current_left: None,
+                            right_idx: 0,
+                            schema,
+                        };
+                    }
+                    CrossJoinState::Running {
+                        mut left_stream,
+                        right_batches,
+                        mut current_left,
+                        mut right_idx,
+                        schema,
+                    } => {
+                        if current_left.is_none() {
+                            let next_left = match left_stream.next().await {
+                                Some(batch) => batch?,
+                                None => return Ok(None),
+                            };
+                            current_left = Some(next_left);
+                            right_idx = 0;
+                        }
+
+                        let left_batch = current_left.as_ref().expect("left batch set");
+
+                        while right_idx < right_batches.len() {
+                            let right_batch = &right_batches[right_idx];
+                            right_idx += 1;
+                            let cross = cross_join_batches(left_batch, right_batch, &schema)?;
+                            if cross.num_rows() > 0 {
+                                let next_state = CrossJoinState::Running {
+                                    left_stream,
+                                    right_batches,
+                                    current_left,
+                                    right_idx,
+                                    schema,
+                                };
+                                return Ok(Some((cross, next_state)));
+                            }
+                        }
+
+                        state = CrossJoinState::Running {
+                            left_stream,
+                            right_batches,
+                            current_left: None,
+                            right_idx: 0,
+                            schema,
+                        };
                     }
                 }
             }
-
-            if total_rows == 0 {
-                return Ok(RecordBatch::new_empty(schema));
-            }
-
-            // Concatenate all cross-joined partial batches
-            let mut final_cols = Vec::new();
-            for col_arrays in &result_columns {
-                let refs: Vec<&dyn arrow::array::Array> =
-                    col_arrays.iter().map(|a| a.as_ref()).collect();
-                let concatenated = arrow::compute::concat(&refs)?;
-                final_cols.push(concatenated);
-            }
-
-            RecordBatch::try_new(schema, final_cols)
-                .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
         });
 
-        Ok(Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-            self.output_schema.clone(),
-            stream,
-        )))
+        Ok(Box::pin(
+            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                self.output_schema.clone(),
+                stream,
+            ),
+        ))
     }
 }
 
@@ -1064,82 +1144,128 @@ impl ExecutionPlan for AntiJoinExec {
         partition: usize,
         context: Arc<datafusion::execution::context::TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
-        let outer = self.outer.clone();
-        let inner = self.inner.clone();
-        let join_var = self.join_var.clone();
-        let schema = self.output_schema.clone();
+        enum AntiJoinState {
+            Init {
+                outer_stream: SendableRecordBatchStream,
+                inner_stream: SendableRecordBatchStream,
+                join_var: String,
+            },
+            Running {
+                outer_stream: SendableRecordBatchStream,
+                inner_ids: std::collections::HashSet<u64>,
+                join_var: String,
+            },
+        }
 
-        let stream = futures::stream::once(async move {
-            use datafusion::physical_plan::common::collect;
-            let outer_batches = collect(outer.execute(partition, context.clone())?).await?;
-            let inner_batches = collect(inner.execute(partition, context)?).await?;
+        let outer_stream = self.outer.execute(partition, context.clone())?;
+        let inner_stream = self.inner.execute(partition, context)?;
 
-            // Collect inner IDs
-            let mut inner_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
-            for batch in &inner_batches {
-                if let Ok(col_idx) = batch.schema().index_of(&join_var) {
-                    let col = batch.column(col_idx);
-                    if let Some(struct_arr) = col.as_any().downcast_ref::<StructArray>() {
-                        if let Some(id_col) = struct_arr.column_by_name("id") {
-                            if let Some(id_arr) = id_col.as_any().downcast_ref::<arrow::array::UInt64Array>() {
-                                for i in 0..id_arr.len() {
-                                    inner_ids.insert(id_arr.value(i));
+        let init = AntiJoinState::Init {
+            outer_stream,
+            inner_stream,
+            join_var: self.join_var.clone(),
+        };
+
+        let stream = futures::stream::try_unfold(init, |state| async move {
+            use futures::StreamExt;
+
+            let mut state = state;
+            loop {
+                match state {
+                    AntiJoinState::Init {
+                        outer_stream,
+                        mut inner_stream,
+                        join_var,
+                    } => {
+                        let mut inner_ids: std::collections::HashSet<u64> =
+                            std::collections::HashSet::new();
+
+                        while let Some(batch) = inner_stream.next().await {
+                            let batch = batch?;
+                            if let Ok(col_idx) = batch.schema().index_of(&join_var) {
+                                let col = batch.column(col_idx);
+                                if let Some(struct_arr) = col.as_any().downcast_ref::<StructArray>()
+                                {
+                                    if let Some(id_col) = struct_arr.column_by_name("id") {
+                                        if let Some(id_arr) = id_col
+                                            .as_any()
+                                            .downcast_ref::<arrow::array::UInt64Array>()
+                                        {
+                                            for i in 0..id_arr.len() {
+                                                inner_ids.insert(id_arr.value(i));
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
-                    }
-                }
-            }
 
-            // Filter outer: keep rows where join_var.id NOT IN inner_ids
-            let mut result_columns: Vec<Vec<arrow::array::ArrayRef>> = Vec::new();
-            let mut total_rows = 0usize;
-            for batch in &outer_batches {
-                if let Ok(col_idx) = batch.schema().index_of(&join_var) {
-                    let col = batch.column(col_idx);
-                    if let Some(struct_arr) = col.as_any().downcast_ref::<StructArray>() {
-                        if let Some(id_col) = struct_arr.column_by_name("id") {
-                            if let Some(id_arr) = id_col.as_any().downcast_ref::<arrow::array::UInt64Array>() {
-                                let mask = arrow::array::BooleanArray::from(
-                                    (0..id_arr.len())
-                                        .map(|i| !inner_ids.contains(&id_arr.value(i)))
-                                        .collect::<Vec<_>>(),
-                                );
-                                let filtered = arrow::compute::filter_record_batch(batch, &mask)?;
-                                if filtered.num_rows() > 0 {
-                                    if result_columns.is_empty() {
-                                        result_columns.resize(filtered.num_columns(), Vec::new());
-                                    }
-                                    total_rows += filtered.num_rows();
-                                    for (i, col) in filtered.columns().iter().enumerate() {
-                                        result_columns[i].push(col.clone());
-                                    }
-                                }
+                        state = AntiJoinState::Running {
+                            outer_stream,
+                            inner_ids,
+                            join_var,
+                        };
+                    }
+                    AntiJoinState::Running {
+                        mut outer_stream,
+                        inner_ids,
+                        join_var,
+                    } => {
+                        while let Some(batch) = outer_stream.next().await {
+                            let batch = batch?;
+                            let col_idx = batch.schema().index_of(&join_var)?;
+                            let col = batch.column(col_idx);
+                            let struct_arr = col.as_any().downcast_ref::<StructArray>().ok_or_else(
+                                || {
+                                    datafusion::error::DataFusionError::Execution(format!(
+                                        "column {} is not a struct",
+                                        join_var
+                                    ))
+                                },
+                            )?;
+                            let id_col = struct_arr.column_by_name("id").ok_or_else(|| {
+                                datafusion::error::DataFusionError::Execution(format!(
+                                    "struct {} has no id field",
+                                    join_var
+                                ))
+                            })?;
+                            let id_arr = id_col
+                                .as_any()
+                                .downcast_ref::<arrow::array::UInt64Array>()
+                                .ok_or_else(|| {
+                                    datafusion::error::DataFusionError::Execution(format!(
+                                        "struct {} id field is not UInt64",
+                                        join_var
+                                    ))
+                                })?;
+
+                            let mask = arrow::array::BooleanArray::from(
+                                (0..id_arr.len())
+                                    .map(|i| !inner_ids.contains(&id_arr.value(i)))
+                                    .collect::<Vec<_>>(),
+                            );
+                            let filtered = arrow::compute::filter_record_batch(&batch, &mask)?;
+                            if filtered.num_rows() > 0 {
+                                let next_state = AntiJoinState::Running {
+                                    outer_stream,
+                                    inner_ids,
+                                    join_var,
+                                };
+                                return Ok(Some((filtered, next_state)));
                             }
                         }
+
+                        return Ok(None);
                     }
                 }
             }
-
-            if total_rows == 0 {
-                return Ok(RecordBatch::new_empty(schema));
-            }
-
-            let mut final_cols = Vec::new();
-            for col_arrays in &result_columns {
-                let refs: Vec<&dyn arrow::array::Array> =
-                    col_arrays.iter().map(|a| a.as_ref()).collect();
-                let concatenated = arrow::compute::concat(&refs)?;
-                final_cols.push(concatenated);
-            }
-
-            RecordBatch::try_new(schema, final_cols)
-                .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
         });
 
-        Ok(Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
-            self.output_schema.clone(),
-            stream,
-        )))
+        Ok(Box::pin(
+            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                self.output_schema.clone(),
+                stream,
+            ),
+        ))
     }
 }

@@ -201,6 +201,52 @@ query q() {
 }
 
 #[tokio::test]
+async fn test_orphan_edge_destination_fails_execution() {
+    let schema = parse_schema(test_schema()).unwrap();
+    let catalog = build_catalog(&schema).unwrap();
+    let mut storage = GraphStorage::new(catalog.clone());
+
+    let person_schema = Arc::new(Schema::new(vec![
+        Field::new("name", DataType::Utf8, false),
+        Field::new("age", DataType::Int32, true),
+    ]));
+    let people = RecordBatch::try_new(
+        person_schema,
+        vec![
+            Arc::new(StringArray::from(vec!["Alice"])),
+            Arc::new(Int32Array::from(vec![Some(30)])),
+        ],
+    )
+    .unwrap();
+    let person_ids = storage.insert_nodes("Person", people).unwrap();
+
+    // Insert an orphan edge pointing to a non-existent destination ID.
+    storage
+        .insert_edges("Knows", &[person_ids[0]], &[999_999], None)
+        .unwrap();
+    storage.build_indices().unwrap();
+    let storage = Arc::new(storage);
+
+    let query = r#"
+query q() {
+    match {
+        $p: Person { name: "Alice" }
+        $p knows $f
+    }
+    return { $f.name }
+}
+"#;
+
+    let qf = parse_query(query).unwrap();
+    let q = &qf.queries[0];
+    let tc = typecheck_query(&storage.catalog, q).unwrap();
+    let ir = lower_query(&storage.catalog, q, &tc).unwrap();
+    let err = execute_query(&ir, storage, &ParamMap::new()).await.unwrap_err();
+
+    assert!(err.to_string().contains("missing destination node id"));
+}
+
+#[tokio::test]
 async fn test_two_hop_traversal() {
     let storage = setup_storage();
     let results = run_query_test(
