@@ -11,11 +11,11 @@ schema_decl = { node_decl | edge_decl }
 
 // node Person { ... }
 // node Employee : Person { ... }
-node_decl = { "node" ~ type_name ~ (":" ~ type_name)? ~ "{" ~ prop_decl* ~ "}" }
+node_decl = { "node" ~ type_name ~ annotation* ~ (":" ~ type_name)? ~ "{" ~ prop_decl* ~ "}" }
 
 // edge Knows: Person -> Person { ... }
 // edge Knows: Person -> Person
-edge_decl = { "edge" ~ type_name ~ ":" ~ type_name ~ "->" ~ type_name ~ ("{" ~ prop_decl* ~ "}")? }
+edge_decl = { "edge" ~ type_name ~ ":" ~ type_name ~ "->" ~ type_name ~ annotation* ~ ("{" ~ prop_decl* ~ "}")? }
 
 prop_decl = { ident ~ ":" ~ type_ref ~ annotation* }
 

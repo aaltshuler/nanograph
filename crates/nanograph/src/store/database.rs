@@ -6,6 +6,7 @@ use arrow::record_batch::{RecordBatch, RecordBatchIterator};
 use futures::StreamExt;
 use lance::dataset::{WriteMode, WriteParams};
 use lance::Dataset;
+use tracing::{debug, info, instrument};
 
 use crate::catalog::schema_ir::{build_catalog_from_ir, build_schema_ir, SchemaIR};
 use crate::catalog::Catalog;
@@ -13,7 +14,8 @@ use crate::error::{NanoError, Result};
 use crate::schema::parser::parse_schema;
 use crate::store::graph::GraphStorage;
 use crate::store::loader::load_jsonl_data;
-use crate::store::manifest::{DatasetEntry, GraphManifest};
+use crate::store::manifest::{hash_string, DatasetEntry, GraphManifest};
+use crate::store::migration::reconcile_migration_sidecars;
 
 const SCHEMA_PG_FILENAME: &str = "schema.pg";
 const SCHEMA_IR_FILENAME: &str = "schema.ir.json";
@@ -27,7 +29,9 @@ pub struct Database {
 
 impl Database {
     /// Create a new database directory from schema source text.
+    #[instrument(skip(schema_source), fields(db_path = %db_path.display()))]
     pub async fn init(db_path: &Path, schema_source: &str) -> Result<Self> {
+        info!("initializing database");
         // Parse and validate schema
         let schema_file = parse_schema(schema_source)?;
         let schema_ir = build_schema_ir(&schema_file)?;
@@ -48,10 +52,14 @@ impl Database {
 
         // Write empty manifest
         let ir_hash = hash_string(&ir_json);
-        let manifest = GraphManifest::new(ir_hash);
+        let mut manifest = GraphManifest::new(ir_hash);
+        let (next_type_id, next_prop_id) = next_schema_identity_counters(&schema_ir);
+        manifest.next_type_id = next_type_id;
+        manifest.next_prop_id = next_prop_id;
         manifest.write_atomic(db_path)?;
 
         let storage = GraphStorage::new(catalog.clone());
+        info!("database initialized");
 
         Ok(Database {
             path: db_path.to_path_buf(),
@@ -62,7 +70,10 @@ impl Database {
     }
 
     /// Open an existing database.
+    #[instrument(fields(db_path = %db_path.display()))]
     pub async fn open(db_path: &Path) -> Result<Self> {
+        info!("opening database");
+        reconcile_migration_sidecars(db_path)?;
         if !db_path.exists() {
             return Err(NanoError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -100,6 +111,12 @@ impl Database {
         // Load only datasets listed in the manifest (authoritative source)
         for entry in &manifest.datasets {
             let dir_name = SchemaIR::dir_name(entry.type_id);
+            debug!(
+                kind = %entry.kind,
+                type_name = %entry.type_name,
+                row_count = entry.row_count,
+                "restoring dataset from manifest"
+            );
             match entry.kind.as_str() {
                 "node" => {
                     let dataset_path = db_path.join("nodes").join(&dir_name);
@@ -125,6 +142,11 @@ impl Database {
 
         // Build CSR/CSC indices
         storage.build_indices()?;
+        info!(
+            node_types = storage.node_segments.len(),
+            edge_types = storage.edge_segments.len(),
+            "database open complete"
+        );
 
         Ok(Database {
             path: db_path.to_path_buf(),
@@ -135,7 +157,9 @@ impl Database {
     }
 
     /// Load JSONL data. For v1, full replacement (WriteMode::Overwrite).
+    #[instrument(skip(self, data_source))]
     pub async fn load(&mut self, data_source: &str) -> Result<()> {
+        info!("starting database load");
         // Reset storage for full replacement
         self.storage = GraphStorage::new(self.catalog.clone());
 
@@ -146,6 +170,11 @@ impl Database {
         // Write each node type to Lance
         for node_def in self.schema_ir.node_types() {
             if let Some(batch) = self.storage.get_all_nodes(&node_def.name)? {
+                debug!(
+                    node_type = %node_def.name,
+                    rows = batch.num_rows(),
+                    "writing node dataset"
+                );
                 let dir_name = SchemaIR::dir_name(node_def.type_id);
                 let dataset_path = self.path.join("nodes").join(&dir_name);
                 write_lance_batch(&dataset_path, batch).await?;
@@ -155,6 +184,11 @@ impl Database {
         // Write each edge type to Lance
         for edge_def in self.schema_ir.edge_types() {
             if let Some(batch) = self.storage.edge_batch_for_save(&edge_def.name)? {
+                debug!(
+                    edge_type = %edge_def.name,
+                    rows = batch.num_rows(),
+                    "writing edge dataset"
+                );
                 let dir_name = SchemaIR::dir_name(edge_def.type_id);
                 let dataset_path = self.path.join("edges").join(&dir_name);
                 write_lance_batch(&dataset_path, batch).await?;
@@ -169,6 +203,9 @@ impl Database {
         let mut manifest = GraphManifest::new(ir_hash);
         manifest.next_node_id = self.storage.next_node_id();
         manifest.next_edge_id = self.storage.next_edge_id();
+        let (next_type_id, next_prop_id) = next_schema_identity_counters(&self.schema_ir);
+        manifest.next_type_id = next_type_id;
+        manifest.next_prop_id = next_prop_id;
 
         for node_def in self.schema_ir.node_types() {
             if let Some(batch) = self.storage.get_all_nodes(&node_def.name)? {
@@ -199,6 +236,11 @@ impl Database {
 
         // Clean up stale Lance dirs not in the new manifest
         cleanup_stale_dirs(&self.path, &manifest)?;
+        info!(
+            node_types = self.storage.node_segments.len(),
+            edge_types = self.storage.edge_segments.len(),
+            "database load complete"
+        );
 
         Ok(())
     }
@@ -249,6 +291,11 @@ fn cleanup_stale_dirs(db_path: &Path, manifest: &GraphManifest) -> Result<()> {
 // ── Lance helpers ───────────────────────────────────────────────────────────
 
 async fn write_lance_batch(path: &Path, batch: RecordBatch) -> Result<()> {
+    info!(
+        dataset_path = %path.display(),
+        rows = batch.num_rows(),
+        "writing Lance dataset"
+    );
     let schema = batch.schema();
     let uri = path.to_string_lossy().to_string();
 
@@ -267,6 +314,10 @@ async fn write_lance_batch(path: &Path, batch: RecordBatch) -> Result<()> {
 }
 
 async fn read_lance_batches(path: &Path) -> Result<Vec<RecordBatch>> {
+    info!(
+        dataset_path = %path.display(),
+        "reading Lance dataset"
+    );
     let uri = path.to_string_lossy().to_string();
     let dataset = Dataset::open(&uri)
         .await
@@ -286,19 +337,37 @@ async fn read_lance_batches(path: &Path) -> Result<Vec<RecordBatch>> {
     Ok(batches)
 }
 
-/// Simple FNV-1a hash of a string → hex.
-fn hash_string(s: &str) -> String {
-    let mut hash: u64 = 14695981039346656037;
-    for byte in s.bytes() {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(1099511628211);
+fn next_schema_identity_counters(ir: &SchemaIR) -> (u32, u32) {
+    use crate::catalog::schema_ir::TypeDef;
+
+    let mut max_type_id = 0u32;
+    let mut max_prop_id = 0u32;
+    for ty in &ir.types {
+        match ty {
+            TypeDef::Node(n) => {
+                max_type_id = max_type_id.max(n.type_id);
+                for p in &n.properties {
+                    max_prop_id = max_prop_id.max(p.prop_id);
+                }
+            }
+            TypeDef::Edge(e) => {
+                max_type_id = max_type_id.max(e.type_id);
+                for p in &e.properties {
+                    max_prop_id = max_prop_id.max(p.prop_id);
+                }
+            }
+        }
     }
-    format!("{:016x}", hash)
+    (
+        max_type_id.saturating_add(1).max(1),
+        max_prop_id.saturating_add(1).max(1),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     fn test_schema_src() -> &'static str {
         r#"node Person {
@@ -326,52 +395,49 @@ edge WorksAt: Person -> Company
 "#
     }
 
-    fn unique_test_dir(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "nanograph_{}_{}", name, std::process::id()
-        ))
+    fn test_dir(name: &str) -> TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("nanograph_{}_", name))
+            .tempdir()
+            .unwrap()
     }
 
     #[tokio::test]
     async fn test_init_creates_directory_structure() {
-        let dir = unique_test_dir("init");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = test_dir("init");
+        let path = dir.path();
 
-        let db = Database::init(&dir, test_schema_src()).await.unwrap();
+        let db = Database::init(path, test_schema_src()).await.unwrap();
 
-        assert!(dir.join("schema.pg").exists());
-        assert!(dir.join("schema.ir.json").exists());
-        assert!(dir.join("graph.manifest.json").exists());
-        assert!(dir.join("nodes").exists());
-        assert!(dir.join("edges").exists());
+        assert!(path.join("schema.pg").exists());
+        assert!(path.join("schema.ir.json").exists());
+        assert!(path.join("graph.manifest.json").exists());
+        assert!(path.join("nodes").exists());
+        assert!(path.join("edges").exists());
 
         assert_eq!(db.catalog.node_types.len(), 2);
         assert_eq!(db.catalog.edge_types.len(), 2);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn test_open_fresh_db() {
-        let dir = unique_test_dir("open_fresh");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = test_dir("open_fresh");
+        let path = dir.path();
 
-        Database::init(&dir, test_schema_src()).await.unwrap();
-        let db = Database::open(&dir).await.unwrap();
+        Database::init(path, test_schema_src()).await.unwrap();
+        let db = Database::open(path).await.unwrap();
 
         assert_eq!(db.catalog.node_types.len(), 2);
         assert_eq!(db.catalog.edge_types.len(), 2);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn test_load_and_reopen_preserves_data() {
-        let dir = unique_test_dir("load_reopen");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = test_dir("load_reopen");
+        let path = dir.path();
 
         // Init + load
-        let mut db = Database::init(&dir, test_schema_src()).await.unwrap();
+        let mut db = Database::init(path, test_schema_src()).await.unwrap();
         db.load(test_data_src()).await.unwrap();
 
         // Verify in-memory
@@ -379,7 +445,7 @@ edge WorksAt: Person -> Company
         assert_eq!(persons.num_rows(), 3);
 
         // Reopen
-        let db2 = Database::open(&dir).await.unwrap();
+        let db2 = Database::open(path).await.unwrap();
         let persons2 = db2.storage.get_all_nodes("Person").unwrap().unwrap();
         assert_eq!(persons2.num_rows(), 3);
 
@@ -390,29 +456,33 @@ edge WorksAt: Person -> Company
         let knows_seg = &db2.storage.edge_segments["Knows"];
         assert_eq!(knows_seg.edge_ids.len(), 2);
         assert!(knows_seg.csr.is_some());
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn test_load_reopen_query() {
-        let dir = unique_test_dir("load_query");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = test_dir("load_query");
+        let path = dir.path();
 
-        let mut db = Database::init(&dir, test_schema_src()).await.unwrap();
+        let mut db = Database::init(path, test_schema_src()).await.unwrap();
         db.load(test_data_src()).await.unwrap();
         drop(db);
 
         // Reopen and verify CSR is functional
-        let db2 = Database::open(&dir).await.unwrap();
+        let db2 = Database::open(path).await.unwrap();
         let snapshot = db2.snapshot();
 
         // Find Alice's id from the Person node segment
         let persons = snapshot.get_all_nodes("Person").unwrap().unwrap();
-        let id_col = persons.column(0).as_any()
-            .downcast_ref::<arrow::array::UInt64Array>().unwrap();
-        let name_col = persons.column(1).as_any()
-            .downcast_ref::<arrow::array::StringArray>().unwrap();
+        let id_col = persons
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .unwrap();
+        let name_col = persons
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
         let alice_id = (0..persons.num_rows())
             .find(|&i| name_col.value(i) == "Alice")
             .map(|i| id_col.value(i))
@@ -422,7 +492,5 @@ edge WorksAt: Person -> Company
         let csr = knows_seg.csr.as_ref().unwrap();
         let alice_friends = csr.neighbors(alice_id);
         assert_eq!(alice_friends.len(), 2);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

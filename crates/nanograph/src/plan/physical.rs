@@ -2,6 +2,7 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
+use ahash::AHashMap;
 use arrow::array::{Array, ArrayRef, RecordBatch, StructArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::Result;
@@ -48,11 +49,7 @@ impl ExpandExec {
             .iter()
             .map(|f| f.as_ref().clone())
             .collect();
-        let dst_field = Field::new(
-            &dst_var,
-            DataType::Struct(dst_struct_fields.into()),
-            false,
-        );
+        let dst_field = Field::new(&dst_var, DataType::Struct(dst_struct_fields.into()), false);
 
         let mut output_fields: Vec<Field> = input_schema
             .fields()
@@ -149,9 +146,9 @@ impl ExecutionPlan for ExpandExec {
 
             // Create an ExpandExec with the real input plan for correct output_schema
             let expand = ExpandExec {
-                input: Arc::new(datafusion::physical_plan::empty::EmptyExec::new(
-                    Arc::new(Schema::new(Vec::<Field>::new())),
-                )),
+                input: Arc::new(datafusion::physical_plan::empty::EmptyExec::new(Arc::new(
+                    Schema::new(Vec::<Field>::new()),
+                ))),
                 src_var,
                 dst_var,
                 edge_type,
@@ -210,10 +207,16 @@ impl ExecutionPlan for ExpandExec {
 
 impl ExpandExec {
     fn expand_batch(&self, input: &RecordBatch) -> Result<RecordBatch> {
-        let edge_seg = self.storage.edge_segments.get(&self.edge_type)
-            .ok_or_else(|| datafusion::error::DataFusionError::Execution(
-                format!("edge type {} not found", self.edge_type)
-            ))?;
+        let edge_seg = self
+            .storage
+            .edge_segments
+            .get(&self.edge_type)
+            .ok_or_else(|| {
+                datafusion::error::DataFusionError::Execution(format!(
+                    "edge type {} not found",
+                    self.edge_type
+                ))
+            })?;
 
         let csr = match self.direction {
             Direction::Out => edge_seg.csr.as_ref(),
@@ -239,11 +242,11 @@ impl ExpandExec {
             })?;
 
         // Get the id field from the struct
-        let id_col = src_struct
-            .column_by_name("id")
-            .ok_or_else(|| {
-                datafusion::error::DataFusionError::Execution("no id field in source struct".to_string())
-            })?;
+        let id_col = src_struct.column_by_name("id").ok_or_else(|| {
+            datafusion::error::DataFusionError::Execution(
+                "no id field in source struct".to_string(),
+            )
+        })?;
         let id_array = id_col
             .as_any()
             .downcast_ref::<UInt64Array>()
@@ -252,7 +255,9 @@ impl ExpandExec {
             })?;
 
         // Get destination node data
-        let dst_all_nodes = self.storage.get_all_nodes(&self.dst_type)
+        let dst_all_nodes = self
+            .storage
+            .get_all_nodes(&self.dst_type)
             .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
         let dst_batch = match &dst_all_nodes {
             Some(b) => b,
@@ -268,9 +273,11 @@ impl ExpandExec {
             .as_any()
             .downcast_ref::<UInt64Array>()
             .ok_or_else(|| {
-                datafusion::error::DataFusionError::Execution("dst id column is not UInt64".to_string())
+                datafusion::error::DataFusionError::Execution(
+                    "dst id column is not UInt64".to_string(),
+                )
             })?;
-        let mut dst_id_to_row: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+        let mut dst_id_to_row: AHashMap<u64, usize> = AHashMap::new();
         for row in 0..dst_id_col.len() {
             dst_id_to_row.insert(dst_id_col.value(row), row);
         }
@@ -333,11 +340,7 @@ impl ExpandExec {
             .iter()
             .map(|f| f.as_ref().clone())
             .collect();
-        let dst_struct_array = StructArray::new(
-            dst_struct_fields.into(),
-            dst_field_arrays,
-            None,
-        );
+        let dst_struct_array = StructArray::new(dst_struct_fields.into(), dst_field_arrays, None);
         output_columns.push(Arc::new(dst_struct_array));
 
         RecordBatch::try_new(self.output_schema.clone(), output_columns)

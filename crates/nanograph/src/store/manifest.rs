@@ -12,6 +12,12 @@ pub struct GraphManifest {
     pub schema_ir_hash: String,
     pub next_node_id: u64,
     pub next_edge_id: u64,
+    #[serde(default)]
+    pub next_type_id: u32,
+    #[serde(default)]
+    pub next_prop_id: u32,
+    #[serde(default)]
+    pub schema_identity_version: u32,
     pub datasets: Vec<DatasetEntry>,
 }
 
@@ -30,6 +36,9 @@ impl GraphManifest {
             schema_ir_hash,
             next_node_id: 0,
             next_edge_id: 0,
+            next_type_id: 0,
+            next_prop_id: 0,
+            schema_identity_version: 1,
             datasets: Vec::new(),
         }
     }
@@ -61,16 +70,25 @@ impl GraphManifest {
     }
 }
 
+/// Simple FNV-1a hash of a string -> hex.
+pub(crate) fn hash_string(s: &str) -> String {
+    let mut hash: u64 = 14695981039346656037;
+    for byte in s.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(1099511628211);
+    }
+    format!("{:016x}", hash)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use tempfile::TempDir;
 
     #[test]
     fn test_manifest_roundtrip() {
-        let dir = std::env::temp_dir().join("nanograph_manifest_test");
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path();
 
         let mut manifest = GraphManifest::new("abc123".to_string());
         manifest.next_node_id = 42;
@@ -82,8 +100,8 @@ mod tests {
             row_count: 5,
         });
 
-        manifest.write_atomic(&dir).unwrap();
-        let loaded = GraphManifest::read(&dir).unwrap();
+        manifest.write_atomic(path).unwrap();
+        let loaded = GraphManifest::read(path).unwrap();
 
         assert_eq!(loaded.format_version, 1);
         assert_eq!(loaded.schema_ir_hash, "abc123");
@@ -91,23 +109,18 @@ mod tests {
         assert_eq!(loaded.next_edge_id, 10);
         assert_eq!(loaded.datasets.len(), 1);
         assert_eq!(loaded.datasets[0].type_name, "Person");
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn test_atomic_write_creates_file() {
-        let dir = std::env::temp_dir().join("nanograph_manifest_test_atomic");
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path();
 
         let manifest = GraphManifest::new("def456".to_string());
-        manifest.write_atomic(&dir).unwrap();
+        manifest.write_atomic(path).unwrap();
 
-        assert!(dir.join("graph.manifest.json").exists());
+        assert!(path.join("graph.manifest.json").exists());
         // tmp file should be gone (renamed)
-        assert!(!dir.join("graph.manifest.json.tmp").exists());
-
-        let _ = fs::remove_dir_all(&dir);
+        assert!(!path.join("graph.manifest.json.tmp").exists());
     }
 }

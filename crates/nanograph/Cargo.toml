@@ -1,7 +1,12 @@
 [package]
 name = "nanograph"
-version = "0.1.0"
-edition = "2021"
+version = "0.2.0"
+edition = "2024"
+description = "Embedded local-first typed property graph database. Arrow-native, DataFusion-backed."
+repository = "https://github.com/aaltshuler/nanograph"
+license = "MIT"
+keywords = ["graph", "database", "arrow", "datafusion", "embedded"]
+categories = ["database-implementations", "data-structures"]
 
 [dependencies]
 arrow = { workspace = true }
@@ -15,6 +20,9 @@ async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 lance = { workspace = true }
+tracing = { workspace = true }
+ahash = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+tempfile = { workspace = true }

@@ -130,9 +130,7 @@ fn lower_clauses(
             .traversals
             .iter()
             .find(|rt| {
-                rt.src == traversal.src
-                    && rt.dst == traversal.dst
-                    && rt.edge_type == edge.name
+                rt.src == traversal.src && rt.dst == traversal.dst && rt.edge_type == edge.name
             })
             .map(|rt| rt.direction)
             .unwrap_or(Direction::Out);
@@ -214,7 +212,14 @@ fn lower_clauses(
 
         let mut inner_pipeline = Vec::new();
         let mut inner_bound = bound_vars.clone();
-        lower_clauses(catalog, neg_clauses, type_ctx, &mut inner_pipeline, &mut inner_bound, param_names)?;
+        lower_clauses(
+            catalog,
+            neg_clauses,
+            type_ctx,
+            &mut inner_pipeline,
+            &mut inner_bound,
+            param_names,
+        )?;
 
         pipeline.push(IROp::AntiJoin {
             outer_var: outer_var.unwrap_or_default(),

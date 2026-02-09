@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, AsArray, RecordBatch, UInt64Builder};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, UInt64Type};
+use tracing::{debug, info};
 
 use crate::catalog::Catalog;
 use crate::error::{NanoError, Result};
@@ -99,14 +100,11 @@ impl GraphStorage {
 
     /// Insert nodes of a given type. The batch should NOT contain an `id` column;
     /// IDs will be assigned automatically. Returns the assigned node IDs.
-    pub fn insert_nodes(
-        &mut self,
-        type_name: &str,
-        batch: RecordBatch,
-    ) -> Result<Vec<NodeId>> {
-        let segment = self.node_segments.get_mut(type_name).ok_or_else(|| {
-            NanoError::Storage(format!("unknown node type: {}", type_name))
-        })?;
+    pub fn insert_nodes(&mut self, type_name: &str, batch: RecordBatch) -> Result<Vec<NodeId>> {
+        let segment = self
+            .node_segments
+            .get_mut(type_name)
+            .ok_or_else(|| NanoError::Storage(format!("unknown node type: {}", type_name)))?;
 
         let num_rows = batch.num_rows();
         let mut ids = Vec::with_capacity(num_rows);
@@ -154,9 +152,10 @@ impl GraphStorage {
             ));
         }
 
-        let segment = self.edge_segments.get_mut(type_name).ok_or_else(|| {
-            NanoError::Storage(format!("unknown edge type: {}", type_name))
-        })?;
+        let segment = self
+            .edge_segments
+            .get_mut(type_name)
+            .ok_or_else(|| NanoError::Storage(format!("unknown edge type: {}", type_name)))?;
 
         let num_edges = src_ids.len();
         let mut edge_ids = Vec::with_capacity(num_edges);
@@ -182,9 +181,18 @@ impl GraphStorage {
     pub fn build_indices(&mut self) -> Result<()> {
         // Find the max node ID to determine CSR size
         let max_node_id = self.next_node_id;
+        info!(
+            edge_types = self.edge_segments.len(),
+            max_node_id, "building graph indices"
+        );
 
         for segment in self.edge_segments.values_mut() {
             let num_edges = segment.src_ids.len();
+            debug!(
+                edge_type = %segment.type_name,
+                edge_count = num_edges,
+                "building CSR/CSC for edge type"
+            );
 
             // Build CSR (outgoing edges)
             let mut out_edges: Vec<(u64, u64, u64)> = Vec::with_capacity(num_edges);
@@ -200,6 +208,8 @@ impl GraphStorage {
             }
             segment.csc = Some(CsrIndex::build(max_node_id as usize, &mut in_edges));
         }
+
+        info!("finished building graph indices");
 
         Ok(())
     }
@@ -242,9 +252,10 @@ impl GraphStorage {
     /// Load a pre-ID'd node batch (has id column already). Does not auto-assign IDs.
     /// Used when restoring from persistence.
     pub fn load_node_batch(&mut self, type_name: &str, batch: RecordBatch) -> Result<()> {
-        let segment = self.node_segments.get_mut(type_name).ok_or_else(|| {
-            NanoError::Storage(format!("unknown node type: {}", type_name))
-        })?;
+        let segment = self
+            .node_segments
+            .get_mut(type_name)
+            .ok_or_else(|| NanoError::Storage(format!("unknown node type: {}", type_name)))?;
 
         // Extract IDs from the batch to build id_to_row
         let id_col = batch
@@ -269,9 +280,10 @@ impl GraphStorage {
     /// Load edge data from a combined batch (edge_id, src, dst, ...props).
     /// Extracts vectors and optional property columns.
     pub fn load_edge_batch(&mut self, type_name: &str, batch: RecordBatch) -> Result<()> {
-        let segment = self.edge_segments.get_mut(type_name).ok_or_else(|| {
-            NanoError::Storage(format!("unknown edge type: {}", type_name))
-        })?;
+        let segment = self
+            .edge_segments
+            .get_mut(type_name)
+            .ok_or_else(|| NanoError::Storage(format!("unknown edge type: {}", type_name)))?;
 
         let id_col = batch
             .column_by_name("id")
@@ -336,9 +348,12 @@ impl GraphStorage {
         }
 
         let num_edges = segment.edge_ids.len();
-        let id_arr: Arc<dyn Array> = Arc::new(arrow::array::UInt64Array::from(segment.edge_ids.clone()));
-        let src_arr: Arc<dyn Array> = Arc::new(arrow::array::UInt64Array::from(segment.src_ids.clone()));
-        let dst_arr: Arc<dyn Array> = Arc::new(arrow::array::UInt64Array::from(segment.dst_ids.clone()));
+        let id_arr: Arc<dyn Array> =
+            Arc::new(arrow::array::UInt64Array::from(segment.edge_ids.clone()));
+        let src_arr: Arc<dyn Array> =
+            Arc::new(arrow::array::UInt64Array::from(segment.src_ids.clone()));
+        let dst_arr: Arc<dyn Array> =
+            Arc::new(arrow::array::UInt64Array::from(segment.dst_ids.clone()));
 
         let mut fields = vec![
             Field::new("id", DataType::UInt64, false),

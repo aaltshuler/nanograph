@@ -1,7 +1,10 @@
 [package]
 name = "nanograph-cli"
-version = "0.1.0"
-edition = "2021"
+version = "0.2.0"
+edition = "2024"
+description = "CLI for NanoGraph — embedded typed property graph database"
+repository = "https://github.com/aaltshuler/nanograph"
+license = "MIT"
 
 [[bin]]
 name = "nanograph"
@@ -14,3 +17,7 @@ tokio = { workspace = true }
 serde_json = { workspace = true }
 arrow = { workspace = true }
 datafusion = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+color-eyre = { workspace = true }
+ariadne = { workspace = true }

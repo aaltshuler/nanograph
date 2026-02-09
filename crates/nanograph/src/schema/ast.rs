@@ -14,6 +14,7 @@ pub enum SchemaDecl {
 #[derive(Debug, Clone)]
 pub struct NodeDecl {
     pub name: String,
+    pub annotations: Vec<Annotation>,
     pub parent: Option<String>,
     pub properties: Vec<PropDecl>,
 }
@@ -23,6 +24,7 @@ pub struct EdgeDecl {
     pub name: String,
     pub from_type: String,
     pub to_type: String,
+    pub annotations: Vec<Annotation>,
     pub properties: Vec<PropDecl>,
 }
 

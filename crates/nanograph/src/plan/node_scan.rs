@@ -26,11 +26,7 @@ pub struct NodeTypeTable {
 }
 
 impl NodeTypeTable {
-    pub fn new(
-        type_name: String,
-        variable_name: String,
-        storage: Arc<GraphStorage>,
-    ) -> Self {
+    pub fn new(type_name: String, variable_name: String, storage: Arc<GraphStorage>) -> Self {
         let node_type = &storage.catalog.node_types[&type_name];
         let struct_fields: Vec<Field> = node_type
             .arrow_schema
@@ -161,13 +157,20 @@ impl ExecutionPlan for NodeScanExec {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let batch = self.storage.get_all_nodes(&self.type_name)
+        let batch = self
+            .storage
+            .get_all_nodes(&self.type_name)
             .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
 
         let result_batch = match batch {
             Some(b) => {
                 let columns: Vec<ArrayRef> = b.columns().to_vec();
-                let fields: Vec<Field> = b.schema().fields().iter().map(|f| f.as_ref().clone()).collect();
+                let fields: Vec<Field> = b
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.as_ref().clone())
+                    .collect();
                 let struct_array = StructArray::new(fields.into(), columns, None);
                 RecordBatch::try_new(
                     self.output_schema.clone(),

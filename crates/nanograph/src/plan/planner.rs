@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use ahash::{AHashMap, AHashSet};
 use arrow::array::{Array, RecordBatch, StructArray};
 use arrow::compute;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -13,16 +14,19 @@ use crate::error::{NanoError, Result};
 use crate::ir::*;
 use crate::query::ast::{AggFunc, CompOp, Literal};
 use crate::store::graph::GraphStorage;
+use tracing::{debug, info, instrument};
 
 use super::node_scan::NodeScanExec;
 use super::physical::ExpandExec;
 
 /// Execute a query IR against a graph storage, returning a RecordBatch of results.
+#[instrument(skip(ir, storage, params), fields(query = %ir.name, pipeline_len = ir.pipeline.len()))]
 pub async fn execute_query(
     ir: &QueryIR,
     storage: Arc<GraphStorage>,
     params: &ParamMap,
 ) -> Result<Vec<RecordBatch>> {
+    info!("executing query");
     // Build the physical plan from IR
     let plan = build_physical_plan(&ir.pipeline, storage.clone())?;
 
@@ -37,8 +41,14 @@ pub async fn execute_query(
         .return_exprs
         .iter()
         .any(|p| matches!(&p.expr, IRExpr::Aggregate { .. }));
-    let can_stream_batchwise =
-        !has_aggregation && ir.order_by.is_empty() && ir.limit.is_none();
+    let can_stream_batchwise = !has_aggregation && ir.order_by.is_empty() && ir.limit.is_none();
+    debug!(
+        has_aggregation,
+        has_order = !ir.order_by.is_empty(),
+        has_limit = ir.limit.is_some(),
+        fast_path = can_stream_batchwise,
+        "query execution mode selected"
+    );
 
     if can_stream_batchwise {
         use futures::StreamExt;
@@ -56,6 +66,7 @@ pub async fn execute_query(
             let projected = apply_projection(&ir.return_exprs, &filtered, params)?;
             out.extend(projected.into_iter().filter(|b| b.num_rows() > 0));
         }
+        info!(result_batches = out.len(), "query execution complete");
         return Ok(out);
     }
 
@@ -81,10 +92,12 @@ pub async fn execute_query(
     if has_aggregation {
         let result = apply_aggregation(&ir.return_exprs, &filtered, params)?;
         let result = apply_order_and_limit(&result, &ir.order_by, ir.limit)?;
+        info!(result_batches = result.len(), "query execution complete");
         Ok(result)
     } else {
         let projected = apply_projection(&ir.return_exprs, &filtered, params)?;
         let result = apply_order_and_limit(&projected, &ir.order_by, ir.limit)?;
+        info!(result_batches = result.len(), "query execution complete");
         Ok(result)
     }
 }
@@ -102,8 +115,10 @@ fn build_physical_plan(
                 type_name,
                 filters: _,
             } => {
-                let node_schema = storage.catalog.node_types.get(type_name)
-                    .ok_or_else(|| NanoError::Plan(format!("unknown node type: {}", type_name)))?;
+                let node_schema =
+                    storage.catalog.node_types.get(type_name).ok_or_else(|| {
+                        NanoError::Plan(format!("unknown node type: {}", type_name))
+                    })?;
 
                 // Build struct output schema
                 let struct_fields: Vec<Field> = node_schema
@@ -112,11 +127,8 @@ fn build_physical_plan(
                     .iter()
                     .map(|f| f.as_ref().clone())
                     .collect();
-                let struct_field = Field::new(
-                    variable,
-                    DataType::Struct(struct_fields.into()),
-                    false,
-                );
+                let struct_field =
+                    Field::new(variable, DataType::Struct(struct_fields.into()), false);
 
                 let output_schema = if let Some(ref plan) = current_plan {
                     // Append to existing schema
@@ -135,7 +147,10 @@ fn build_physical_plan(
                 let scan = NodeScanExec::new(
                     type_name.clone(),
                     variable.clone(),
-                    Arc::new(Schema::new(vec![output_schema.field(output_schema.fields().len() - 1).as_ref().clone()])),
+                    Arc::new(Schema::new(vec![output_schema
+                        .field(output_schema.fields().len() - 1)
+                        .as_ref()
+                        .clone()])),
                     storage.clone(),
                 );
 
@@ -179,7 +194,8 @@ fn build_physical_plan(
 
                 // Build the inner plan, seeding it with the outer plan as input
                 // so Expand ops have the source rows to work with
-                let inner_plan = build_physical_plan_with_input(inner, storage.clone(), outer.clone())?;
+                let inner_plan =
+                    build_physical_plan_with_input(inner, storage.clone(), outer.clone())?;
 
                 current_plan = Some(Arc::new(AntiJoinExec::new(
                     outer,
@@ -210,8 +226,10 @@ fn build_physical_plan_with_input(
                 type_name,
                 filters: _,
             } => {
-                let node_schema = storage.catalog.node_types.get(type_name)
-                    .ok_or_else(|| NanoError::Plan(format!("unknown node type: {}", type_name)))?;
+                let node_schema =
+                    storage.catalog.node_types.get(type_name).ok_or_else(|| {
+                        NanoError::Plan(format!("unknown node type: {}", type_name))
+                    })?;
 
                 let struct_fields: Vec<Field> = node_schema
                     .arrow_schema
@@ -219,11 +237,8 @@ fn build_physical_plan_with_input(
                     .iter()
                     .map(|f| f.as_ref().clone())
                     .collect();
-                let struct_field = Field::new(
-                    variable,
-                    DataType::Struct(struct_fields.into()),
-                    false,
-                );
+                let struct_field =
+                    Field::new(variable, DataType::Struct(struct_fields.into()), false);
 
                 let output_schema = if let Some(ref plan) = current_plan {
                     let mut fields: Vec<Field> = plan
@@ -241,7 +256,10 @@ fn build_physical_plan_with_input(
                 let scan = NodeScanExec::new(
                     type_name.clone(),
                     variable.clone(),
-                    Arc::new(Schema::new(vec![output_schema.field(output_schema.fields().len() - 1).as_ref().clone()])),
+                    Arc::new(Schema::new(vec![output_schema
+                        .field(output_schema.fields().len() - 1)
+                        .as_ref()
+                        .clone()])),
                     storage.clone(),
                 );
 
@@ -281,7 +299,8 @@ fn build_physical_plan_with_input(
             IROp::AntiJoin { outer_var, inner } => {
                 let outer = current_plan
                     .ok_or_else(|| NanoError::Plan("AntiJoin without outer input".to_string()))?;
-                let inner_plan = build_physical_plan_with_input(inner, storage.clone(), outer.clone())?;
+                let inner_plan =
+                    build_physical_plan_with_input(inner, storage.clone(), outer.clone())?;
                 current_plan = Some(Arc::new(AntiJoinExec::new(
                     outer,
                     inner_plan,
@@ -305,7 +324,10 @@ fn apply_ir_filters(
     for op in pipeline {
         match op {
             IROp::Filter(f) => filters.push(f),
-            IROp::NodeScan { filters: scan_filters, .. } => {
+            IROp::NodeScan {
+                filters: scan_filters,
+                ..
+            } => {
                 for f in scan_filters {
                     filters.push(f);
                 }
@@ -325,7 +347,11 @@ fn apply_ir_filters(
     Ok(result)
 }
 
-fn apply_single_filter(filter: &IRFilter, batches: &[RecordBatch], params: &ParamMap) -> Result<Vec<RecordBatch>> {
+fn apply_single_filter(
+    filter: &IRFilter,
+    batches: &[RecordBatch],
+    params: &ParamMap,
+) -> Result<Vec<RecordBatch>> {
     let mut result = Vec::new();
     for batch in batches {
         let left = eval_ir_expr(&filter.left, batch, params)?;
@@ -350,20 +376,20 @@ fn apply_single_filter(filter: &IRFilter, batches: &[RecordBatch], params: &Para
     Ok(result)
 }
 
-fn eval_ir_expr(expr: &IRExpr, batch: &RecordBatch, params: &ParamMap) -> Result<arrow::array::ArrayRef> {
+fn eval_ir_expr(
+    expr: &IRExpr,
+    batch: &RecordBatch,
+    params: &ParamMap,
+) -> Result<arrow::array::ArrayRef> {
     match expr {
         IRExpr::PropAccess { variable, property } => {
-            let col_idx = batch
-                .schema()
-                .index_of(variable)
-                .map_err(|e| NanoError::Execution(format!("column {} not found: {}", variable, e)))?;
+            let col_idx = batch.schema().index_of(variable).map_err(|e| {
+                NanoError::Execution(format!("column {} not found: {}", variable, e))
+            })?;
             let col = batch.column(col_idx);
-            let struct_arr = col
-                .as_any()
-                .downcast_ref::<StructArray>()
-                .ok_or_else(|| {
-                    NanoError::Execution(format!("column {} is not a struct", variable))
-                })?;
+            let struct_arr = col.as_any().downcast_ref::<StructArray>().ok_or_else(|| {
+                NanoError::Execution(format!("column {} is not a struct", variable))
+            })?;
             let prop_col = struct_arr.column_by_name(property).ok_or_else(|| {
                 NanoError::Execution(format!("struct {} has no field {}", variable, property))
             })?;
@@ -381,29 +407,23 @@ fn eval_ir_expr(expr: &IRExpr, batch: &RecordBatch, params: &ParamMap) -> Result
             Ok(batch.column(col_idx).clone())
         }
         IRExpr::Param(name) => {
-            let lit = params.get(name).ok_or_else(|| {
-                NanoError::Execution(format!("parameter ${} not provided", name))
-            })?;
+            let lit = params
+                .get(name)
+                .ok_or_else(|| NanoError::Execution(format!("parameter ${} not provided", name)))?;
             Ok(literal_to_array(lit, batch.num_rows()))
         }
-        _ => Err(NanoError::Execution("unsupported expr in filter".to_string())),
+        _ => Err(NanoError::Execution(
+            "unsupported expr in filter".to_string(),
+        )),
     }
 }
 
 fn literal_to_array(lit: &Literal, num_rows: usize) -> arrow::array::ArrayRef {
     match lit {
-        Literal::String(s) => {
-            Arc::new(arrow::array::StringArray::from(vec![s.as_str(); num_rows]))
-        }
-        Literal::Integer(n) => {
-            Arc::new(arrow::array::Int64Array::from(vec![*n; num_rows]))
-        }
-        Literal::Float(f) => {
-            Arc::new(arrow::array::Float64Array::from(vec![*f; num_rows]))
-        }
-        Literal::Bool(b) => {
-            Arc::new(arrow::array::BooleanArray::from(vec![*b; num_rows]))
-        }
+        Literal::String(s) => Arc::new(arrow::array::StringArray::from(vec![s.as_str(); num_rows])),
+        Literal::Integer(n) => Arc::new(arrow::array::Int64Array::from(vec![*n; num_rows])),
+        Literal::Float(f) => Arc::new(arrow::array::Float64Array::from(vec![*f; num_rows])),
+        Literal::Bool(b) => Arc::new(arrow::array::BooleanArray::from(vec![*b; num_rows])),
     }
 }
 
@@ -438,7 +458,8 @@ fn apply_projection(
     let sample = &batches[0];
     let mut out_fields = Vec::new();
     for proj in projections {
-        let (name, dt, nullable) = infer_projection_field(&proj.expr, proj.alias.as_deref(), sample)?;
+        let (name, dt, nullable) =
+            infer_projection_field(&proj.expr, proj.alias.as_deref(), sample)?;
         out_fields.push(Field::new(name, dt, nullable));
     }
     let out_schema = Arc::new(Schema::new(out_fields));
@@ -464,10 +485,14 @@ fn infer_projection_field(
 ) -> Result<(String, DataType, bool)> {
     match expr {
         IRExpr::PropAccess { variable, property } => {
-            let col_idx = batch.schema().index_of(variable)
+            let col_idx = batch
+                .schema()
+                .index_of(variable)
                 .map_err(|e| NanoError::Execution(e.to_string()))?;
             let col = batch.column(col_idx);
-            let struct_arr = col.as_any().downcast_ref::<StructArray>()
+            let struct_arr = col
+                .as_any()
+                .downcast_ref::<StructArray>()
                 .ok_or_else(|| NanoError::Execution("not a struct".to_string()))?;
             let field = struct_arr
                 .fields()
@@ -552,9 +577,8 @@ fn apply_aggregation(
     }
 
     // Simple grouping: build a hashmap of group key -> row indices
-    use std::collections::HashMap;
     let num_rows = combined.num_rows();
-    let mut groups: HashMap<Vec<String>, Vec<usize>> = HashMap::new();
+    let mut groups: AHashMap<Vec<String>, Vec<usize>> = AHashMap::new();
 
     for row in 0..num_rows {
         let mut key = Vec::new();
@@ -571,12 +595,14 @@ fn apply_aggregation(
 
     // Initialize output column storage
     for (_, proj) in &group_exprs {
-        let (name, dt, nullable) = infer_projection_field(&proj.expr, proj.alias.as_deref(), &combined)?;
+        let (name, dt, nullable) =
+            infer_projection_field(&proj.expr, proj.alias.as_deref(), &combined)?;
         output_fields.push(Field::new(name, dt, nullable));
         output_columns.push(Vec::new());
     }
     for (_, proj) in &agg_exprs {
-        let (name, dt, nullable) = infer_projection_field(&proj.expr, proj.alias.as_deref(), &combined)?;
+        let (name, dt, nullable) =
+            infer_projection_field(&proj.expr, proj.alias.as_deref(), &combined)?;
         output_fields.push(Field::new(name, dt, nullable));
         output_agg_columns.push(Vec::new());
     }
@@ -616,21 +642,21 @@ fn apply_aggregation(
     for (agg_idx, (_, proj)) in agg_exprs.iter().enumerate() {
         let (_, dt, _) = infer_projection_field(&proj.expr, proj.alias.as_deref(), &combined)?;
         let arr = match dt {
-            DataType::Int64 => {
-                Arc::new(arrow::array::Int64Array::from(
-                    output_agg_columns[agg_idx].iter().map(|v| *v as i64).collect::<Vec<_>>(),
-                )) as arrow::array::ArrayRef
-            }
-            DataType::Float64 => {
-                Arc::new(arrow::array::Float64Array::from(
-                    output_agg_columns[agg_idx].clone(),
-                )) as arrow::array::ArrayRef
-            }
-            _ => {
-                Arc::new(arrow::array::Int64Array::from(
-                    output_agg_columns[agg_idx].iter().map(|v| *v as i64).collect::<Vec<_>>(),
-                )) as arrow::array::ArrayRef
-            }
+            DataType::Int64 => Arc::new(arrow::array::Int64Array::from(
+                output_agg_columns[agg_idx]
+                    .iter()
+                    .map(|v| *v as i64)
+                    .collect::<Vec<_>>(),
+            )) as arrow::array::ArrayRef,
+            DataType::Float64 => Arc::new(arrow::array::Float64Array::from(
+                output_agg_columns[agg_idx].clone(),
+            )) as arrow::array::ArrayRef,
+            _ => Arc::new(arrow::array::Int64Array::from(
+                output_agg_columns[agg_idx]
+                    .iter()
+                    .map(|v| *v as i64)
+                    .collect::<Vec<_>>(),
+            )) as arrow::array::ArrayRef,
         };
         arrays.push(arr);
     }
@@ -641,11 +667,7 @@ fn apply_aggregation(
     Ok(vec![out_batch])
 }
 
-fn compute_aggregate(
-    func: &AggFunc,
-    col: &arrow::array::ArrayRef,
-    rows: &[usize],
-) -> Result<f64> {
+fn compute_aggregate(func: &AggFunc, col: &arrow::array::ArrayRef, rows: &[usize]) -> Result<f64> {
     match func {
         AggFunc::Count => Ok(rows.len() as f64),
         AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max => {
@@ -665,10 +687,7 @@ fn compute_aggregate(
                 AggFunc::Sum => Ok(values.iter().sum()),
                 AggFunc::Avg => Ok(values.iter().sum::<f64>() / values.len() as f64),
                 AggFunc::Min => Ok(values.iter().cloned().fold(f64::INFINITY, f64::min)),
-                AggFunc::Max => Ok(values
-                    .iter()
-                    .cloned()
-                    .fold(f64::NEG_INFINITY, f64::max)),
+                AggFunc::Max => Ok(values.iter().cloned().fold(f64::NEG_INFINITY, f64::max)),
                 _ => unreachable!(),
             }
         }
@@ -726,31 +745,30 @@ fn array_value_to_f64(arr: &arrow::array::ArrayRef, row: usize) -> Option<f64> {
 
 fn strings_to_array(values: &[String], dt: &DataType) -> arrow::array::ArrayRef {
     match dt {
-        DataType::Utf8 => {
-            Arc::new(arrow::array::StringArray::from(
-                values.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-            ))
-        }
-        DataType::Int32 => {
-            Arc::new(arrow::array::Int32Array::from(
-                values.iter().map(|s| s.parse::<i32>().unwrap_or(0)).collect::<Vec<_>>(),
-            ))
-        }
-        DataType::Int64 => {
-            Arc::new(arrow::array::Int64Array::from(
-                values.iter().map(|s| s.parse::<i64>().unwrap_or(0)).collect::<Vec<_>>(),
-            ))
-        }
-        DataType::UInt64 => {
-            Arc::new(arrow::array::UInt64Array::from(
-                values.iter().map(|s| s.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>(),
-            ))
-        }
-        _ => {
-            Arc::new(arrow::array::StringArray::from(
-                values.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-            ))
-        }
+        DataType::Utf8 => Arc::new(arrow::array::StringArray::from(
+            values.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        )),
+        DataType::Int32 => Arc::new(arrow::array::Int32Array::from(
+            values
+                .iter()
+                .map(|s| s.parse::<i32>().unwrap_or(0))
+                .collect::<Vec<_>>(),
+        )),
+        DataType::Int64 => Arc::new(arrow::array::Int64Array::from(
+            values
+                .iter()
+                .map(|s| s.parse::<i64>().unwrap_or(0))
+                .collect::<Vec<_>>(),
+        )),
+        DataType::UInt64 => Arc::new(arrow::array::UInt64Array::from(
+            values
+                .iter()
+                .map(|s| s.parse::<u64>().unwrap_or(0))
+                .collect::<Vec<_>>(),
+        )),
+        _ => Arc::new(arrow::array::StringArray::from(
+            values.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        )),
     }
 }
 
@@ -791,14 +809,18 @@ fn apply_order_and_limit(
                         struct_arr.and_then(|s| s.column_by_name(property).cloned())
                     } else {
                         // Try as a flat column (post-projection)
-                        result.schema().index_of(property).ok()
+                        result
+                            .schema()
+                            .index_of(property)
+                            .ok()
                             .map(|i| result.column(i).clone())
                     }
                 }
-                IRExpr::AliasRef(name) => {
-                    result.schema().index_of(name).ok()
-                        .map(|i| result.column(i).clone())
-                }
+                IRExpr::AliasRef(name) => result
+                    .schema()
+                    .index_of(name)
+                    .ok()
+                    .map(|i| result.column(i).clone()),
                 _ => None,
             };
 
@@ -1152,7 +1174,7 @@ impl ExecutionPlan for AntiJoinExec {
             },
             Running {
                 outer_stream: SendableRecordBatchStream,
-                inner_ids: std::collections::HashSet<u64>,
+                inner_ids: AHashSet<u64>,
                 join_var: String,
             },
         }
@@ -1177,8 +1199,7 @@ impl ExecutionPlan for AntiJoinExec {
                         mut inner_stream,
                         join_var,
                     } => {
-                        let mut inner_ids: std::collections::HashSet<u64> =
-                            std::collections::HashSet::new();
+                        let mut inner_ids: AHashSet<u64> = AHashSet::new();
 
                         while let Some(batch) = inner_stream.next().await {
                             let batch = batch?;
@@ -1189,8 +1210,8 @@ impl ExecutionPlan for AntiJoinExec {
                                     if let Some(id_col) = struct_arr.column_by_name("id") {
                                         if let Some(id_arr) = id_col
                                             .as_any()
-                                            .downcast_ref::<arrow::array::UInt64Array>()
-                                        {
+                                            .downcast_ref::<arrow::array::UInt64Array>(
+                                        ) {
                                             for i in 0..id_arr.len() {
                                                 inner_ids.insert(id_arr.value(i));
                                             }
@@ -1215,14 +1236,13 @@ impl ExecutionPlan for AntiJoinExec {
                             let batch = batch?;
                             let col_idx = batch.schema().index_of(&join_var)?;
                             let col = batch.column(col_idx);
-                            let struct_arr = col.as_any().downcast_ref::<StructArray>().ok_or_else(
-                                || {
+                            let struct_arr =
+                                col.as_any().downcast_ref::<StructArray>().ok_or_else(|| {
                                     datafusion::error::DataFusionError::Execution(format!(
                                         "column {} is not a struct",
                                         join_var
                                     ))
-                                },
-                            )?;
+                                })?;
                             let id_col = struct_arr.column_by_name("id").ok_or_else(|| {
                                 datafusion::error::DataFusionError::Execution(format!(
                                     "struct {} has no id field",

@@ -42,16 +42,19 @@ fn setup_storage() -> Arc<GraphStorage> {
         person_schema,
         vec![
             Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie", "Diana"])),
-            Arc::new(Int32Array::from(vec![Some(30), Some(25), Some(35), Some(28)])),
+            Arc::new(Int32Array::from(vec![
+                Some(30),
+                Some(25),
+                Some(35),
+                Some(28),
+            ])),
         ],
     )
     .unwrap();
     let person_ids = storage.insert_nodes("Person", people).unwrap();
 
     // Insert companies
-    let company_schema = Arc::new(Schema::new(vec![
-        Field::new("name", DataType::Utf8, false),
-    ]));
+    let company_schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
     let companies = RecordBatch::try_new(
         company_schema,
         vec![Arc::new(StringArray::from(vec!["Acme", "Globex"]))],
@@ -241,7 +244,9 @@ query q() {
     let q = &qf.queries[0];
     let tc = typecheck_query(&storage.catalog, q).unwrap();
     let ir = lower_query(&storage.catalog, q, &tc).unwrap();
-    let err = execute_query(&ir, storage, &ParamMap::new()).await.unwrap_err();
+    let err = execute_query(&ir, storage, &ParamMap::new())
+        .await
+        .unwrap_err();
 
     assert!(err.to_string().contains("missing destination node id"));
 }

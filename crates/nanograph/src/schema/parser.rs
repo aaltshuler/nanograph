@@ -1,7 +1,8 @@
+use pest::error::InputLocation;
 use pest::Parser;
 use pest_derive::Parser;
 
-use crate::error::{NanoError, Result};
+use crate::error::{NanoError, ParseDiagnostic, Result, SourceSpan};
 use crate::types::{PropType, ScalarType};
 
 use super::ast::*;
@@ -11,8 +12,11 @@ use super::ast::*;
 struct SchemaParser;
 
 pub fn parse_schema(input: &str) -> Result<SchemaFile> {
-    let pairs = SchemaParser::parse(Rule::schema_file, input)
-        .map_err(|e| NanoError::Parse(e.to_string()))?;
+    parse_schema_diagnostic(input).map_err(|e| NanoError::Parse(e.to_string()))
+}
+
+pub fn parse_schema_diagnostic(input: &str) -> std::result::Result<SchemaFile, ParseDiagnostic> {
+    let pairs = SchemaParser::parse(Rule::schema_file, input).map_err(pest_error_to_diagnostic)?;
 
     let mut declarations = Vec::new();
     for pair in pairs {
@@ -20,7 +24,8 @@ pub fn parse_schema(input: &str) -> Result<SchemaFile> {
             Rule::schema_file => {
                 for inner in pair.into_inner() {
                     if let Rule::schema_decl = inner.as_rule() {
-                        declarations.push(parse_schema_decl(inner)?);
+                        declarations
+                            .push(parse_schema_decl(inner).map_err(nano_error_to_diagnostic)?);
                     }
                 }
             }
@@ -28,6 +33,18 @@ pub fn parse_schema(input: &str) -> Result<SchemaFile> {
         }
     }
     Ok(SchemaFile { declarations })
+}
+
+fn pest_error_to_diagnostic(err: pest::error::Error<Rule>) -> ParseDiagnostic {
+    let span = match err.location {
+        InputLocation::Pos(pos) => Some(SourceSpan::new(pos, pos)),
+        InputLocation::Span((start, end)) => Some(SourceSpan::new(start, end)),
+    };
+    ParseDiagnostic::new(err.to_string(), span)
+}
+
+fn nano_error_to_diagnostic(err: NanoError) -> ParseDiagnostic {
+    ParseDiagnostic::new(err.to_string(), None)
 }
 
 fn parse_schema_decl(pair: pest::iterators::Pair<Rule>) -> Result<SchemaDecl> {
@@ -46,11 +63,15 @@ fn parse_node_decl(pair: pest::iterators::Pair<Rule>) -> Result<NodeDecl> {
     let mut inner = pair.into_inner();
     let name = inner.next().unwrap().as_str().to_string();
 
+    let mut annotations = Vec::new();
     let mut parent = None;
     let mut properties = Vec::new();
 
     for item in inner {
         match item.as_rule() {
+            Rule::annotation => {
+                annotations.push(parse_annotation(item)?);
+            }
             Rule::type_name => {
                 parent = Some(item.as_str().to_string());
             }
@@ -63,6 +84,7 @@ fn parse_node_decl(pair: pest::iterators::Pair<Rule>) -> Result<NodeDecl> {
 
     Ok(NodeDecl {
         name,
+        annotations,
         parent,
         properties,
     })
@@ -74,10 +96,13 @@ fn parse_edge_decl(pair: pest::iterators::Pair<Rule>) -> Result<EdgeDecl> {
     let from_type = inner.next().unwrap().as_str().to_string();
     let to_type = inner.next().unwrap().as_str().to_string();
 
+    let mut annotations = Vec::new();
     let mut properties = Vec::new();
     for item in inner {
-        if let Rule::prop_decl = item.as_rule() {
-            properties.push(parse_prop_decl(item)?);
+        match item.as_rule() {
+            Rule::annotation => annotations.push(parse_annotation(item)?),
+            Rule::prop_decl => properties.push(parse_prop_decl(item)?),
+            _ => {}
         }
     }
 
@@ -85,6 +110,7 @@ fn parse_edge_decl(pair: pest::iterators::Pair<Rule>) -> Result<EdgeDecl> {
         name,
         from_type,
         to_type,
+        annotations,
         properties,
     })
 }
@@ -166,6 +192,7 @@ edge WorksAt: Person -> Company {
         match &schema.declarations[0] {
             SchemaDecl::Node(n) => {
                 assert_eq!(n.name, "Person");
+                assert!(n.annotations.is_empty());
                 assert!(n.parent.is_none());
                 assert_eq!(n.properties.len(), 2);
                 assert_eq!(n.properties[0].name, "name");
@@ -182,6 +209,7 @@ edge WorksAt: Person -> Company {
                 assert_eq!(e.name, "Knows");
                 assert_eq!(e.from_type, "Person");
                 assert_eq!(e.to_type, "Person");
+                assert!(e.annotations.is_empty());
                 assert_eq!(e.properties.len(), 1);
             }
             _ => panic!("expected Edge"),
@@ -234,7 +262,43 @@ node Person {
         match &schema.declarations[0] {
             SchemaDecl::Edge(e) => {
                 assert_eq!(e.name, "WorksAt");
+                assert!(e.annotations.is_empty());
                 assert!(e.properties.is_empty());
+            }
+            _ => panic!("expected Edge"),
+        }
+    }
+
+    #[test]
+    fn test_parse_type_rename_annotation() {
+        let input = r#"
+node Account @rename_from("User") {
+    full_name: String @rename_from("name")
+}
+
+edge ConnectedTo: Account -> Account @rename_from("Knows")
+"#;
+        let schema = parse_schema(input).unwrap();
+        match &schema.declarations[0] {
+            SchemaDecl::Node(n) => {
+                assert_eq!(n.name, "Account");
+                assert_eq!(n.annotations.len(), 1);
+                assert_eq!(n.annotations[0].name, "rename_from");
+                assert_eq!(n.annotations[0].value.as_deref(), Some("User"));
+                assert_eq!(n.properties[0].annotations[0].name, "rename_from");
+                assert_eq!(
+                    n.properties[0].annotations[0].value.as_deref(),
+                    Some("name")
+                );
+            }
+            _ => panic!("expected Node"),
+        }
+        match &schema.declarations[1] {
+            SchemaDecl::Edge(e) => {
+                assert_eq!(e.name, "ConnectedTo");
+                assert_eq!(e.annotations.len(), 1);
+                assert_eq!(e.annotations[0].name, "rename_from");
+                assert_eq!(e.annotations[0].value.as_deref(), Some("Knows"));
             }
             _ => panic!("expected Edge"),
         }
@@ -244,5 +308,12 @@ node Person {
     fn test_parse_error() {
         let input = "node { }"; // missing type name
         assert!(parse_schema(input).is_err());
+    }
+
+    #[test]
+    fn test_parse_error_diagnostic_has_span() {
+        let input = "node { }";
+        let err = parse_schema_diagnostic(input).unwrap_err();
+        assert!(err.span.is_some());
     }
 }

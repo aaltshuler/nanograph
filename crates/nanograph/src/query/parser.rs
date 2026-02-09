@@ -1,7 +1,8 @@
+use pest::error::InputLocation;
 use pest::Parser;
 use pest_derive::Parser;
 
-use crate::error::{NanoError, Result};
+use crate::error::{NanoError, ParseDiagnostic, Result, SourceSpan};
 
 use super::ast::*;
 
@@ -10,20 +11,35 @@ use super::ast::*;
 struct QueryParser;
 
 pub fn parse_query(input: &str) -> Result<QueryFile> {
-    let pairs = QueryParser::parse(Rule::query_file, input)
-        .map_err(|e| NanoError::Parse(e.to_string()))?;
+    parse_query_diagnostic(input).map_err(|e| NanoError::Parse(e.to_string()))
+}
+
+pub fn parse_query_diagnostic(input: &str) -> std::result::Result<QueryFile, ParseDiagnostic> {
+    let pairs = QueryParser::parse(Rule::query_file, input).map_err(pest_error_to_diagnostic)?;
 
     let mut queries = Vec::new();
     for pair in pairs {
         if let Rule::query_file = pair.as_rule() {
             for inner in pair.into_inner() {
                 if let Rule::query_decl = inner.as_rule() {
-                    queries.push(parse_query_decl(inner)?);
+                    queries.push(parse_query_decl(inner).map_err(nano_error_to_diagnostic)?);
                 }
             }
         }
     }
     Ok(QueryFile { queries })
+}
+
+fn pest_error_to_diagnostic(err: pest::error::Error<Rule>) -> ParseDiagnostic {
+    let span = match err.location {
+        InputLocation::Pos(pos) => Some(SourceSpan::new(pos, pos)),
+        InputLocation::Span((start, end)) => Some(SourceSpan::new(start, end)),
+    };
+    ParseDiagnostic::new(err.to_string(), span)
+}
+
+fn nano_error_to_diagnostic(err: NanoError) -> ParseDiagnostic {
+    ParseDiagnostic::new(err.to_string(), None)
 }
 
 fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
@@ -68,9 +84,12 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
             }
             Rule::limit_clause => {
                 let int_pair = item.into_inner().next().unwrap();
-                limit = Some(int_pair.as_str().parse::<u64>().map_err(|e| {
-                    NanoError::Parse(format!("invalid limit: {}", e))
-                })?);
+                limit = Some(
+                    int_pair
+                        .as_str()
+                        .parse::<u64>()
+                        .map_err(|e| NanoError::Parse(format!("invalid limit: {}", e)))?,
+                );
             }
             _ => {}
         }
@@ -207,9 +226,7 @@ fn parse_expr(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
         }
         Rule::variable => {
             let v = inner.as_str();
-            Ok(Expr::Variable(
-                v.strip_prefix('$').unwrap_or(v).to_string(),
-            ))
+            Ok(Expr::Variable(v.strip_prefix('$').unwrap_or(v).to_string()))
         }
         Rule::literal => Ok(Expr::Literal(parse_literal(inner)?)),
         Rule::agg_call => {
@@ -220,12 +237,7 @@ fn parse_expr(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
                 "avg" => AggFunc::Avg,
                 "min" => AggFunc::Min,
                 "max" => AggFunc::Max,
-                other => {
-                    return Err(NanoError::Parse(format!(
-                        "unknown aggregate: {}",
-                        other
-                    )))
-                }
+                other => return Err(NanoError::Parse(format!("unknown aggregate: {}", other))),
             };
             let arg = parse_expr(parts.next().unwrap())?;
             Ok(Expr::Aggregate {
@@ -261,15 +273,17 @@ fn parse_literal(pair: pest::iterators::Pair<Rule>) -> Result<Literal> {
             Ok(Literal::String(s[1..s.len() - 1].to_string()))
         }
         Rule::integer => {
-            let n: i64 = inner.as_str().parse().map_err(|e| {
-                NanoError::Parse(format!("invalid integer: {}", e))
-            })?;
+            let n: i64 = inner
+                .as_str()
+                .parse()
+                .map_err(|e| NanoError::Parse(format!("invalid integer: {}", e)))?;
             Ok(Literal::Integer(n))
         }
         Rule::float_lit => {
-            let f: f64 = inner.as_str().parse().map_err(|e| {
-                NanoError::Parse(format!("invalid float: {}", e))
-            })?;
+            let f: f64 = inner
+                .as_str()
+                .parse()
+                .map_err(|e| NanoError::Parse(format!("invalid float: {}", e)))?;
             Ok(Literal::Float(f))
         }
         Rule::bool_lit => {
@@ -561,5 +575,19 @@ query avg_age_by_company() {
         let qf = parse_query(input).unwrap();
         let q = &qf.queries[0];
         assert_eq!(q.return_clause.len(), 3);
+    }
+
+    #[test]
+    fn test_parse_error_diagnostic_has_span() {
+        let input = r#"
+query q() {
+    match {
+        $p: Person
+    }
+    return { $p.name
+}
+"#;
+        let err = parse_query_diagnostic(input).unwrap_err();
+        assert!(err.span.is_some());
     }
 }

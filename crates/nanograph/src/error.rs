@@ -1,5 +1,40 @@
 use thiserror::Error;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceSpan {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl SourceSpan {
+    pub fn new(start: usize, end: usize) -> Self {
+        Self {
+            start,
+            end: end.max(start.saturating_add(1)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseDiagnostic {
+    pub message: String,
+    pub span: Option<SourceSpan>,
+}
+
+impl ParseDiagnostic {
+    pub fn new(message: String, span: Option<SourceSpan>) -> Self {
+        Self { message, span }
+    }
+}
+
+impl std::fmt::Display for ParseDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for ParseDiagnostic {}
+
 #[derive(Debug, Error)]
 pub enum NanoError {
     #[error("parse error: {0}")]

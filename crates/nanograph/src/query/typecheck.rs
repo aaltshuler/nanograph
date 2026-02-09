@@ -51,9 +51,7 @@ pub fn typecheck_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeConte
     let params: HashMap<String, ScalarType> = query
         .params
         .iter()
-        .filter_map(|p| {
-            ScalarType::from_str_name(&p.type_name).map(|s| (p.name.clone(), s))
-        })
+        .filter_map(|p| ScalarType::from_str_name(&p.type_name).map(|s| (p.name.clone(), s)))
         .collect();
 
     // Typecheck match clauses
@@ -131,11 +129,7 @@ fn typecheck_clauses(
     Ok(())
 }
 
-fn typecheck_binding(
-    catalog: &Catalog,
-    binding: &Binding,
-    ctx: &mut TypeContext,
-) -> Result<()> {
+fn typecheck_binding(catalog: &Catalog, binding: &Binding, ctx: &mut TypeContext) -> Result<()> {
     // T1: binding type must exist in catalog
     if !catalog.node_types.contains_key(&binding.type_name) {
         return Err(NanoError::Type(format!(
@@ -197,10 +191,7 @@ fn typecheck_traversal(
     let edge = catalog
         .lookup_edge_by_name(&traversal.edge_name)
         .ok_or_else(|| {
-            NanoError::Type(format!(
-                "T4: unknown edge type `{}`",
-                traversal.edge_name
-            ))
+            NanoError::Type(format!("T4: unknown edge type `{}`", traversal.edge_name))
         })?;
 
     // Determine direction based on bound variables and edge endpoints
@@ -320,17 +311,11 @@ fn resolve_expr_type(
         Expr::PropAccess { variable, property } => {
             // T6: variable must be bound and property must exist
             let bv = ctx.bindings.get(variable).ok_or_else(|| {
-                NanoError::Type(format!(
-                    "T6: variable `${}` is not bound",
-                    variable
-                ))
+                NanoError::Type(format!("T6: variable `${}` is not bound", variable))
             })?;
 
             let node_type = catalog.node_types.get(&bv.type_name).ok_or_else(|| {
-                NanoError::Type(format!(
-                    "T6: type `{}` not found in catalog",
-                    bv.type_name
-                ))
+                NanoError::Type(format!("T6: type `{}` not found in catalog", bv.type_name))
             })?;
 
             let prop = node_type.properties.get(property).ok_or_else(|| {

@@ -36,13 +36,9 @@ pub fn load_jsonl_data(storage: &mut GraphStorage, data: &str) -> Result<()> {
     let mut name_to_id: HashMap<(String, String), u64> = HashMap::new();
 
     for (type_name, nodes) in &node_data {
-        let node_type = storage
-            .catalog
-            .node_types
-            .get(type_name)
-            .ok_or_else(|| {
-                NanoError::Storage(format!("unknown node type in data: {}", type_name))
-            })?;
+        let node_type = storage.catalog.node_types.get(type_name).ok_or_else(|| {
+            NanoError::Storage(format!("unknown node type in data: {}", type_name))
+        })?;
 
         let props: Vec<String> = node_type
             .arrow_schema
@@ -137,9 +133,7 @@ pub fn load_jsonl_data(storage: &mut GraphStorage, data: &str) -> Result<()> {
                     .get(edge_type)
                     .and_then(|key| storage.catalog.edge_types.get(key))
             })
-            .ok_or_else(|| {
-                NanoError::Storage(format!("unknown edge type: {}", edge_type))
-            })?;
+            .ok_or_else(|| NanoError::Storage(format!("unknown edge type: {}", edge_type)))?;
 
         let from_type = et.from_type.clone();
         let to_type = et.to_type.clone();
@@ -156,15 +150,16 @@ pub fn load_jsonl_data(storage: &mut GraphStorage, data: &str) -> Result<()> {
                 NanoError::Storage(format!("node not found: {}:{}", to_type, to_name))
             })?;
 
-        let data = edge_obj
-            .get("data")
-            .and_then(|d| d.as_object())
-            .cloned();
+        let data = edge_obj.get("data").and_then(|d| d.as_object()).cloned();
 
         edges_by_type
             .entry(edge_name)
             .or_default()
-            .push(ResolvedEdge { from_id, to_id, data });
+            .push(ResolvedEdge {
+                from_id,
+                to_id,
+                data,
+            });
     }
 
     // Insert edges batched by type
@@ -172,15 +167,18 @@ pub fn load_jsonl_data(storage: &mut GraphStorage, data: &str) -> Result<()> {
         let src_ids: Vec<u64> = edges.iter().map(|e| e.from_id).collect();
         let dst_ids: Vec<u64> = edges.iter().map(|e| e.to_id).collect();
 
-        let et = storage.catalog.edge_types.get(edge_name).ok_or_else(|| {
-            NanoError::Storage(format!("unknown edge type: {}", edge_name))
-        })?;
+        let et = storage
+            .catalog
+            .edge_types
+            .get(edge_name)
+            .ok_or_else(|| NanoError::Storage(format!("unknown edge type: {}", edge_name)))?;
 
         let prop_batch = if !et.properties.is_empty() {
             // Build property columns from edge data
-            let edge_seg = storage.edge_segments.get(edge_name).ok_or_else(|| {
-                NanoError::Storage(format!("no edge segment: {}", edge_name))
-            })?;
+            let edge_seg = storage
+                .edge_segments
+                .get(edge_name)
+                .ok_or_else(|| NanoError::Storage(format!("no edge segment: {}", edge_name)))?;
             // Edge segment schema: id, src, dst, ...props — skip first 3
             let prop_fields: Vec<Field> = edge_seg
                 .schema
@@ -244,7 +242,10 @@ pub fn json_values_to_array(
             Arc::new(arr)
         }
         DataType::Int32 => {
-            let arr: Int32Array = values.iter().map(|v| v.as_i64().map(|n| n as i32)).collect();
+            let arr: Int32Array = values
+                .iter()
+                .map(|v| v.as_i64().map(|n| n as i32))
+                .collect();
             Arc::new(arr)
         }
         DataType::Int64 => {
@@ -264,11 +265,17 @@ pub fn json_values_to_array(
             Arc::new(arr)
         }
         DataType::Float32 => {
-            let arr: Float32Array = values.iter().map(|v| v.as_f64().map(|n| n as f32)).collect();
+            let arr: Float32Array = values
+                .iter()
+                .map(|v| v.as_f64().map(|n| n as f32))
+                .collect();
             Arc::new(arr)
         }
         DataType::UInt32 => {
-            let arr: UInt32Array = values.iter().map(|v| v.as_u64().map(|n| n as u32)).collect();
+            let arr: UInt32Array = values
+                .iter()
+                .map(|v| v.as_u64().map(|n| n as u32))
+                .collect();
             Arc::new(arr)
         }
         DataType::Date32 => {
