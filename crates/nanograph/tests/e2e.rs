@@ -4,8 +4,8 @@ use arrow::array::{Array, Int32Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 
 use nanograph::catalog::build_catalog;
-use nanograph::ir::lower::lower_query;
 use nanograph::ir::ParamMap;
+use nanograph::ir::lower::lower_query;
 use nanograph::plan::planner::execute_query;
 use nanograph::query::parser::parse_query;
 use nanograph::query::typecheck::typecheck_query;
@@ -182,6 +182,55 @@ query q() {
 }
 
 #[tokio::test]
+async fn test_inline_binding_filters_with_cross_join() {
+    let storage = setup_storage();
+    let results = run_query_test(
+        r#"
+query q() {
+    match {
+        $p: Person { name: "Alice" }
+        $q: Person { name: "Bob" }
+    }
+    return { $p.name as p_name, $q.name as q_name }
+}
+"#,
+        storage,
+    )
+    .await;
+
+    let p_names = extract_string_column(&results, "p_name");
+    let q_names = extract_string_column(&results, "q_name");
+    assert_eq!(p_names, vec!["Alice"]);
+    assert_eq!(q_names, vec!["Bob"]);
+}
+
+#[tokio::test]
+async fn test_multi_scan_explicit_filter_on_single_binding() {
+    let storage = setup_storage();
+    let results = run_query_test(
+        r#"
+query q() {
+    match {
+        $p: Person
+        $q: Person
+        $p.name = "Alice"
+    }
+    return { $p.name as p_name, $q.name as q_name }
+}
+"#,
+        storage,
+    )
+    .await;
+
+    let p_names = extract_string_column(&results, "p_name");
+    let mut q_names = extract_string_column(&results, "q_name");
+    q_names.sort();
+
+    assert_eq!(p_names.len(), 4);
+    assert!(p_names.iter().all(|n| n == "Alice"));
+    assert_eq!(q_names, vec!["Alice", "Bob", "Charlie", "Diana"]);
+}
+#[tokio::test]
 async fn test_one_hop_traversal() {
     let storage = setup_storage();
     let results = run_query_test(
@@ -298,6 +347,32 @@ query q() {
 }
 
 #[tokio::test]
+async fn test_negation_inner_filter_applies() {
+    let storage = setup_storage();
+    let results = run_query_test(
+        r#"
+query q() {
+    match {
+        $p: Person
+        not {
+            $p worksAt $c
+            $c.name = "Acme"
+        }
+    }
+    return { $p.name }
+}
+"#,
+        storage,
+    )
+    .await;
+
+    let mut names = extract_string_column(&results, "name");
+    names.sort();
+    // Excludes only Alice (worksAt Acme). Bob worksAt Globex and should remain.
+    assert_eq!(names, vec!["Bob", "Charlie", "Diana"]);
+}
+
+#[tokio::test]
 async fn test_aggregation_friend_counts() {
     let storage = setup_storage();
     let results = run_query_test(
@@ -347,6 +422,49 @@ query q() {
     assert_eq!(names.len(), 2);
     assert_eq!(names[0], "Charlie"); // age 35
     assert_eq!(names[1], "Alice"); // age 30
+}
+
+#[tokio::test]
+async fn test_limit_without_order() {
+    let storage = setup_storage();
+    let results = run_query_test(
+        r#"
+query q() {
+    match {
+        $p: Person
+    }
+    return { $p.name }
+    limit 2
+}
+"#,
+        storage,
+    )
+    .await;
+
+    let names = extract_string_column(&results, "name");
+    assert_eq!(names, vec!["Alice", "Bob"]);
+}
+
+#[tokio::test]
+async fn test_limit_with_single_scan_filter_pushdown() {
+    let storage = setup_storage();
+    let results = run_query_test(
+        r#"
+query q() {
+    match {
+        $p: Person
+        $p.age > 25
+    }
+    return { $p.name }
+    limit 2
+}
+"#,
+        storage,
+    )
+    .await;
+
+    let names = extract_string_column(&results, "name");
+    assert_eq!(names, vec!["Alice", "Charlie"]);
 }
 
 #[tokio::test]

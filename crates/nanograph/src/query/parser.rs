@@ -1,5 +1,5 @@
-use pest::error::InputLocation;
 use pest::Parser;
+use pest::error::InputLocation;
 use pest_derive::Parser;
 
 use crate::error::{NanoError, ParseDiagnostic, Result, SourceSpan};
@@ -183,7 +183,7 @@ fn parse_prop_match(pair: pest::iterators::Pair<Rule>) -> Result<PropMatch> {
             return Err(NanoError::Parse(format!(
                 "unexpected match value: {:?}",
                 value_inner.as_rule()
-            )))
+            )));
         }
     };
 

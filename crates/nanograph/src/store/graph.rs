@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::array::{Array, AsArray, RecordBatch, UInt64Builder};
@@ -16,6 +17,7 @@ pub struct GraphStorage {
     pub catalog: Catalog,
     pub node_segments: HashMap<String, NodeSegment>,
     pub edge_segments: HashMap<String, EdgeSegment>,
+    node_dataset_paths: HashMap<String, PathBuf>,
     next_node_id: u64,
     next_edge_id: u64,
 }
@@ -93,6 +95,7 @@ impl GraphStorage {
             catalog,
             node_segments,
             edge_segments,
+            node_dataset_paths: HashMap::new(),
             next_node_id: 0,
             next_edge_id: 0,
         }
@@ -408,6 +411,18 @@ impl GraphStorage {
 
     pub fn next_edge_id(&self) -> u64 {
         self.next_edge_id
+    }
+
+    pub fn set_node_dataset_path(&mut self, type_name: &str, path: PathBuf) {
+        self.node_dataset_paths.insert(type_name.to_string(), path);
+    }
+
+    pub fn clear_node_dataset_paths(&mut self) {
+        self.node_dataset_paths.clear();
+    }
+
+    pub fn node_dataset_path(&self, type_name: &str) -> Option<&Path> {
+        self.node_dataset_paths.get(type_name).map(|p| p.as_path())
     }
 }
 

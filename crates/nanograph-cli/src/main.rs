@@ -6,24 +6,24 @@ use std::sync::Arc;
 use ariadne::{Color, Label, Report, ReportKind, Source};
 use arrow::array::RecordBatch;
 use clap::{Parser, Subcommand};
-use color_eyre::eyre::{eyre, Result, WrapErr};
+use color_eyre::eyre::{Result, WrapErr, eyre};
 use tracing::{debug, info, instrument};
 use tracing_subscriber::EnvFilter;
 
 use nanograph::catalog::build_catalog;
 use nanograph::error::ParseDiagnostic;
-use nanograph::ir::lower::lower_query;
 use nanograph::ir::ParamMap;
+use nanograph::ir::lower::lower_query;
 use nanograph::plan::planner::execute_query;
 use nanograph::query::ast::Literal;
 use nanograph::query::parser::parse_query_diagnostic;
 use nanograph::query::typecheck::typecheck_query;
 use nanograph::schema::parser::parse_schema_diagnostic;
-use nanograph::store::database::Database;
+use nanograph::store::database::{Database, DeleteOp, DeletePredicate};
 use nanograph::store::graph::GraphStorage;
 use nanograph::store::loader::load_jsonl_data;
 use nanograph::store::migration::{
-    execute_schema_migration, MigrationExecution, MigrationPlan, MigrationStatus, MigrationStep,
+    MigrationExecution, MigrationPlan, MigrationStatus, MigrationStep, execute_schema_migration,
 };
 
 #[derive(Parser)]
@@ -51,6 +51,17 @@ enum Commands {
         db_path: PathBuf,
         #[arg(long)]
         data: PathBuf,
+    },
+    /// Delete nodes by predicate, cascading incident edges
+    Delete {
+        /// Path to the database directory
+        db_path: PathBuf,
+        /// Node type name
+        #[arg(long = "type")]
+        type_name: String,
+        /// Predicate expression, e.g. name=Alice or age>=30
+        #[arg(long = "where")]
+        predicate: String,
     },
     /// Diff and apply schema migration from <db>/schema.pg
     Migrate {
@@ -110,6 +121,11 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Init { db_path, schema } => cmd_init(&db_path, &schema).await,
         Commands::Load { db_path, data } => cmd_load(&db_path, &data).await,
+        Commands::Delete {
+            db_path,
+            type_name,
+            predicate,
+        } => cmd_delete(&db_path, &type_name, &predicate).await,
         Commands::Migrate {
             db_path,
             dry_run,
@@ -310,6 +326,26 @@ async fn cmd_load(db_path: &PathBuf, data_path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
+#[instrument(skip(type_name, predicate), fields(db_path = %db_path.display(), type_name = type_name))]
+async fn cmd_delete(db_path: &PathBuf, type_name: &str, predicate: &str) -> Result<()> {
+    let pred = parse_delete_predicate(predicate)?;
+    let mut db = Database::open(db_path).await?;
+    let result = db.delete_nodes(type_name, &pred).await?;
+
+    info!(
+        deleted_nodes = result.deleted_nodes,
+        deleted_edges = result.deleted_edges,
+        "delete complete"
+    );
+    println!(
+        "Deleted {} node(s) and {} edge(s) in {}",
+        result.deleted_nodes,
+        result.deleted_edges,
+        db_path.display()
+    );
+    Ok(())
+}
+
 #[instrument(skip(db, schema, query_path), fields(query_path = %query_path.display()))]
 async fn cmd_check(
     db: Option<PathBuf>,
@@ -491,6 +527,49 @@ fn parse_param(s: &str) -> std::result::Result<(String, String), String> {
         value
     };
     Ok((key, value))
+}
+
+fn parse_delete_predicate(input: &str) -> Result<DeletePredicate> {
+    let ops = [
+        (">=", DeleteOp::Ge),
+        ("<=", DeleteOp::Le),
+        ("!=", DeleteOp::Ne),
+        ("=", DeleteOp::Eq),
+        (">", DeleteOp::Gt),
+        ("<", DeleteOp::Lt),
+    ];
+
+    for (token, op) in ops {
+        if let Some(pos) = input.find(token) {
+            let property = input[..pos].trim();
+            let raw_value = input[pos + token.len()..].trim();
+            if property.is_empty() || raw_value.is_empty() {
+                return Err(eyre!(
+                    "invalid --where predicate '{}': expected <property><op><value>",
+                    input
+                ));
+            }
+
+            let value = if (raw_value.starts_with('"') && raw_value.ends_with('"'))
+                || (raw_value.starts_with('\'') && raw_value.ends_with('\''))
+            {
+                raw_value[1..raw_value.len() - 1].to_string()
+            } else {
+                raw_value.to_string()
+            };
+
+            return Ok(DeletePredicate {
+                property: property.to_string(),
+                op,
+                value,
+            });
+        }
+    }
+
+    Err(eyre!(
+        "invalid --where predicate '{}': supported operators are =, !=, >, >=, <, <=",
+        input
+    ))
 }
 
 /// Build a ParamMap from raw CLI strings using query param type declarations.

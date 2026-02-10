@@ -6,7 +6,7 @@ use tempfile::TempDir;
 
 use nanograph::store::database::Database;
 use nanograph::store::manifest::GraphManifest;
-use nanograph::store::migration::{execute_schema_migration, MigrationStatus, MigrationStep};
+use nanograph::store::migration::{MigrationStatus, MigrationStep, execute_schema_migration};
 
 fn base_schema() -> &'static str {
     r#"

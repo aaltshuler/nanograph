@@ -2,6 +2,6 @@
 *.nanograph
 *.lance
 .DS_Store
-docs/
+docs-no-sync/
 .claude/
 .reference/

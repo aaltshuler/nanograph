@@ -16,8 +16,10 @@ use crate::query::ast::{AggFunc, CompOp, Literal};
 use crate::store::graph::GraphStorage;
 use tracing::{debug, info, instrument};
 
-use super::node_scan::NodeScanExec;
+use super::node_scan::{NodeScanExec, NodeScanPredicate};
 use super::physical::ExpandExec;
+
+type ScanProjectionMap = AHashMap<String, Option<AHashSet<String>>>;
 
 /// Execute a query IR against a graph storage, returning a RecordBatch of results.
 #[instrument(skip(ir, storage, params), fields(query = %ir.name, pipeline_len = ir.pipeline.len()))]
@@ -27,8 +29,30 @@ pub async fn execute_query(
     params: &ParamMap,
 ) -> Result<Vec<RecordBatch>> {
     info!("executing query");
+    let has_aggregation = ir
+        .return_exprs
+        .iter()
+        .any(|p| matches!(&p.expr, IRExpr::Aggregate { .. }));
+    let single_scan_pushdown = analyze_single_scan_pushdown(&ir.pipeline, params);
+    let scan_limit_pushdown = if !has_aggregation && ir.order_by.is_empty() {
+        ir.limit.and_then(|v| {
+            single_scan_pushdown
+                .as_ref()
+                .filter(|info| info.all_filters_pushdown)
+                .map(|_| v as usize)
+        })
+    } else {
+        None
+    };
+    let scan_projections = analyze_scan_projection_requirements(ir);
     // Build the physical plan from IR
-    let plan = build_physical_plan(&ir.pipeline, storage.clone())?;
+    let plan = build_physical_plan(
+        &ir.pipeline,
+        storage.clone(),
+        params,
+        scan_limit_pushdown,
+        &scan_projections,
+    )?;
 
     // Execute the plan to get intermediate results
     let ctx = SessionContext::new();
@@ -37,10 +61,6 @@ pub async fn execute_query(
         .execute(0, task_ctx)
         .map_err(|e| NanoError::Execution(e.to_string()))?;
 
-    let has_aggregation = ir
-        .return_exprs
-        .iter()
-        .any(|p| matches!(&p.expr, IRExpr::Aggregate { .. }));
     let can_stream_batchwise = !has_aggregation && ir.order_by.is_empty() && ir.limit.is_none();
     debug!(
         has_aggregation,
@@ -105,6 +125,9 @@ pub async fn execute_query(
 fn build_physical_plan(
     pipeline: &[IROp],
     storage: Arc<GraphStorage>,
+    params: &ParamMap,
+    scan_limit_pushdown: Option<usize>,
+    scan_projections: &ScanProjectionMap,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let mut current_plan: Option<Arc<dyn ExecutionPlan>> = None;
 
@@ -113,20 +136,19 @@ fn build_physical_plan(
             IROp::NodeScan {
                 variable,
                 type_name,
-                filters: _,
+                filters,
             } => {
                 let node_schema =
                     storage.catalog.node_types.get(type_name).ok_or_else(|| {
                         NanoError::Plan(format!("unknown node type: {}", type_name))
                     })?;
 
-                // Build struct output schema
-                let struct_fields: Vec<Field> = node_schema
-                    .arrow_schema
-                    .fields()
-                    .iter()
-                    .map(|f| f.as_ref().clone())
-                    .collect();
+                // Build struct output schema, pruning to required fields when possible.
+                let struct_fields = select_scan_struct_fields(
+                    variable,
+                    &node_schema.arrow_schema,
+                    scan_projections,
+                );
                 let struct_field =
                     Field::new(variable, DataType::Struct(struct_fields.into()), false);
 
@@ -144,13 +166,25 @@ fn build_physical_plan(
                     Arc::new(Schema::new(vec![struct_field]))
                 };
 
+                let mut pushdown_filters = build_scan_pushdown_filters(variable, filters, params);
+                pushdown_filters
+                    .extend(build_explicit_pushdown_filters(variable, pipeline, params));
+
                 let scan = NodeScanExec::new(
                     type_name.clone(),
                     variable.clone(),
-                    Arc::new(Schema::new(vec![output_schema
-                        .field(output_schema.fields().len() - 1)
-                        .as_ref()
-                        .clone()])),
+                    Arc::new(Schema::new(vec![
+                        output_schema
+                            .field(output_schema.fields().len() - 1)
+                            .as_ref()
+                            .clone(),
+                    ])),
+                    pushdown_filters,
+                    if current_plan.is_none() {
+                        scan_limit_pushdown
+                    } else {
+                        None
+                    },
                     storage.clone(),
                 );
 
@@ -194,13 +228,20 @@ fn build_physical_plan(
 
                 // Build the inner plan, seeding it with the outer plan as input
                 // so Expand ops have the source rows to work with
-                let inner_plan =
-                    build_physical_plan_with_input(inner, storage.clone(), outer.clone())?;
+                let inner_plan = build_physical_plan_with_input(
+                    inner,
+                    storage.clone(),
+                    outer.clone(),
+                    params,
+                    scan_projections,
+                )?;
 
                 current_plan = Some(Arc::new(AntiJoinExec::new(
                     outer,
                     inner_plan,
                     outer_var.clone(),
+                    inner.clone(),
+                    params.clone(),
                     storage.clone(),
                 )));
             }
@@ -216,6 +257,8 @@ fn build_physical_plan_with_input(
     pipeline: &[IROp],
     storage: Arc<GraphStorage>,
     input: Arc<dyn ExecutionPlan>,
+    params: &ParamMap,
+    scan_projections: &ScanProjectionMap,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let mut current_plan: Option<Arc<dyn ExecutionPlan>> = Some(input);
 
@@ -224,19 +267,18 @@ fn build_physical_plan_with_input(
             IROp::NodeScan {
                 variable,
                 type_name,
-                filters: _,
+                filters,
             } => {
                 let node_schema =
                     storage.catalog.node_types.get(type_name).ok_or_else(|| {
                         NanoError::Plan(format!("unknown node type: {}", type_name))
                     })?;
 
-                let struct_fields: Vec<Field> = node_schema
-                    .arrow_schema
-                    .fields()
-                    .iter()
-                    .map(|f| f.as_ref().clone())
-                    .collect();
+                let struct_fields = select_scan_struct_fields(
+                    variable,
+                    &node_schema.arrow_schema,
+                    scan_projections,
+                );
                 let struct_field =
                     Field::new(variable, DataType::Struct(struct_fields.into()), false);
 
@@ -253,13 +295,21 @@ fn build_physical_plan_with_input(
                     Arc::new(Schema::new(vec![struct_field]))
                 };
 
+                let mut pushdown_filters = build_scan_pushdown_filters(variable, filters, params);
+                pushdown_filters
+                    .extend(build_explicit_pushdown_filters(variable, pipeline, params));
+
                 let scan = NodeScanExec::new(
                     type_name.clone(),
                     variable.clone(),
-                    Arc::new(Schema::new(vec![output_schema
-                        .field(output_schema.fields().len() - 1)
-                        .as_ref()
-                        .clone()])),
+                    Arc::new(Schema::new(vec![
+                        output_schema
+                            .field(output_schema.fields().len() - 1)
+                            .as_ref()
+                            .clone(),
+                    ])),
+                    pushdown_filters,
+                    None,
                     storage.clone(),
                 );
 
@@ -299,12 +349,19 @@ fn build_physical_plan_with_input(
             IROp::AntiJoin { outer_var, inner } => {
                 let outer = current_plan
                     .ok_or_else(|| NanoError::Plan("AntiJoin without outer input".to_string()))?;
-                let inner_plan =
-                    build_physical_plan_with_input(inner, storage.clone(), outer.clone())?;
+                let inner_plan = build_physical_plan_with_input(
+                    inner,
+                    storage.clone(),
+                    outer.clone(),
+                    params,
+                    scan_projections,
+                )?;
                 current_plan = Some(Arc::new(AntiJoinExec::new(
                     outer,
                     inner_plan,
                     outer_var.clone(),
+                    inner.clone(),
+                    params.clone(),
                     storage.clone(),
                 )));
             }
@@ -314,22 +371,303 @@ fn build_physical_plan_with_input(
     current_plan.ok_or_else(|| NanoError::Plan("empty inner pipeline".to_string()))
 }
 
+fn build_scan_pushdown_filters(
+    variable: &str,
+    filters: &[IRFilter],
+    params: &ParamMap,
+) -> Vec<NodeScanPredicate> {
+    filters
+        .iter()
+        .filter_map(|filter| pushdown_scan_filter(variable, filter, params))
+        .collect()
+}
+
+fn build_explicit_pushdown_filters(
+    variable: &str,
+    pipeline: &[IROp],
+    params: &ParamMap,
+) -> Vec<NodeScanPredicate> {
+    pipeline
+        .iter()
+        .filter_map(|op| match op {
+            IROp::Filter(filter) => pushdown_scan_filter(variable, filter, params),
+            _ => None,
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+struct SingleScanPushdownInfo {
+    all_filters_pushdown: bool,
+}
+
+fn analyze_single_scan_pushdown(
+    pipeline: &[IROp],
+    params: &ParamMap,
+) -> Option<SingleScanPushdownInfo> {
+    let mut scan_var: Option<&str> = None;
+    let mut scan_filters: &[IRFilter] = &[];
+    let mut explicit_filters: Vec<&IRFilter> = Vec::new();
+
+    for op in pipeline {
+        match op {
+            IROp::NodeScan {
+                variable, filters, ..
+            } => {
+                if scan_var.is_some() {
+                    return None;
+                }
+                scan_var = Some(variable);
+                scan_filters = filters;
+            }
+            IROp::Filter(filter) => explicit_filters.push(filter),
+            _ => return None,
+        }
+    }
+
+    let variable = scan_var?;
+    let mut all_filters_pushdown = true;
+    for filter in scan_filters {
+        if pushdown_scan_filter(variable, filter, params).is_none() {
+            all_filters_pushdown = false;
+        }
+    }
+
+    for filter in explicit_filters {
+        if pushdown_scan_filter(variable, filter, params).is_none() {
+            all_filters_pushdown = false;
+        }
+    }
+
+    Some(SingleScanPushdownInfo {
+        all_filters_pushdown,
+    })
+}
+
+fn analyze_scan_projection_requirements(ir: &QueryIR) -> ScanProjectionMap {
+    let mut scan_variables = AHashSet::new();
+    collect_scan_variables(&ir.pipeline, &mut scan_variables);
+
+    let mut requirements: ScanProjectionMap = scan_variables
+        .iter()
+        .map(|var| (var.clone(), Some(AHashSet::new())))
+        .collect();
+
+    collect_pipeline_projection_requirements(&ir.pipeline, &scan_variables, &mut requirements);
+    for proj in &ir.return_exprs {
+        collect_expr_projection_requirements(&proj.expr, &scan_variables, &mut requirements);
+    }
+    for ordering in &ir.order_by {
+        collect_expr_projection_requirements(&ordering.expr, &scan_variables, &mut requirements);
+    }
+
+    // Keep id available for join/expand semantics and stable downstream behavior.
+    for required in requirements.values_mut() {
+        if let Some(props) = required {
+            props.insert("id".to_string());
+        }
+    }
+
+    requirements
+}
+
+fn collect_scan_variables(pipeline: &[IROp], out: &mut AHashSet<String>) {
+    for op in pipeline {
+        match op {
+            IROp::NodeScan { variable, .. } => {
+                out.insert(variable.clone());
+            }
+            IROp::AntiJoin { inner, .. } => collect_scan_variables(inner, out),
+            _ => {}
+        }
+    }
+}
+
+fn collect_pipeline_projection_requirements(
+    pipeline: &[IROp],
+    scan_variables: &AHashSet<String>,
+    requirements: &mut ScanProjectionMap,
+) {
+    for op in pipeline {
+        match op {
+            IROp::NodeScan {
+                variable, filters, ..
+            } => {
+                for filter in filters {
+                    collect_expr_projection_requirements(
+                        &filter.left,
+                        scan_variables,
+                        requirements,
+                    );
+                    collect_expr_projection_requirements(
+                        &filter.right,
+                        scan_variables,
+                        requirements,
+                    );
+                }
+
+                // Always keep id available for the bound variable.
+                mark_scan_property(requirements, variable, "id");
+            }
+            IROp::Expand { src_var, .. } => {
+                mark_scan_property(requirements, src_var, "id");
+            }
+            IROp::Filter(filter) => {
+                collect_expr_projection_requirements(&filter.left, scan_variables, requirements);
+                collect_expr_projection_requirements(&filter.right, scan_variables, requirements);
+            }
+            IROp::AntiJoin { outer_var, inner } => {
+                mark_scan_property(requirements, outer_var, "id");
+                collect_pipeline_projection_requirements(inner, scan_variables, requirements);
+            }
+        }
+    }
+}
+
+fn collect_expr_projection_requirements(
+    expr: &IRExpr,
+    scan_variables: &AHashSet<String>,
+    requirements: &mut ScanProjectionMap,
+) {
+    match expr {
+        IRExpr::PropAccess { variable, property } => {
+            if scan_variables.contains(variable) {
+                mark_scan_property(requirements, variable, property);
+            }
+        }
+        IRExpr::Variable(variable) => {
+            if scan_variables.contains(variable) {
+                mark_scan_full(requirements, variable);
+            }
+        }
+        IRExpr::Aggregate { arg, .. } => {
+            collect_expr_projection_requirements(arg, scan_variables, requirements);
+        }
+        _ => {}
+    }
+}
+
+fn mark_scan_property(requirements: &mut ScanProjectionMap, variable: &str, property: &str) {
+    if let Some(required) = requirements.get_mut(variable) {
+        if let Some(props) = required {
+            props.insert(property.to_string());
+        }
+    }
+}
+
+fn mark_scan_full(requirements: &mut ScanProjectionMap, variable: &str) {
+    if let Some(required) = requirements.get_mut(variable) {
+        *required = None;
+    }
+}
+
+fn select_scan_struct_fields(
+    variable: &str,
+    node_schema: &SchemaRef,
+    scan_projections: &ScanProjectionMap,
+) -> Vec<Field> {
+    match scan_projections.get(variable) {
+        Some(Some(required_props)) => {
+            let selected: Vec<Field> = node_schema
+                .fields()
+                .iter()
+                .filter(|field| required_props.contains(field.name()))
+                .map(|f| f.as_ref().clone())
+                .collect();
+            if selected.is_empty() {
+                node_schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.as_ref().clone())
+                    .collect()
+            } else {
+                selected
+            }
+        }
+        _ => node_schema
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect(),
+    }
+}
+
+fn pushdown_scan_filter(
+    variable: &str,
+    filter: &IRFilter,
+    params: &ParamMap,
+) -> Option<NodeScanPredicate> {
+    match (&filter.left, &filter.right) {
+        (
+            IRExpr::PropAccess {
+                variable: v,
+                property,
+            },
+            rhs,
+        ) if v == variable => pushdown_literal(rhs, params).map(|literal| NodeScanPredicate {
+            property: property.clone(),
+            op: filter.op,
+            literal,
+        }),
+        (
+            lhs,
+            IRExpr::PropAccess {
+                variable: v,
+                property,
+            },
+        ) if v == variable => pushdown_literal(lhs, params).map(|literal| NodeScanPredicate {
+            property: property.clone(),
+            op: flip_comp_op(filter.op),
+            literal,
+        }),
+        _ => None,
+    }
+}
+
+fn pushdown_literal(expr: &IRExpr, params: &ParamMap) -> Option<Literal> {
+    match expr {
+        IRExpr::Literal(lit) => Some(lit.clone()),
+        IRExpr::Param(name) => params.get(name).cloned(),
+        _ => None,
+    }
+}
+
+fn flip_comp_op(op: CompOp) -> CompOp {
+    match op {
+        CompOp::Eq => CompOp::Eq,
+        CompOp::Ne => CompOp::Ne,
+        CompOp::Gt => CompOp::Lt,
+        CompOp::Lt => CompOp::Gt,
+        CompOp::Ge => CompOp::Le,
+        CompOp::Le => CompOp::Ge,
+    }
+}
+
 fn apply_ir_filters(
     pipeline: &[IROp],
     batches: &[RecordBatch],
     params: &ParamMap,
 ) -> Result<Vec<RecordBatch>> {
+    let scan_variables = pipeline_scan_variables(pipeline);
     let mut filters: Vec<&IRFilter> = Vec::new();
 
     for op in pipeline {
         match op {
-            IROp::Filter(f) => filters.push(f),
+            IROp::Filter(f) => {
+                if is_explicit_filter_pushed_down(&scan_variables, f, params) {
+                    continue;
+                }
+                filters.push(f);
+            }
             IROp::NodeScan {
+                variable,
                 filters: scan_filters,
                 ..
             } => {
                 for f in scan_filters {
-                    filters.push(f);
+                    if pushdown_scan_filter(variable, f, params).is_none() {
+                        filters.push(f);
+                    }
                 }
             }
             _ => {}
@@ -345,6 +683,26 @@ fn apply_ir_filters(
         result = apply_single_filter(filter, &result, params)?;
     }
     Ok(result)
+}
+
+fn pipeline_scan_variables(pipeline: &[IROp]) -> AHashSet<String> {
+    pipeline
+        .iter()
+        .filter_map(|op| match op {
+            IROp::NodeScan { variable, .. } => Some(variable.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn is_explicit_filter_pushed_down(
+    scan_variables: &AHashSet<String>,
+    filter: &IRFilter,
+    params: &ParamMap,
+) -> bool {
+    scan_variables
+        .iter()
+        .any(|variable| pushdown_scan_filter(variable, filter, params).is_some())
 }
 
 fn apply_single_filter(
@@ -1092,6 +1450,8 @@ struct AntiJoinExec {
     outer: Arc<dyn ExecutionPlan>,
     inner: Arc<dyn ExecutionPlan>,
     join_var: String,
+    inner_pipeline: Vec<IROp>,
+    params: ParamMap,
     storage: Arc<GraphStorage>,
     output_schema: SchemaRef,
     properties: PlanProperties,
@@ -1102,6 +1462,8 @@ impl AntiJoinExec {
         outer: Arc<dyn ExecutionPlan>,
         inner: Arc<dyn ExecutionPlan>,
         join_var: String,
+        inner_pipeline: Vec<IROp>,
+        params: ParamMap,
         storage: Arc<GraphStorage>,
     ) -> Self {
         let output_schema = outer.schema();
@@ -1115,6 +1477,8 @@ impl AntiJoinExec {
             outer,
             inner,
             join_var,
+            inner_pipeline,
+            params,
             storage,
             output_schema,
             properties,
@@ -1157,6 +1521,8 @@ impl ExecutionPlan for AntiJoinExec {
             children[0].clone(),
             children[1].clone(),
             self.join_var.clone(),
+            self.inner_pipeline.clone(),
+            self.params.clone(),
             self.storage.clone(),
         )))
     }
@@ -1171,6 +1537,8 @@ impl ExecutionPlan for AntiJoinExec {
                 outer_stream: SendableRecordBatchStream,
                 inner_stream: SendableRecordBatchStream,
                 join_var: String,
+                inner_pipeline: Vec<IROp>,
+                params: ParamMap,
             },
             Running {
                 outer_stream: SendableRecordBatchStream,
@@ -1186,6 +1554,8 @@ impl ExecutionPlan for AntiJoinExec {
             outer_stream,
             inner_stream,
             join_var: self.join_var.clone(),
+            inner_pipeline: self.inner_pipeline.clone(),
+            params: self.params.clone(),
         };
 
         let stream = futures::stream::try_unfold(init, |state| async move {
@@ -1198,22 +1568,34 @@ impl ExecutionPlan for AntiJoinExec {
                         outer_stream,
                         mut inner_stream,
                         join_var,
+                        inner_pipeline,
+                        params,
                     } => {
                         let mut inner_ids: AHashSet<u64> = AHashSet::new();
 
                         while let Some(batch) = inner_stream.next().await {
                             let batch = batch?;
-                            if let Ok(col_idx) = batch.schema().index_of(&join_var) {
-                                let col = batch.column(col_idx);
-                                if let Some(struct_arr) = col.as_any().downcast_ref::<StructArray>()
-                                {
-                                    if let Some(id_col) = struct_arr.column_by_name("id") {
-                                        if let Some(id_arr) = id_col
-                                            .as_any()
-                                            .downcast_ref::<arrow::array::UInt64Array>(
-                                        ) {
-                                            for i in 0..id_arr.len() {
-                                                inner_ids.insert(id_arr.value(i));
+                            let filtered_batches =
+                                apply_ir_filters(&inner_pipeline, &[batch], &params).map_err(
+                                    |e| {
+                                        datafusion::error::DataFusionError::Execution(e.to_string())
+                                    },
+                                )?;
+
+                            for filtered in filtered_batches {
+                                if let Ok(col_idx) = filtered.schema().index_of(&join_var) {
+                                    let col = filtered.column(col_idx);
+                                    if let Some(struct_arr) =
+                                        col.as_any().downcast_ref::<StructArray>()
+                                    {
+                                        if let Some(id_col) = struct_arr.column_by_name("id") {
+                                            if let Some(id_arr) = id_col
+                                                .as_any()
+                                                .downcast_ref::<arrow::array::UInt64Array>(
+                                            ) {
+                                                for i in 0..id_arr.len() {
+                                                    inner_ids.insert(id_arr.value(i));
+                                                }
                                             }
                                         }
                                     }

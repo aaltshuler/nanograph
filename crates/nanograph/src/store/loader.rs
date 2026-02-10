@@ -11,6 +11,16 @@ use super::graph::GraphStorage;
 /// Load JSONL-formatted data into a GraphStorage.
 /// Each line is either a node `{"type": "...", "data": {...}}` or edge `{"edge": "...", "from": "...", "to": "..."}`.
 pub fn load_jsonl_data(storage: &mut GraphStorage, data: &str) -> Result<()> {
+    load_jsonl_data_with_name_seed(storage, data, None)
+}
+
+/// Load JSONL-formatted data into a GraphStorage with an optional pre-populated
+/// name-to-id mapping for resolving edges that reference existing nodes.
+pub fn load_jsonl_data_with_name_seed(
+    storage: &mut GraphStorage,
+    data: &str,
+    name_seed: Option<&HashMap<(String, String), u64>>,
+) -> Result<()> {
     let mut node_data: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
     let mut edge_data: Vec<serde_json::Value> = Vec::new();
 
@@ -33,7 +43,7 @@ pub fn load_jsonl_data(storage: &mut GraphStorage, data: &str) -> Result<()> {
     }
 
     // Insert nodes
-    let mut name_to_id: HashMap<(String, String), u64> = HashMap::new();
+    let mut name_to_id: HashMap<(String, String), u64> = name_seed.cloned().unwrap_or_default();
 
     for (type_name, nodes) in &node_data {
         let node_type = storage.catalog.node_types.get(type_name).ok_or_else(|| {
@@ -105,7 +115,9 @@ pub fn load_jsonl_data(storage: &mut GraphStorage, data: &str) -> Result<()> {
         to_id: u64,
         data: Option<serde_json::Map<String, serde_json::Value>>,
     }
-    let mut edges_by_type: BTreeMap<String, Vec<ResolvedEdge>> = BTreeMap::new();
+    // No multigraph support: deduplicate by (src, dst) per edge type.
+    // Last occurrence wins so later lines can override edge properties.
+    let mut edges_by_type: BTreeMap<String, BTreeMap<(u64, u64), ResolvedEdge>> = BTreeMap::new();
 
     for edge_obj in &edge_data {
         let edge_type = edge_obj
@@ -152,18 +164,19 @@ pub fn load_jsonl_data(storage: &mut GraphStorage, data: &str) -> Result<()> {
 
         let data = edge_obj.get("data").and_then(|d| d.as_object()).cloned();
 
-        edges_by_type
-            .entry(edge_name)
-            .or_default()
-            .push(ResolvedEdge {
+        edges_by_type.entry(edge_name).or_default().insert(
+            (from_id, to_id),
+            ResolvedEdge {
                 from_id,
                 to_id,
                 data,
-            });
+            },
+        );
     }
 
     // Insert edges batched by type
-    for (edge_name, edges) in &edges_by_type {
+    for (edge_name, edges_map) in &edges_by_type {
+        let edges: Vec<&ResolvedEdge> = edges_map.values().collect();
         let src_ids: Vec<u64> = edges.iter().map(|e| e.from_id).collect();
         let dst_ids: Vec<u64> = edges.iter().map(|e| e.to_id).collect();
 
@@ -192,7 +205,8 @@ pub fn load_jsonl_data(storage: &mut GraphStorage, data: &str) -> Result<()> {
             for field in &prop_fields {
                 let values: Vec<serde_json::Value> = edges
                     .iter()
-                    .map(|e| {
+                    .map(|edge| {
+                        let e = *edge;
                         e.data
                             .as_ref()
                             .and_then(|d| d.get(field.name()))

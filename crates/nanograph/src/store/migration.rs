@@ -3,23 +3,23 @@ use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use arrow::array::{new_null_array, ArrayRef, AsArray, RecordBatch, UInt64Array};
+use arrow::array::{ArrayRef, AsArray, RecordBatch, UInt64Array, new_null_array};
 use arrow::datatypes::UInt64Type;
 use arrow::record_batch::RecordBatchIterator;
-use lance::dataset::{WriteMode, WriteParams};
 use lance::Dataset;
+use lance::dataset::{WriteMode, WriteParams};
 use serde::{Deserialize, Serialize};
 
-use crate::catalog::schema_ir::{
-    build_catalog_from_ir, EdgeTypeDef, NodeTypeDef, PropDef, SchemaIR, TypeDef,
-};
 use crate::catalog::Catalog;
+use crate::catalog::schema_ir::{
+    EdgeTypeDef, NodeTypeDef, PropDef, SchemaIR, TypeDef, build_catalog_from_ir,
+};
 use crate::error::{NanoError, Result};
 use crate::schema::ast::{Annotation, PropDecl, SchemaDecl, SchemaFile};
 use crate::schema::parser::parse_schema;
 use crate::store::database::Database;
 use crate::store::graph::GraphStorage;
-use crate::store::manifest::{hash_string, DatasetEntry, GraphManifest};
+use crate::store::manifest::{DatasetEntry, GraphManifest, hash_string};
 use crate::types::ScalarType;
 
 const SCHEMA_PG_FILENAME: &str = "schema.pg";

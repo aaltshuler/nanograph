@@ -1,5 +1,5 @@
-use pest::error::InputLocation;
 use pest::Parser;
+use pest::error::InputLocation;
 use pest_derive::Parser;
 
 use crate::error::{NanoError, ParseDiagnostic, Result, SourceSpan};
@@ -32,7 +32,9 @@ pub fn parse_schema_diagnostic(input: &str) -> std::result::Result<SchemaFile, P
             _ => {}
         }
     }
-    Ok(SchemaFile { declarations })
+    let schema = SchemaFile { declarations };
+    validate_schema_annotations(&schema).map_err(nano_error_to_diagnostic)?;
+    Ok(schema)
 }
 
 fn pest_error_to_diagnostic(err: pest::error::Error<Rule>) -> ParseDiagnostic {
@@ -159,6 +161,91 @@ fn parse_annotation(pair: pest::iterators::Pair<Rule>) -> Result<Annotation> {
     });
 
     Ok(Annotation { name, value })
+}
+
+fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
+    for decl in &schema.declarations {
+        match decl {
+            SchemaDecl::Node(node) => {
+                for ann in &node.annotations {
+                    if ann.name == "key" || ann.name == "unique" {
+                        return Err(NanoError::Parse(format!(
+                            "@{} is only supported on node properties (node {})",
+                            ann.name, node.name
+                        )));
+                    }
+                }
+
+                let mut key_count = 0usize;
+                for prop in &node.properties {
+                    let mut key_seen = false;
+                    let mut unique_seen = false;
+                    for ann in &prop.annotations {
+                        if ann.name == "key" {
+                            if ann.value.is_some() {
+                                return Err(NanoError::Parse(format!(
+                                    "@key on {}.{} does not accept a value",
+                                    node.name, prop.name
+                                )));
+                            }
+                            if key_seen {
+                                return Err(NanoError::Parse(format!(
+                                    "property {}.{} declares @key multiple times",
+                                    node.name, prop.name
+                                )));
+                            }
+                            key_seen = true;
+                            key_count += 1;
+                        } else if ann.name == "unique" {
+                            if ann.value.is_some() {
+                                return Err(NanoError::Parse(format!(
+                                    "@unique on {}.{} does not accept a value",
+                                    node.name, prop.name
+                                )));
+                            }
+                            if unique_seen {
+                                return Err(NanoError::Parse(format!(
+                                    "property {}.{} declares @unique multiple times",
+                                    node.name, prop.name
+                                )));
+                            }
+                            unique_seen = true;
+                        }
+                    }
+                }
+
+                if key_count > 1 {
+                    return Err(NanoError::Parse(format!(
+                        "node type {} has multiple @key properties; only one is currently supported",
+                        node.name
+                    )));
+                }
+            }
+            SchemaDecl::Edge(edge) => {
+                for ann in &edge.annotations {
+                    if ann.name == "key" || ann.name == "unique" {
+                        return Err(NanoError::Parse(format!(
+                            "@{} is not supported on edges (edge {})",
+                            ann.name, edge.name
+                        )));
+                    }
+                }
+
+                for prop in &edge.properties {
+                    for ann in &prop.annotations {
+                        if ann.name == "key" || ann.name == "unique" {
+                            return Err(NanoError::Parse(format!(
+                                "@{} is not supported on edge properties (edge {}.{})",
+                                ann.name, edge.name, prop.name
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -302,6 +389,56 @@ edge ConnectedTo: Account -> Account @rename_from("Knows")
             }
             _ => panic!("expected Edge"),
         }
+    }
+
+    #[test]
+    fn test_reject_multiple_node_keys() {
+        let input = r#"
+node Person {
+    id: U64 @key
+    ext_id: String @key
+}
+"#;
+        let err = parse_schema(input).unwrap_err();
+        assert!(err.to_string().contains("multiple @key properties"));
+    }
+
+    #[test]
+    fn test_reject_unique_with_value() {
+        let input = r#"
+node Person {
+    email: String @unique("x")
+}
+"#;
+        let err = parse_schema(input).unwrap_err();
+        assert!(err.to_string().contains("@unique"));
+        assert!(err.to_string().contains("does not accept a value"));
+    }
+
+    #[test]
+    fn test_reject_unique_on_node_annotation() {
+        let input = r#"
+node Person @unique {
+    email: String
+}
+"#;
+        let err = parse_schema(input).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("only supported on node properties")
+        );
+    }
+
+    #[test]
+    fn test_reject_unique_on_edge_property() {
+        let input = r#"
+node Person { name: String }
+edge Knows: Person -> Person {
+    weight: I32 @unique
+}
+"#;
+        let err = parse_schema(input).unwrap_err();
+        assert!(err.to_string().contains("edge properties"));
     }
 
     #[test]

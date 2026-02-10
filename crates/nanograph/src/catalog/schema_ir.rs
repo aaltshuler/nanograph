@@ -63,11 +63,7 @@ fn fnv1a_type_id(kind: &str, name: &str) -> u32 {
         hash ^= byte as u32;
         hash = hash.wrapping_mul(16777619);
     }
-    if hash == 0 {
-        1
-    } else {
-        hash
-    }
+    if hash == 0 { 1 } else { hash }
 }
 
 /// FNV-1a hash of `"{type_name}:{prop_name}"` → stable u32 prop_id.
