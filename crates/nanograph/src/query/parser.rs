@@ -305,14 +305,50 @@ fn parse_traversal(pair: pest::iterators::Pair<Rule>) -> Result<Traversal> {
     let src_var = inner.next().unwrap().as_str();
     let src = src_var.strip_prefix('$').unwrap_or(src_var).to_string();
     let edge_name = inner.next().unwrap().as_str().to_string();
-    let dst_var = inner.next().unwrap().as_str();
+    let mut min_hops = 1u32;
+    let mut max_hops = Some(1u32);
+
+    let next = inner.next().unwrap();
+    let dst_pair = if let Rule::traversal_bounds = next.as_rule() {
+        let (min, max) = parse_traversal_bounds(next)?;
+        min_hops = min;
+        max_hops = max;
+        inner
+            .next()
+            .ok_or_else(|| NanoError::Parse("traversal missing destination variable".to_string()))?
+    } else {
+        next
+    };
+
+    let dst_var = dst_pair.as_str();
     let dst = dst_var.strip_prefix('$').unwrap_or(dst_var).to_string();
 
     Ok(Traversal {
         src,
         edge_name,
         dst,
+        min_hops,
+        max_hops,
     })
+}
+
+fn parse_traversal_bounds(pair: pest::iterators::Pair<Rule>) -> Result<(u32, Option<u32>)> {
+    let mut inner = pair.into_inner();
+    let min = inner
+        .next()
+        .ok_or_else(|| NanoError::Parse("traversal bound missing min hop".to_string()))?
+        .as_str()
+        .parse::<u32>()
+        .map_err(|e| NanoError::Parse(format!("invalid traversal min bound: {}", e)))?;
+    let max = inner
+        .next()
+        .map(|p| {
+            p.as_str()
+                .parse::<u32>()
+                .map_err(|e| NanoError::Parse(format!("invalid traversal max bound: {}", e)))
+        })
+        .transpose()?;
+    Ok((min, max))
 }
 
 fn parse_filter(pair: pest::iterators::Pair<Rule>) -> Result<Filter> {
@@ -487,6 +523,8 @@ query friends_of($name: String) {
                 assert_eq!(t.src, "p");
                 assert_eq!(t.edge_name, "knows");
                 assert_eq!(t.dst, "f");
+                assert_eq!(t.min_hops, 1);
+                assert_eq!(t.max_hops, Some(1));
             }
             _ => panic!("expected Traversal"),
         }
@@ -514,6 +552,8 @@ query unemployed() {
                         assert_eq!(t.src, "p");
                         assert_eq!(t.edge_name, "worksAt");
                         assert_eq!(t.dst, "_");
+                        assert_eq!(t.min_hops, 1);
+                        assert_eq!(t.max_hops, Some(1));
                     }
                     _ => panic!("expected Traversal inside negation"),
                 }
@@ -587,6 +627,52 @@ query employees_of($company: String) {
                 assert_eq!(t.src, "p");
                 assert_eq!(t.edge_name, "worksAt");
                 assert_eq!(t.dst, "c");
+                assert_eq!(t.min_hops, 1);
+                assert_eq!(t.max_hops, Some(1));
+            }
+            _ => panic!("expected Traversal"),
+        }
+    }
+
+    #[test]
+    fn test_parse_bounded_traversal() {
+        let input = r#"
+query q() {
+    match {
+        $a: Person
+        $a knows{1,3} $b
+    }
+    return { $b.name }
+}
+"#;
+        let qf = parse_query(input).unwrap();
+        let q = &qf.queries[0];
+        match &q.match_clause[1] {
+            Clause::Traversal(t) => {
+                assert_eq!(t.min_hops, 1);
+                assert_eq!(t.max_hops, Some(3));
+            }
+            _ => panic!("expected Traversal"),
+        }
+    }
+
+    #[test]
+    fn test_parse_unbounded_traversal() {
+        let input = r#"
+query q() {
+    match {
+        $a: Person
+        $a knows{1,} $b
+    }
+    return { $b.name }
+}
+"#;
+        let qf = parse_query(input).unwrap();
+        let q = &qf.queries[0];
+        match &q.match_clause[1] {
+            Clause::Traversal(t) => {
+                assert_eq!(t.min_hops, 1);
+                assert_eq!(t.max_hops, None);
             }
             _ => panic!("expected Traversal"),
         }

@@ -212,6 +212,8 @@ fn build_physical_plan(
                 edge_type,
                 direction,
                 dst_type,
+                min_hops,
+                max_hops,
             } => {
                 let input = current_plan
                     .ok_or_else(|| NanoError::Plan("Expand without input".to_string()))?;
@@ -222,6 +224,8 @@ fn build_physical_plan(
                     edge_type.clone(),
                     *direction,
                     dst_type.clone(),
+                    *min_hops,
+                    *max_hops,
                     storage.clone(),
                 );
                 current_plan = Some(Arc::new(expand));
@@ -342,6 +346,8 @@ fn build_physical_plan_with_input(
                 edge_type,
                 direction,
                 dst_type,
+                min_hops,
+                max_hops,
             } => {
                 let input = current_plan
                     .ok_or_else(|| NanoError::Plan("Expand without input".to_string()))?;
@@ -352,6 +358,8 @@ fn build_physical_plan_with_input(
                     edge_type.clone(),
                     *direction,
                     dst_type.clone(),
+                    *min_hops,
+                    *max_hops,
                     storage.clone(),
                 );
                 current_plan = Some(Arc::new(expand));

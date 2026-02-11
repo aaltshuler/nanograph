@@ -13,7 +13,8 @@ set -euo pipefail
 # ═══════════════════════════════════════════════════════════════════════════
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+source "$SCRIPT_DIR/../lib/common.sh"
+ROOT="$(repo_root_from_script_dir "$SCRIPT_DIR")"
 EXAMPLES="$ROOT/examples/starwars"
 DB="/tmp/sw_lifecycle_test.nanograph"
 TMP_DIR="$(mktemp -d /tmp/sw_lifecycle.XXXXXX)"
@@ -21,86 +22,24 @@ KEYED_SCHEMA="$TMP_DIR/starwars-keyed.pg"
 QUERY_FILE="$TMP_DIR/lifecycle.gq"
 UPSERT_DATA="$TMP_DIR/upsert.jsonl"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
-
-pass() { echo -e "${GREEN}✓ $1${NC}"; }
-fail() { echo -e "${RED}✗ $1${NC}"; exit 1; }
-info() { echo -e "${YELLOW}→ $1${NC}"; }
-
 cleanup() {
     rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
 
 run_jsonl() {
-    local query_name="$1"
-    shift
-    local out
-    if ! out=$("$NG" run --db "$DB" --query "$QUERY_FILE" --name "$query_name" --format jsonl "$@" 2>/dev/null); then
-        fail "query '$query_name' failed"
-    fi
-    echo "$out"
+    run_query_jsonl "$DB" "$QUERY_FILE" "$@"
 }
 
 run_count() {
-    local query_name="$1"
-    shift
-    local out
-    out="$(run_jsonl "$query_name" "$@")"
-    if [ -z "$out" ]; then
-        echo 0
-    else
-        echo "$out" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' '
-    fi
-}
-
-assert_int_eq() {
-    local actual="$1"
-    local expected="$2"
-    local message="$3"
-    if [ "$actual" -eq "$expected" ]; then
-        pass "$message"
-    else
-        fail "$message (expected $expected, got $actual)"
-    fi
-}
-
-assert_str_eq() {
-    local actual="$1"
-    local expected="$2"
-    local message="$3"
-    if [ "$actual" = "$expected" ]; then
-        pass "$message"
-    else
-        fail "$message (expected '$expected', got '$actual')"
-    fi
+    run_query_count "$DB" "$QUERY_FILE" "$@"
 }
 
 # ── 0. Build ───────────────────────────────────────────────────────────────
-info "Building nanograph..."
-cargo build --manifest-path "$ROOT/Cargo.toml" --quiet 2>/dev/null
-NG="$ROOT/target/debug/nanograph"
-[ -x "$NG" ] || fail "binary not found at $NG"
-pass "Binary built"
+build_nanograph_binary "$ROOT"
 
 # ── 1. Prepare keyed Star Wars schema ──────────────────────────────────────
-info "Preparing keyed Star Wars schema (Character.name @key)..."
-awk '
-    /^node Character[[:space:]]*{/ { in_character = 1; print; next }
-    in_character && /^[[:space:]]*name:[[:space:]]*String[[:space:]]*$/ {
-        print "    name: String @key"
-        next
-    }
-    in_character && /^}/ { in_character = 0; print; next }
-    { print }
-' "$EXAMPLES/starwars.pg" > "$KEYED_SCHEMA"
-
-grep -q 'name: String @key' "$KEYED_SCHEMA" \
-    || fail "failed to inject @key into Character.name"
-pass "Keyed schema generated"
+create_character_name_keyed_schema "$EXAMPLES/starwars.pg" "$KEYED_SCHEMA"
 
 # ── 2. Init + baseline load ────────────────────────────────────────────────
 rm -rf "$DB"
@@ -109,7 +48,7 @@ info "Initializing database..."
 pass "Database initialized"
 
 info "Loading baseline Star Wars data..."
-"$NG" load "$DB" --data "$EXAMPLES/starwars.jsonl"
+"$NG" load "$DB" --data "$EXAMPLES/starwars.jsonl" --mode overwrite
 pass "Baseline data loaded"
 
 # ── 3. Write lifecycle query set ───────────────────────────────────────────
@@ -187,7 +126,7 @@ cat > "$UPSERT_DATA" << 'JSONL'
 JSONL
 
 info "Applying keyed upsert load..."
-"$NG" load "$DB" --data "$UPSERT_DATA"
+"$NG" load "$DB" --data "$UPSERT_DATA" --mode merge
 pass "Keyed upsert load applied"
 
 LUKE_UPDATED=$(run_count luke_updated_marker)

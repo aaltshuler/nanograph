@@ -46,7 +46,8 @@ prop_match = { ident ~ ":" ~ match_value }
 match_value = { literal | variable }
 
 // Traversal: $p knows $f
-traversal = { variable ~ edge_ident ~ variable }
+traversal = { variable ~ edge_ident ~ traversal_bounds? ~ variable }
+traversal_bounds = { "{" ~ integer ~ "," ~ integer? ~ "}" }
 
 // Filter: $f.age > 25
 filter = { expr ~ comp_op ~ expr }

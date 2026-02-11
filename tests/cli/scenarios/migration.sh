@@ -14,25 +14,13 @@ set -euo pipefail
 # ═══════════════════════════════════════════════════════════════════════════
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+source "$SCRIPT_DIR/../lib/common.sh"
+ROOT="$(repo_root_from_script_dir "$SCRIPT_DIR")"
 EXAMPLES="$ROOT/examples/starwars"
 DB="/tmp/sw_migration_test.nanograph"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
-
-pass() { echo -e "${GREEN}✓ $1${NC}"; }
-fail() { echo -e "${RED}✗ $1${NC}"; exit 1; }
-info() { echo -e "${YELLOW}→ $1${NC}"; }
-
 # ── 0. Build ───────────────────────────────────────────────────────────────
-info "Building nanograph..."
-cargo build --manifest-path "$ROOT/Cargo.toml" --quiet 2>/dev/null
-NG="$ROOT/target/debug/nanograph"
-[ -x "$NG" ] || fail "binary not found at $NG"
-pass "Binary built"
+build_nanograph_binary "$ROOT"
 
 # ── 1. Clean + Init ───────────────────────────────────────────────────────
 rm -rf "$DB"
@@ -42,28 +30,26 @@ pass "Database initialized at $DB"
 
 # ── 2. Load data ──────────────────────────────────────────────────────────
 info "Loading Star Wars data..."
-$NG load "$DB" --data "$EXAMPLES/starwars.jsonl"
+$NG load "$DB" --data "$EXAMPLES/starwars.jsonl" --mode overwrite
 pass "Data loaded (59 nodes, 120 edges)"
 
 # ── 3. Baseline queries ──────────────────────────────────────────────────
 info "Running baseline queries..."
 
 JEDI_OUT=$($NG run --db "$DB" --query "$EXAMPLES/starwars.gq" --name jedi --format csv)
-JEDI_COUNT=$(echo "$JEDI_OUT" | tail -n +2 | wc -l | tr -d ' ')
-[ "$JEDI_COUNT" -eq 7 ] || fail "Expected 7 Jedi, got $JEDI_COUNT"
-pass "jedi query: $JEDI_COUNT members"
+JEDI_COUNT=$(count_csv_data_rows "$JEDI_OUT")
+assert_int_eq "$JEDI_COUNT" 7 "jedi query: $JEDI_COUNT members"
 
 DUELS_OUT=$($NG run --db "$DB" --query "$EXAMPLES/starwars.gq" --name all_duels --format csv)
-DUELS_COUNT=$(echo "$DUELS_OUT" | tail -n +2 | wc -l | tr -d ' ')
-[ "$DUELS_COUNT" -eq 10 ] || fail "Expected 10 duels, got $DUELS_COUNT"
-pass "all_duels query: $DUELS_COUNT duels"
+DUELS_COUNT=$(count_csv_data_rows "$DUELS_OUT")
+assert_int_eq "$DUELS_COUNT" 10 "all_duels query: $DUELS_COUNT duels"
 
 HEROES_OUT=$($NG run --db "$DB" --query "$EXAMPLES/starwars.gq" --name heroes --format csv)
-HEROES_COUNT=$(echo "$HEROES_OUT" | tail -n +2 | wc -l | tr -d ' ')
+HEROES_COUNT=$(count_csv_data_rows "$HEROES_OUT")
 pass "heroes query: $HEROES_COUNT heroes"
 
 WIELDERS_OUT=$($NG run --db "$DB" --query "$EXAMPLES/starwars.gq" --name wielders --format csv)
-WIELDERS_COUNT=$(echo "$WIELDERS_OUT" | tail -n +2 | wc -l | tr -d ' ')
+WIELDERS_COUNT=$(count_csv_data_rows "$WIELDERS_OUT")
 pass "wielders query: $WIELDERS_COUNT wielders (has Weapon.color)"
 
 VETS_OUT=$($NG run --db "$DB" --query "$EXAMPLES/starwars.gq" --name battle_veterans --format csv)

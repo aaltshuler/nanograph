@@ -1,4 +1,4 @@
-# NanoGraph
+# nanograph
 
 A local-first, embedded, strongly-typed property graph database in Rust. Think SQLite/DuckDB, but for graphs.
 
@@ -31,6 +31,21 @@ nanograph check --db my.nanograph --query queries.gq
 # Run a query
 nanograph run --db my.nanograph --query queries.gq --name my_query
 ```
+
+## Testing
+
+```bash
+# Engine + library tests
+cargo test -p nanograph
+cargo test -p nanograph-cli
+
+# CLI end-to-end scenarios
+bash tests/cli/run-cli-e2e.sh
+```
+
+Test framework details: `test-framework.md`.
+
+Documentation index: `docs/README.md`.
 
 ## Query language
 

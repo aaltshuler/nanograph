@@ -53,6 +53,8 @@ pub struct Traversal {
     pub src: String,
     pub edge_name: String,
     pub dst: String,
+    pub min_hops: u32,
+    pub max_hops: Option<u32>,
 }
 
 #[derive(Debug, Clone)]

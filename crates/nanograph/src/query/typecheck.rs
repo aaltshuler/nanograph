@@ -32,6 +32,8 @@ pub struct ResolvedTraversal {
     pub dst: String,
     pub edge_type: String,
     pub direction: Direction,
+    pub min_hops: u32,
+    pub max_hops: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -393,6 +395,24 @@ fn typecheck_traversal(
             NanoError::Type(format!("T4: unknown edge type `{}`", traversal.edge_name))
         })?;
 
+    if traversal.min_hops == 0 {
+        return Err(NanoError::Type(
+            "T15: traversal min hop bound must be >= 1".to_string(),
+        ));
+    }
+    if let Some(max_hops) = traversal.max_hops {
+        if max_hops < traversal.min_hops {
+            return Err(NanoError::Type(format!(
+                "T15: invalid traversal bounds {{{},{}}}; max must be >= min",
+                traversal.min_hops, max_hops
+            )));
+        }
+    } else {
+        return Err(NanoError::Type(
+            "T15: unbounded traversal is disabled; use bounded traversal {min,max}".to_string(),
+        ));
+    }
+
     // Determine direction based on bound variables and edge endpoints
     let src_bound = ctx.bindings.get(&traversal.src);
     let dst_bound = ctx.bindings.get(&traversal.dst);
@@ -441,6 +461,8 @@ fn typecheck_traversal(
         dst: traversal.dst.clone(),
         edge_type: edge.name.clone(),
         direction,
+        min_hops: traversal.min_hops,
+        max_hops: traversal.max_hops,
     });
 
     Ok(())
@@ -836,6 +858,64 @@ query q() {
         // $c is Company (to_type), $p is src — direction should be Out
         // because $p (Person=from_type) worksAt $c (Company=to_type) is forward
         assert_eq!(ctx.traversals[0].direction, Direction::Out);
+    }
+
+    #[test]
+    fn test_bounded_traversal_typecheck() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q() {
+    match {
+        $p: Person
+        $p knows{1,3} $f
+    }
+    return { $f.name }
+}
+"#,
+        )
+        .unwrap();
+        let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        assert_eq!(ctx.traversals[0].min_hops, 1);
+        assert_eq!(ctx.traversals[0].max_hops, Some(3));
+    }
+
+    #[test]
+    fn test_bounded_traversal_invalid_bounds() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q() {
+    match {
+        $p: Person
+        $p knows{3,1} $f
+    }
+    return { $f.name }
+}
+"#,
+        )
+        .unwrap();
+        let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+        assert!(err.to_string().contains("T15"));
+    }
+
+    #[test]
+    fn test_unbounded_traversal_is_disabled() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q() {
+    match {
+        $p: Person
+        $p knows{1,} $f
+    }
+    return { $f.name }
+}
+"#,
+        )
+        .unwrap();
+        let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+        assert!(err.to_string().contains("unbounded traversal is disabled"));
     }
 
     #[test]

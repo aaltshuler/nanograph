@@ -205,6 +205,8 @@ fn lower_clauses(
                 edge_type: edge.name.clone(),
                 direction,
                 dst_type,
+                min_hops: traversal.min_hops,
+                max_hops: traversal.max_hops,
             });
             pipeline.push(IROp::Filter(IRFilter {
                 left: IRExpr::PropAccess {
@@ -234,6 +236,8 @@ fn lower_clauses(
                 edge_type: edge.name.clone(),
                 direction: reverse_dir,
                 dst_type: src_type,
+                min_hops: traversal.min_hops,
+                max_hops: traversal.max_hops,
             });
             if traversal.src != "_" {
                 bound_vars.insert(traversal.src.clone());
@@ -245,6 +249,8 @@ fn lower_clauses(
                 edge_type: edge.name.clone(),
                 direction,
                 dst_type,
+                min_hops: traversal.min_hops,
+                max_hops: traversal.max_hops,
             });
             if traversal.dst != "_" {
                 bound_vars.insert(traversal.dst.clone());
@@ -456,5 +462,36 @@ query q($name: String, $age: I32) {
             }
             _ => panic!("expected update mutation op"),
         }
+    }
+
+    #[test]
+    fn test_lower_bounded_traversal() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q() {
+    match {
+        $p: Person
+        $p knows{1,3} $f
+    }
+    return { $f.name }
+}
+"#,
+        )
+        .unwrap();
+        let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+        let expand = ir
+            .pipeline
+            .iter()
+            .find_map(|op| match op {
+                IROp::Expand {
+                    min_hops, max_hops, ..
+                } => Some((*min_hops, *max_hops)),
+                _ => None,
+            })
+            .expect("expected expand op");
+        assert_eq!(expand.0, 1);
+        assert_eq!(expand.1, Some(3));
     }
 }

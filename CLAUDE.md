@@ -14,10 +14,11 @@ cargo build -p nanograph                 # library only
 cargo build -p nanograph-cli             # CLI only
 cargo test                               # all tests (unit + e2e + migration)
 cargo test -p nanograph                  # library tests only
-cargo test --test e2e                    # e2e integration tests only
-cargo test --test schema_migration       # migration tests only
+cargo test -p nanograph --test e2e       # e2e integration tests only
+cargo test -p nanograph --test schema_migration  # migration tests only
 cargo test test_bind_by_property         # single test by name
 cargo test -- --nocapture                # show stdout
+bash tests/cli/run-cli-e2e.sh            # all CLI shell scenarios
 cargo clippy                             # lint
 cargo fmt                                # format
 RUST_LOG=debug cargo run -p nanograph-cli -- run ...  # enable tracing
@@ -122,13 +123,19 @@ Arrow 57, DataFusion 52, Lance 2.0 + lance-index 2.0 — these must stay compati
 ## Design Documents
 
 - `grammar.ebnf` — formal grammar for both DSLs, includes type rules (T1-T14; T10-T14 cover mutations)
-- `docs/specs.md` — product spec (v0)
-- `docs/datafusion_mapping.md` — how each query construct maps to DataFusion execution
-- `docs/execution-checklist.md` — implementation checklist with phase status and milestone gates
+- `docs/dev/architecture.md` — system overview, module map, data flow
+- `docs/dev/specs.md` — product spec (v0)
+- `docs/dev/datafusion-mapping.md` — query language → DataFusion execution mapping
+- `docs/dev/storage-layout.md` — Lance layout, schema IR design, persistence invariants
+- `docs/dev/db-features.md` — feature roadmap with implementation status
+- `docs/dev/execution-checklist.md` — implementation checklist with phase status and milestone gates
+- `docs/dev/test-framework.md` — test tiers, commands, fixture policy, CI guidance
+
+Source of truth for behavior is code. Update docs in the same PR when behavior changes.
 
 ## Test Fixtures
 
-Test schemas, queries, and data live in `crates/nanograph/tests/fixtures/` (test.pg, test.gq, test.jsonl). Star Wars example in `examples/starwars/`. Migration tests in `tests/schema_migration.rs`. Index performance harness in `tests/index_perf.rs` (run with `--ignored`). Mutation CLI script in `tests/test_query_mutations.sh`.
+Test schemas, queries, and data live in `crates/nanograph/tests/fixtures/` (test.pg, test.gq, test.jsonl). Star Wars example in `examples/starwars/`. Migration tests in `crates/nanograph/tests/schema_migration.rs`. Index performance harness in `crates/nanograph/tests/index_perf.rs` (run with `--ignored`). CLI scenario scripts live in `tests/cli/scenarios/` and can be run via `bash tests/cli/run-cli-e2e.sh`.
 
 ## Known Pitfalls
 

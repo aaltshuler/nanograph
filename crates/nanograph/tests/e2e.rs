@@ -486,6 +486,68 @@ query q() {
 }
 
 #[tokio::test]
+async fn test_bounded_traversal_exact_two_hops() {
+    let storage = setup_storage();
+    let results = run_query_test(
+        r#"
+query q() {
+    match {
+        $p: Person { name: "Alice" }
+        $p knows{2,2} $x
+    }
+    return { $x.name }
+}
+"#,
+        storage,
+    )
+    .await;
+
+    let names = extract_string_column(&results, "name");
+    assert_eq!(names, vec!["Diana"]);
+}
+
+#[tokio::test]
+async fn test_bounded_traversal_range_one_to_two_hops() {
+    let storage = setup_storage();
+    let results = run_query_test(
+        r#"
+query q() {
+    match {
+        $p: Person { name: "Alice" }
+        $p knows{1,2} $x
+    }
+    return { $x.name }
+    order { $x.name asc }
+}
+"#,
+        storage,
+    )
+    .await;
+
+    let names = extract_string_column(&results, "name");
+    assert_eq!(names, vec!["Bob", "Charlie", "Diana"]);
+}
+
+#[test]
+fn test_unbounded_traversal_is_rejected() {
+    let storage = setup_storage();
+    let qf = parse_query(
+        r#"
+query q() {
+    match {
+        $p: Person { name: "Alice" }
+        $p knows{1,} $x
+    }
+    return { $x.name }
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query(&storage.catalog, &qf.queries[0]).unwrap_err();
+    assert!(err.to_string().contains("unbounded traversal is disabled"));
+}
+
+#[tokio::test]
 async fn test_negation_unemployed() {
     let storage = setup_storage();
     let results = run_query_test(

@@ -18,6 +18,7 @@ use datafusion::physical_plan::{
 use crate::error::{NanoError, Result};
 use crate::ir::{IRAssignment, IRExpr, IRMutationPredicate, MutationIR, MutationOpIR, ParamMap};
 use crate::query::ast::{CompOp, Literal};
+use crate::store::csr::CsrIndex;
 use crate::store::database::{Database, DeleteOp, DeletePredicate, LoadMode};
 use crate::store::graph::GraphStorage;
 use crate::types::Direction;
@@ -32,6 +33,8 @@ pub struct ExpandExec {
     edge_type: String,
     direction: Direction,
     dst_type: String,
+    min_hops: u32,
+    max_hops: Option<u32>,
     output_schema: SchemaRef,
     storage: Arc<GraphStorage>,
     properties: PlanProperties,
@@ -45,6 +48,8 @@ impl ExpandExec {
         edge_type: String,
         direction: Direction,
         dst_type: String,
+        min_hops: u32,
+        max_hops: Option<u32>,
         storage: Arc<GraphStorage>,
     ) -> Self {
         let input_schema = input.schema();
@@ -81,6 +86,8 @@ impl ExpandExec {
             edge_type,
             direction,
             dst_type,
+            min_hops,
+            max_hops,
             output_schema,
             storage,
             properties,
@@ -90,10 +97,15 @@ impl ExpandExec {
 
 impl DisplayAs for ExpandExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        let bound = match self.max_hops {
+            Some(max) if self.min_hops == 1 && max == 1 => "".to_string(),
+            Some(max) => format!("{{{},{}}}", self.min_hops, max),
+            None => format!("{{{},}}", self.min_hops),
+        };
         write!(
             f,
-            "ExpandExec: ${} --[{}]--> ${}",
-            self.src_var, self.edge_type, self.dst_var
+            "ExpandExec: ${} --[{}{}]--> ${}",
+            self.src_var, self.edge_type, bound, self.dst_var
         )
     }
 }
@@ -130,6 +142,8 @@ impl ExecutionPlan for ExpandExec {
             self.edge_type.clone(),
             self.direction,
             self.dst_type.clone(),
+            self.min_hops,
+            self.max_hops,
             self.storage.clone(),
         )))
     }
@@ -146,6 +160,8 @@ impl ExecutionPlan for ExpandExec {
         let src_var = self.src_var.clone();
         let dst_var = self.dst_var.clone();
         let dst_type = self.dst_type.clone();
+        let min_hops = self.min_hops;
+        let max_hops = self.max_hops;
         let storage = self.storage.clone();
 
         let stream = futures::stream::once(async move {
@@ -162,6 +178,8 @@ impl ExecutionPlan for ExpandExec {
                 edge_type,
                 direction,
                 dst_type,
+                min_hops,
+                max_hops,
                 output_schema: schema.clone(),
                 storage,
                 properties: PlanProperties::new(
@@ -290,13 +308,13 @@ impl ExpandExec {
             dst_id_to_row.insert(dst_id_col.value(row), row);
         }
 
-        // For each input row, look up neighbors and expand
+        // For each input row, perform bounded/unbounded expansion.
         let mut output_row_indices: Vec<(usize, u64)> = Vec::new(); // (input_row, dst_node_id)
-
         for row in 0..input.num_rows() {
             let src_id = id_array.value(row);
-            let neighbors = csr.neighbors(src_id);
-            for &dst_id in neighbors {
+            let expanded_ids =
+                collect_traversal_neighbors(csr, src_id, self.min_hops, self.max_hops);
+            for dst_id in expanded_ids {
                 output_row_indices.push((row, dst_id));
             }
         }
@@ -361,6 +379,95 @@ fn take_rows(array: &ArrayRef, indices: &[usize]) -> DFResult<ArrayRef> {
     let idx_array = UInt64Array::from(indices.iter().map(|&i| i as u64).collect::<Vec<_>>());
     let taken = arrow::compute::take(array.as_ref(), &idx_array, None)?;
     Ok(taken)
+}
+
+fn collect_traversal_neighbors(
+    csr: &CsrIndex,
+    src_id: u64,
+    min_hops: u32,
+    max_hops: Option<u32>,
+) -> Vec<u64> {
+    match max_hops {
+        Some(max_hops) => collect_bounded_neighbors(csr, src_id, min_hops, max_hops),
+        None => collect_unbounded_neighbors(csr, src_id, min_hops),
+    }
+}
+
+fn collect_bounded_neighbors(
+    csr: &CsrIndex,
+    src_id: u64,
+    min_hops: u32,
+    max_hops: u32,
+) -> Vec<u64> {
+    if max_hops < min_hops {
+        return Vec::new();
+    }
+
+    let mut frontier = vec![src_id];
+    let mut emitted = std::collections::HashSet::new();
+    let mut out = Vec::new();
+
+    for depth in 1..=max_hops {
+        if frontier.is_empty() {
+            break;
+        }
+
+        let mut next = Vec::new();
+        let mut next_seen = std::collections::HashSet::new();
+        for node in &frontier {
+            for &neighbor in csr.neighbors(*node) {
+                if next_seen.insert(neighbor) {
+                    next.push(neighbor);
+                }
+            }
+        }
+
+        if next.is_empty() {
+            break;
+        }
+
+        if depth >= min_hops {
+            for node in &next {
+                if emitted.insert(*node) {
+                    out.push(*node);
+                }
+            }
+        }
+        frontier = next;
+    }
+
+    out
+}
+
+fn collect_unbounded_neighbors(csr: &CsrIndex, src_id: u64, min_hops: u32) -> Vec<u64> {
+    let mut frontier = vec![src_id];
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    let mut depth = 0u32;
+
+    while !frontier.is_empty() {
+        depth = depth.saturating_add(1);
+
+        let mut next = Vec::new();
+        for node in &frontier {
+            for &neighbor in csr.neighbors(*node) {
+                if seen.insert(neighbor) {
+                    next.push(neighbor);
+                }
+            }
+        }
+
+        if next.is_empty() {
+            break;
+        }
+
+        if depth >= min_hops {
+            out.extend(next.iter().copied());
+        }
+        frontier = next;
+    }
+
+    out
 }
 
 #[derive(Debug, Clone, Copy, Default)]

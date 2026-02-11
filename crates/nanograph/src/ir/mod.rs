@@ -68,6 +68,8 @@ pub enum IROp {
         edge_type: String,
         direction: Direction,
         dst_type: String,
+        min_hops: u32,
+        max_hops: Option<u32>,
     },
     Filter(IRFilter),
     AntiJoin {
