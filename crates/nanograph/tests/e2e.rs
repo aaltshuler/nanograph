@@ -1,16 +1,23 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow::array::{Array, Int32Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
+use lance::Dataset;
+use lance_index::DatasetIndexExt;
 
 use nanograph::catalog::build_catalog;
+use nanograph::catalog::schema_ir::SchemaIR;
 use nanograph::ir::ParamMap;
-use nanograph::ir::lower::lower_query;
+use nanograph::ir::lower::{lower_mutation_query, lower_query};
+use nanograph::plan::physical::{MutationExecResult, execute_mutation};
 use nanograph::plan::planner::execute_query;
 use nanograph::query::parser::parse_query;
-use nanograph::query::typecheck::typecheck_query;
+use nanograph::query::typecheck::{CheckedQuery, typecheck_query, typecheck_query_decl};
 use nanograph::schema::parser::parse_schema;
+use nanograph::store::database::Database;
 use nanograph::store::graph::GraphStorage;
+use nanograph::store::indexing::scalar_index_name;
 
 fn test_schema() -> &'static str {
     r#"
@@ -25,6 +32,53 @@ edge Knows: Person -> Person {
     since: Date?
 }
 edge WorksAt: Person -> Company
+"#
+}
+
+fn indexed_test_schema() -> &'static str {
+    r#"
+node Person {
+    name: String
+    email: String @index
+}
+"#
+}
+
+fn indexed_test_data() -> &'static str {
+    r#"{"type":"Person","data":{"name":"Alice","email":"alice@example.com"}}
+{"type":"Person","data":{"name":"Bob","email":"bob@example.com"}}
+"#
+}
+
+fn keyed_mutation_schema() -> &'static str {
+    r#"
+node Person {
+    name: String @key
+    age: I32?
+}
+edge Knows: Person -> Person
+"#
+}
+
+fn keyed_mutation_data() -> &'static str {
+    r#"{"type":"Person","data":{"name":"Alice","age":30}}
+{"type":"Person","data":{"name":"Bob","age":25}}
+{"edge":"Knows","from":"Alice","to":"Bob"}
+"#
+}
+
+fn test_data() -> &'static str {
+    r#"{"type":"Person","data":{"name":"Alice","age":30}}
+{"type":"Person","data":{"name":"Bob","age":25}}
+{"type":"Person","data":{"name":"Charlie","age":35}}
+{"type":"Person","data":{"name":"Diana","age":28}}
+{"type":"Company","data":{"name":"Acme"}}
+{"type":"Company","data":{"name":"Globex"}}
+{"edge":"Knows","from":"Alice","to":"Bob"}
+{"edge":"Knows","from":"Alice","to":"Charlie"}
+{"edge":"Knows","from":"Bob","to":"Diana"}
+{"edge":"WorksAt","from":"Alice","to":"Acme"}
+{"edge":"WorksAt","from":"Bob","to":"Globex"}
 "#
 }
 
@@ -103,6 +157,28 @@ async fn run_query_test_with_params(
     execute_query(&ir, storage, params).await.unwrap()
 }
 
+async fn run_db_query_test_with_params(
+    query_str: &str,
+    db: &Database,
+    params: &ParamMap,
+) -> Vec<RecordBatch> {
+    let storage = db.snapshot();
+    run_query_test_with_params(query_str, storage, params).await
+}
+
+async fn run_db_mutation_test_with_params(
+    query_str: &str,
+    db: &mut Database,
+    params: &ParamMap,
+) -> MutationExecResult {
+    let qf = parse_query(query_str).unwrap();
+    let query = &qf.queries[0];
+    let checked = typecheck_query_decl(db.catalog(), query).unwrap();
+    assert!(matches!(checked, CheckedQuery::Mutation(_)));
+    let ir = lower_mutation_query(query).unwrap();
+    execute_mutation(&ir, db, params).await.unwrap()
+}
+
 fn extract_string_column(batches: &[RecordBatch], col_name: &str) -> Vec<String> {
     let mut result = Vec::new();
     for batch in batches {
@@ -112,6 +188,34 @@ fn extract_string_column(batches: &[RecordBatch], col_name: &str) -> Vec<String>
         for i in 0..arr.len() {
             if !arr.is_null(i) {
                 result.push(arr.value(i).to_string());
+            }
+        }
+    }
+    result
+}
+
+fn extract_string_pairs(
+    batches: &[RecordBatch],
+    left_col: &str,
+    right_col: &str,
+) -> Vec<(String, String)> {
+    let mut result = Vec::new();
+    for batch in batches {
+        let left_idx = batch.schema().index_of(left_col).unwrap();
+        let right_idx = batch.schema().index_of(right_col).unwrap();
+        let left = batch
+            .column(left_idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let right = batch
+            .column(right_idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            if !left.is_null(i) && !right.is_null(i) {
+                result.push((left.value(i).to_string(), right.value(i).to_string()));
             }
         }
     }
@@ -250,6 +354,64 @@ query q() {
     let mut names = extract_string_column(&results, "name");
     names.sort();
     assert_eq!(names, vec!["Bob", "Charlie"]);
+}
+
+#[tokio::test]
+async fn test_indexed_point_lookup_after_persist_and_reopen() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+
+    let mut db = Database::init(&db_path, indexed_test_schema())
+        .await
+        .unwrap();
+    db.load(indexed_test_data()).await.unwrap();
+
+    let person = db
+        .schema_ir
+        .node_types()
+        .find(|n| n.name == "Person")
+        .unwrap();
+    let dataset_path = db_path
+        .join("nodes")
+        .join(SchemaIR::dir_name(person.type_id));
+    let dataset = Dataset::open(dataset_path.to_string_lossy().as_ref())
+        .await
+        .unwrap();
+    let index_names: HashSet<String> = dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .map(|idx| idx.name.clone())
+        .collect();
+    let expected_index = scalar_index_name(person.type_id, "email");
+    assert!(index_names.contains(&expected_index));
+
+    drop(db);
+    let reopened = Database::open(&db_path).await.unwrap();
+
+    let mut params = ParamMap::new();
+    params.insert(
+        "email".to_string(),
+        nanograph::query::ast::Literal::String("alice@example.com".to_string()),
+    );
+    let results = run_db_query_test_with_params(
+        r#"
+query q($email: String) {
+    match {
+        $p: Person
+        $p.email = $email
+    }
+    return { $p.name }
+}
+"#,
+        &reopened,
+        &params,
+    )
+    .await;
+
+    let names = extract_string_column(&results, "name");
+    assert_eq!(names, vec!["Alice"]);
 }
 
 #[tokio::test]
@@ -465,6 +627,249 @@ query q() {
 
     let names = extract_string_column(&results, "name");
     assert_eq!(names, vec!["Alice", "Charlie"]);
+}
+
+#[tokio::test]
+async fn test_single_scan_filter_pushdown_parity_with_nonpushdown_tautology() {
+    let storage = setup_storage();
+    let pushed = run_query_test(
+        r#"
+query q() {
+    match {
+        $p: Person
+        $p.age > 25
+    }
+    return { $p.name }
+    order { $p.name asc }
+}
+"#,
+        storage.clone(),
+    )
+    .await;
+    let mixed = run_query_test(
+        r#"
+query q() {
+    match {
+        $p: Person
+        $p.age > 25
+        $p.name = $p.name
+    }
+    return { $p.name }
+    order { $p.name asc }
+}
+"#,
+        storage,
+    )
+    .await;
+
+    let pushed_names = extract_string_column(&pushed, "name");
+    let mixed_names = extract_string_column(&mixed, "name");
+    assert_eq!(pushed_names, mixed_names);
+    assert_eq!(pushed_names, vec!["Alice", "Charlie", "Diana"]);
+}
+
+#[tokio::test]
+async fn test_multi_scan_filter_pushdown_parity_with_nonpushdown_tautology() {
+    let storage = setup_storage();
+    let pushed = run_query_test(
+        r#"
+query q() {
+    match {
+        $p: Person
+        $q: Person
+        $p.name = "Alice"
+    }
+    return { $p.name as p_name, $q.name as q_name }
+    order { $q.name asc }
+}
+"#,
+        storage.clone(),
+    )
+    .await;
+    let mixed = run_query_test(
+        r#"
+query q() {
+    match {
+        $p: Person
+        $q: Person
+        $p.name = "Alice"
+        $p.name = $p.name
+    }
+    return { $p.name as p_name, $q.name as q_name }
+    order { $q.name asc }
+}
+"#,
+        storage,
+    )
+    .await;
+
+    let pushed_pairs = extract_string_pairs(&pushed, "p_name", "q_name");
+    let mixed_pairs = extract_string_pairs(&mixed, "p_name", "q_name");
+    assert_eq!(pushed_pairs, mixed_pairs);
+    assert_eq!(
+        pushed_pairs,
+        vec![
+            ("Alice".to_string(), "Alice".to_string()),
+            ("Alice".to_string(), "Bob".to_string()),
+            ("Alice".to_string(), "Charlie".to_string()),
+            ("Alice".to_string(), "Diana".to_string())
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_insert_mutation_query() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let mut db = Database::init(&db_path, test_schema()).await.unwrap();
+    db.load(test_data()).await.unwrap();
+
+    let mut params = ParamMap::new();
+    params.insert(
+        "name".to_string(),
+        nanograph::query::ast::Literal::String("Eve".to_string()),
+    );
+    params.insert(
+        "age".to_string(),
+        nanograph::query::ast::Literal::Integer(29),
+    );
+    let result = run_db_mutation_test_with_params(
+        r#"
+query add_person($name: String, $age: I32) {
+    insert Person {
+        name: $name
+        age: $age
+    }
+}
+"#,
+        &mut db,
+        &params,
+    )
+    .await;
+    assert_eq!(result.affected_nodes, 1);
+    assert_eq!(result.affected_edges, 0);
+
+    let names = extract_string_column(
+        &run_db_query_test_with_params(
+            r#"
+query q() {
+    match { $p: Person { name: "Eve" } }
+    return { $p.name }
+}
+"#,
+            &db,
+            &ParamMap::new(),
+        )
+        .await,
+        "name",
+    );
+    assert_eq!(names, vec!["Eve"]);
+}
+
+#[tokio::test]
+async fn test_update_mutation_query_preserves_id_and_edges() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let mut db = Database::init(&db_path, keyed_mutation_schema())
+        .await
+        .unwrap();
+    db.load(keyed_mutation_data()).await.unwrap();
+
+    let before = db.storage.get_all_nodes("Person").unwrap().unwrap();
+    let before_ids = before
+        .column_by_name("id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow::array::UInt64Array>()
+        .unwrap();
+    let before_names = before
+        .column_by_name("name")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let alice_id_before = (0..before.num_rows())
+        .find(|&row| before_names.value(row) == "Alice")
+        .map(|row| before_ids.value(row))
+        .unwrap();
+
+    let mut params = ParamMap::new();
+    params.insert(
+        "name".to_string(),
+        nanograph::query::ast::Literal::String("Alice".to_string()),
+    );
+    params.insert(
+        "age".to_string(),
+        nanograph::query::ast::Literal::Integer(31),
+    );
+    let result = run_db_mutation_test_with_params(
+        r#"
+query update_person($name: String, $age: I32) {
+    update Person set { age: $age } where name = $name
+}
+"#,
+        &mut db,
+        &params,
+    )
+    .await;
+    assert_eq!(result.affected_nodes, 1);
+
+    let after = db.storage.get_all_nodes("Person").unwrap().unwrap();
+    let after_ids = after
+        .column_by_name("id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow::array::UInt64Array>()
+        .unwrap();
+    let after_names = after
+        .column_by_name("name")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let after_ages = after
+        .column_by_name("age")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap();
+    let alice_after = (0..after.num_rows())
+        .find(|&row| after_names.value(row) == "Alice")
+        .unwrap();
+    assert_eq!(after_ids.value(alice_after), alice_id_before);
+    assert_eq!(after_ages.value(alice_after), 31);
+    assert_eq!(db.storage.edge_segments["Knows"].edge_ids.len(), 1);
+}
+
+#[tokio::test]
+async fn test_delete_mutation_query_cascades_edges() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let mut db = Database::init(&db_path, test_schema()).await.unwrap();
+    db.load(test_data()).await.unwrap();
+
+    let mut params = ParamMap::new();
+    params.insert(
+        "name".to_string(),
+        nanograph::query::ast::Literal::String("Alice".to_string()),
+    );
+    let result = run_db_mutation_test_with_params(
+        r#"
+query delete_person($name: String) {
+    delete Person where name = $name
+}
+"#,
+        &mut db,
+        &params,
+    )
+    .await;
+    assert_eq!(result.affected_nodes, 1);
+    assert_eq!(result.affected_edges, 3);
+
+    let people = db.storage.get_all_nodes("Person").unwrap().unwrap();
+    assert_eq!(people.num_rows(), 3);
+    assert_eq!(db.storage.edge_segments["Knows"].edge_ids.len(), 1);
+    assert_eq!(db.storage.edge_segments["WorksAt"].edge_ids.len(), 1);
 }
 
 #[tokio::test]

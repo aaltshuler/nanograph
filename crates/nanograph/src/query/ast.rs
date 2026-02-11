@@ -11,6 +11,7 @@ pub struct QueryDecl {
     pub return_clause: Vec<Projection>,
     pub order_clause: Vec<Ordering>,
     pub limit: Option<u64>,
+    pub mutation: Option<Mutation>,
 }
 
 #[derive(Debug, Clone)]
@@ -132,4 +133,43 @@ pub struct Projection {
 pub struct Ordering {
     pub expr: Expr,
     pub descending: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum Mutation {
+    Insert(InsertMutation),
+    Update(UpdateMutation),
+    Delete(DeleteMutation),
+}
+
+#[derive(Debug, Clone)]
+pub struct InsertMutation {
+    pub type_name: String,
+    pub assignments: Vec<MutationAssignment>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateMutation {
+    pub type_name: String,
+    pub assignments: Vec<MutationAssignment>,
+    pub predicate: MutationPredicate,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeleteMutation {
+    pub type_name: String,
+    pub predicate: MutationPredicate,
+}
+
+#[derive(Debug, Clone)]
+pub struct MutationAssignment {
+    pub property: String,
+    pub value: MatchValue,
+}
+
+#[derive(Debug, Clone)]
+pub struct MutationPredicate {
+    pub property: String,
+    pub op: CompOp,
+    pub value: MatchValue,
 }

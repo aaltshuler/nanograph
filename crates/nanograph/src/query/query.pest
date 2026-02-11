@@ -9,12 +9,24 @@ query_file = { SOI ~ query_decl* ~ EOI }
 
 query_decl = {
     "query" ~ ident ~ "(" ~ param_list? ~ ")" ~ "{"
-        ~ match_clause
-        ~ return_clause
-        ~ order_clause?
-        ~ limit_clause?
+        ~ query_body
     ~ "}"
 }
+
+query_body = { read_query_body | mutation_stmt }
+read_query_body = {
+    match_clause
+    ~ return_clause
+    ~ order_clause?
+    ~ limit_clause?
+}
+
+mutation_stmt = { insert_stmt | update_stmt | delete_stmt }
+insert_stmt = { "insert" ~ type_name ~ "{" ~ mutation_assignment+ ~ "}" }
+update_stmt = { "update" ~ type_name ~ "set" ~ "{" ~ mutation_assignment+ ~ "}" ~ "where" ~ mutation_predicate }
+delete_stmt = { "delete" ~ type_name ~ "where" ~ mutation_predicate }
+mutation_assignment = { ident ~ ":" ~ match_value ~ ","? }
+mutation_predicate = { ident ~ comp_op ~ match_value }
 
 param_list = { param ~ ("," ~ param)* }
 param = { variable ~ ":" ~ type_ref }

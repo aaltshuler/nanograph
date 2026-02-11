@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -6,7 +6,7 @@ use arrow::record_batch::{RecordBatch, RecordBatchIterator};
 use arrow::{
     array::{
         Array, ArrayRef, BooleanArray, BooleanBuilder, Float32Array, Float64Array, Int32Array,
-        Int64Array, StringArray, UInt32Array, UInt64Array, UInt64Builder,
+        Int64Array, StringArray, UInt32Array, UInt64Array,
     },
     datatypes::DataType,
 };
@@ -18,10 +18,10 @@ use tracing::{debug, info, instrument};
 use crate::catalog::Catalog;
 use crate::catalog::schema_ir::{SchemaIR, build_catalog_from_ir, build_schema_ir};
 use crate::error::{NanoError, Result};
-use crate::schema::ast::SchemaDecl;
 use crate::schema::parser::parse_schema;
 use crate::store::graph::GraphStorage;
-use crate::store::loader::{json_values_to_array, load_jsonl_data, load_jsonl_data_with_name_seed};
+use crate::store::indexing::rebuild_node_scalar_indexes;
+use crate::store::loader::build_next_storage_for_load;
 use crate::store::manifest::{DatasetEntry, GraphManifest, hash_string};
 use crate::store::migration::reconcile_migration_sidecars;
 
@@ -36,6 +36,13 @@ pub enum DeleteOp {
     Ge,
     Lt,
     Le,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadMode {
+    Overwrite,
+    Append,
+    Merge,
 }
 
 #[derive(Debug, Clone)]
@@ -188,44 +195,38 @@ impl Database {
         })
     }
 
-    /// Load JSONL data.
-    ///
-    /// Default behavior is full replacement. If the schema contains `@key` on a node property,
-    /// keyed node types are merged as upserts and existing IDs are preserved for matched keys.
+    /// Load JSONL data using compatibility defaults:
+    /// - any `@key` in schema => `LoadMode::Merge`
+    /// - no `@key` in schema => `LoadMode::Overwrite`
     #[instrument(skip(self, data_source))]
     pub async fn load(&mut self, data_source: &str) -> Result<()> {
-        info!("starting database load");
-        let constraints = load_node_constraint_annotations(&self.path)?;
-        let key_props = constraints.key_props;
-        let mut incoming_storage = GraphStorage::new(self.catalog.clone());
-        if key_props.is_empty() {
-            load_jsonl_data(&mut incoming_storage, data_source)?;
+        let mode = if self
+            .schema_ir
+            .node_types()
+            .any(|node| node.properties.iter().any(|prop| prop.key))
+        {
+            LoadMode::Merge
         } else {
-            let incoming_node_types = collect_incoming_node_types(data_source)?;
-            let name_seed = build_name_seed_for_keyed_load(
-                &self.storage,
-                &self.schema_ir,
-                &key_props,
-                &incoming_node_types,
-            )?;
-            load_jsonl_data_with_name_seed(&mut incoming_storage, data_source, Some(&name_seed))?;
-        }
-
-        let mut next_storage = if key_props.is_empty() {
-            incoming_storage
-        } else {
-            merge_storage_with_node_keys(
-                &self.storage,
-                &incoming_storage,
-                &self.schema_ir,
-                &key_props,
-            )?
+            LoadMode::Overwrite
         };
-        enforce_node_unique_constraints(&next_storage, &constraints.unique_props)?;
-        next_storage.build_indices()?;
-        self.storage = next_storage;
+        self.load_with_mode(data_source, mode).await
+    }
+
+    /// Load JSONL data using explicit semantics.
+    #[instrument(skip(self, data_source), fields(mode = ?mode))]
+    pub async fn load_with_mode(&mut self, data_source: &str, mode: LoadMode) -> Result<()> {
+        info!("starting database load");
+        self.storage = build_next_storage_for_load(
+            &self.path,
+            &self.storage,
+            &self.schema_ir,
+            data_source,
+            mode,
+        )
+        .await?;
         self.persist_storage().await?;
         info!(
+            mode = ?mode,
             node_types = self.storage.node_segments.len(),
             edge_types = self.storage.edge_segments.len(),
             "database load complete"
@@ -246,7 +247,7 @@ impl Database {
             None => return Ok(DeleteResult::default()),
         };
 
-        let delete_mask = build_delete_mask(&target_batch, predicate)?;
+        let delete_mask = build_delete_mask_for_mutation(&target_batch, predicate)?;
         let deleted_node_ids = collect_deleted_node_ids(&target_batch, &delete_mask)?;
         if deleted_node_ids.is_empty() {
             return Ok(DeleteResult::default());
@@ -319,6 +320,7 @@ impl Database {
                 let dir_name = SchemaIR::dir_name(node_def.type_id);
                 let dataset_path = self.path.join("nodes").join(&dir_name);
                 write_lance_batch(&dataset_path, batch).await?;
+                rebuild_node_scalar_indexes(&dataset_path, node_def).await?;
                 self.storage
                     .set_node_dataset_path(&node_def.name, dataset_path);
             }
@@ -517,7 +519,10 @@ fn compare_for_delete(left: &ArrayRef, right: &ArrayRef, op: DeleteOp) -> Result
     .map_err(|e| NanoError::Storage(format!("delete predicate compare error: {}", e)))
 }
 
-fn build_delete_mask(batch: &RecordBatch, predicate: &DeletePredicate) -> Result<BooleanArray> {
+pub(crate) fn build_delete_mask_for_mutation(
+    batch: &RecordBatch,
+    predicate: &DeletePredicate,
+) -> Result<BooleanArray> {
     let left = batch
         .column_by_name(&predicate.property)
         .ok_or_else(|| {
@@ -587,778 +592,6 @@ fn filter_edge_batch_by_deleted_nodes(
     let keep_mask = keep_builder.finish();
     arrow::compute::filter_record_batch(batch, &keep_mask)
         .map_err(|e| NanoError::Storage(format!("edge delete filter error: {}", e)))
-}
-
-#[derive(Debug, Default)]
-struct NodeConstraintAnnotations {
-    key_props: HashMap<String, String>,
-    unique_props: HashMap<String, Vec<String>>,
-}
-
-fn load_node_constraint_annotations(db_path: &Path) -> Result<NodeConstraintAnnotations> {
-    let schema_source = std::fs::read_to_string(db_path.join(SCHEMA_PG_FILENAME))?;
-    let schema_file = parse_schema(&schema_source)?;
-    let mut constraints = NodeConstraintAnnotations::default();
-
-    for decl in schema_file.declarations {
-        if let SchemaDecl::Node(node) = decl {
-            let mut node_key_prop: Option<String> = None;
-            let mut node_unique_props: Vec<String> = Vec::new();
-
-            for prop in node.properties {
-                let key_annotations: Vec<_> = prop
-                    .annotations
-                    .iter()
-                    .filter(|a| a.name == "key")
-                    .collect();
-                if key_annotations.len() > 1 {
-                    return Err(NanoError::Storage(format!(
-                        "property {}.{} declares @key multiple times",
-                        node.name, prop.name
-                    )));
-                }
-                if let Some(annotation) = key_annotations.first() {
-                    if annotation.value.is_some() {
-                        return Err(NanoError::Storage(format!(
-                            "@key on {}.{} does not accept a value",
-                            node.name, prop.name
-                        )));
-                    }
-                    if node_key_prop.replace(prop.name.clone()).is_some() {
-                        return Err(NanoError::Storage(format!(
-                            "node type {} has multiple @key properties; only one is currently supported",
-                            node.name
-                        )));
-                    }
-                }
-
-                let unique_annotations: Vec<_> = prop
-                    .annotations
-                    .iter()
-                    .filter(|a| a.name == "unique")
-                    .collect();
-                if unique_annotations.len() > 1 {
-                    return Err(NanoError::Storage(format!(
-                        "property {}.{} declares @unique multiple times",
-                        node.name, prop.name
-                    )));
-                }
-                if let Some(annotation) = unique_annotations.first() {
-                    if annotation.value.is_some() {
-                        return Err(NanoError::Storage(format!(
-                            "@unique on {}.{} does not accept a value",
-                            node.name, prop.name
-                        )));
-                    }
-                    node_unique_props.push(prop.name.clone());
-                }
-            }
-
-            if let Some(prop_name) = node_key_prop {
-                if !node_unique_props.contains(&prop_name) {
-                    node_unique_props.push(prop_name.clone());
-                }
-                constraints.key_props.insert(node.name.clone(), prop_name);
-            }
-            if !node_unique_props.is_empty() {
-                node_unique_props.sort();
-                node_unique_props.dedup();
-                constraints
-                    .unique_props
-                    .insert(node.name.clone(), node_unique_props);
-            }
-        }
-    }
-
-    Ok(constraints)
-}
-
-fn enforce_node_unique_constraints(
-    storage: &GraphStorage,
-    unique_props: &HashMap<String, Vec<String>>,
-) -> Result<()> {
-    for (type_name, properties) in unique_props {
-        let Some(batch) = storage.get_all_nodes(type_name)? else {
-            continue;
-        };
-
-        for property in properties {
-            let prop_idx = batch.schema().index_of(property).map_err(|e| {
-                NanoError::Storage(format!(
-                    "node type {} missing @unique property {}: {}",
-                    type_name, property, e
-                ))
-            })?;
-            let arr = batch.column(prop_idx);
-            let mut seen: HashMap<String, usize> = HashMap::new();
-            for row in 0..batch.num_rows() {
-                let Some(value) = unique_value_string(arr, row, type_name, property)? else {
-                    continue;
-                };
-                if let Some(prev_row) = seen.insert(value.clone(), row) {
-                    return Err(NanoError::Storage(format!(
-                        "@unique constraint violation on {}.{}: duplicate value '{}' at rows {} and {}",
-                        type_name, property, value, prev_row, row
-                    )));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn collect_incoming_node_types(data_source: &str) -> Result<HashSet<String>> {
-    let mut node_types = HashSet::new();
-    for line in data_source.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with("//") {
-            continue;
-        }
-
-        let obj: serde_json::Value = serde_json::from_str(line)
-            .map_err(|e| NanoError::Storage(format!("JSON parse error: {}", e)))?;
-        if let Some(type_name) = obj.get("type").and_then(|v| v.as_str()) {
-            node_types.insert(type_name.to_string());
-        }
-    }
-    Ok(node_types)
-}
-
-fn build_name_seed_for_keyed_load(
-    storage: &GraphStorage,
-    schema_ir: &SchemaIR,
-    key_props: &HashMap<String, String>,
-    incoming_node_types: &HashSet<String>,
-) -> Result<HashMap<(String, String), u64>> {
-    let mut seed = HashMap::new();
-
-    for node_def in schema_ir.node_types() {
-        let preserve_existing =
-            key_props.contains_key(&node_def.name) || !incoming_node_types.contains(&node_def.name);
-        if !preserve_existing {
-            continue;
-        }
-
-        let Some(batch) = storage.get_all_nodes(&node_def.name)? else {
-            continue;
-        };
-        let Some(name_col) = batch.column_by_name("name") else {
-            continue;
-        };
-        let Some(name_arr) = name_col.as_any().downcast_ref::<StringArray>() else {
-            continue;
-        };
-        let id_arr = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| {
-                NanoError::Storage(format!(
-                    "node type {} has non-UInt64 id column",
-                    node_def.name
-                ))
-            })?;
-
-        for row in 0..batch.num_rows() {
-            if name_arr.is_null(row) {
-                continue;
-            }
-            seed.insert(
-                (node_def.name.clone(), name_arr.value(row).to_string()),
-                id_arr.value(row),
-            );
-        }
-    }
-
-    Ok(seed)
-}
-
-fn merge_storage_with_node_keys(
-    existing: &GraphStorage,
-    incoming: &GraphStorage,
-    schema_ir: &SchemaIR,
-    key_props: &HashMap<String, String>,
-) -> Result<GraphStorage> {
-    let mut merged = GraphStorage::new(existing.catalog.clone());
-    let mut next_node_id = existing.next_node_id();
-    let mut next_edge_id = existing.next_edge_id();
-    let mut id_remap_by_type: HashMap<String, HashMap<u64, u64>> = HashMap::new();
-    let mut replaced_unkeyed_types: HashSet<String> = HashSet::new();
-
-    for node_def in schema_ir.node_types() {
-        let existing_batch = existing.get_all_nodes(&node_def.name)?;
-        let incoming_batch = incoming.get_all_nodes(&node_def.name)?;
-
-        if let Some(key_prop) = key_props.get(&node_def.name) {
-            let (merged_batch, remap) = merge_keyed_node_batches(
-                existing_batch.as_ref(),
-                incoming_batch.as_ref(),
-                key_prop,
-                &mut next_node_id,
-            )?;
-            id_remap_by_type.insert(node_def.name.clone(), remap);
-            if let Some(batch) = merged_batch {
-                merged.load_node_batch(&node_def.name, batch)?;
-            }
-        } else {
-            match (existing_batch.as_ref(), incoming_batch.as_ref()) {
-                (_, Some(incoming_batch)) => {
-                    let (reassigned, remap) = reassign_node_ids(incoming_batch, &mut next_node_id)?;
-                    replaced_unkeyed_types.insert(node_def.name.clone());
-                    id_remap_by_type.insert(node_def.name.clone(), remap);
-                    merged.load_node_batch(&node_def.name, reassigned)?;
-                }
-                (Some(existing_batch), None) => {
-                    id_remap_by_type.insert(node_def.name.clone(), HashMap::new());
-                    merged.load_node_batch(&node_def.name, existing_batch.clone())?;
-                }
-                (None, None) => {
-                    id_remap_by_type.insert(node_def.name.clone(), HashMap::new());
-                }
-            }
-        }
-    }
-
-    for edge_def in schema_ir.edge_types() {
-        let src_remap = id_remap_by_type
-            .get(&edge_def.src_type_name)
-            .ok_or_else(|| {
-                NanoError::Storage(format!(
-                    "missing source ID remap for node type {}",
-                    edge_def.src_type_name
-                ))
-            })?;
-        let dst_remap = id_remap_by_type
-            .get(&edge_def.dst_type_name)
-            .ok_or_else(|| {
-                NanoError::Storage(format!(
-                    "missing destination ID remap for node type {}",
-                    edge_def.dst_type_name
-                ))
-            })?;
-        let existing_batch = existing.edge_batch_for_save(&edge_def.name)?;
-        let incoming_batch = incoming.edge_batch_for_save(&edge_def.name)?;
-        let preserve_existing = !replaced_unkeyed_types.contains(&edge_def.src_type_name)
-            && !replaced_unkeyed_types.contains(&edge_def.dst_type_name);
-
-        let merged_edge_batch = merge_edge_batches(
-            existing_batch.as_ref(),
-            incoming_batch.as_ref(),
-            src_remap,
-            dst_remap,
-            &edge_def.name,
-            preserve_existing,
-            &mut next_edge_id,
-        )?;
-        if let Some(batch) = merged_edge_batch {
-            merged.load_edge_batch(&edge_def.name, batch)?;
-        }
-    }
-
-    Ok(merged)
-}
-
-fn merge_keyed_node_batches(
-    existing: Option<&RecordBatch>,
-    incoming: Option<&RecordBatch>,
-    key_prop: &str,
-    next_node_id: &mut u64,
-) -> Result<(Option<RecordBatch>, HashMap<u64, u64>)> {
-    match (existing, incoming) {
-        (None, None) => Ok((None, HashMap::new())),
-        (Some(existing), None) => Ok((Some(existing.clone()), HashMap::new())),
-        (None, Some(incoming)) => {
-            let (reassigned, remap) = reassign_node_ids(incoming, next_node_id)?;
-            Ok((Some(reassigned), remap))
-        }
-        (Some(existing), Some(incoming)) => {
-            if existing.num_columns() != incoming.num_columns() {
-                return Err(NanoError::Storage(format!(
-                    "schema mismatch while merging keyed nodes on {}",
-                    key_prop
-                )));
-            }
-
-            let existing_key_idx = existing.schema().index_of(key_prop).map_err(|e| {
-                NanoError::Storage(format!("missing key property {}: {}", key_prop, e))
-            })?;
-            let incoming_key_idx = incoming.schema().index_of(key_prop).map_err(|e| {
-                NanoError::Storage(format!("missing key property {}: {}", key_prop, e))
-            })?;
-
-            let existing_id_arr = existing
-                .column(0)
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .ok_or_else(|| {
-                    NanoError::Storage("existing node batch id column is not UInt64".to_string())
-                })?;
-            let incoming_id_arr = incoming
-                .column(0)
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .ok_or_else(|| {
-                    NanoError::Storage("incoming node batch id column is not UInt64".to_string())
-                })?;
-
-            let mut existing_key_to_row: HashMap<String, usize> = HashMap::new();
-            for row in 0..existing.num_rows() {
-                let key = key_value_string(existing.column(existing_key_idx), row, key_prop)?;
-                if existing_key_to_row.insert(key.clone(), row).is_some() {
-                    return Err(NanoError::Storage(format!(
-                        "existing data contains duplicate @key value '{}' for {}",
-                        key, key_prop
-                    )));
-                }
-            }
-
-            let mut incoming_seen_keys: HashSet<String> = HashSet::new();
-            let mut existing_updates: Vec<Option<usize>> = vec![None; existing.num_rows()];
-            let mut new_rows: Vec<(usize, u64)> = Vec::new();
-            let mut remap: HashMap<u64, u64> = HashMap::new();
-
-            for incoming_row in 0..incoming.num_rows() {
-                let key =
-                    key_value_string(incoming.column(incoming_key_idx), incoming_row, key_prop)?;
-                if !incoming_seen_keys.insert(key.clone()) {
-                    return Err(NanoError::Storage(format!(
-                        "incoming load contains duplicate @key value '{}' for {}",
-                        key, key_prop
-                    )));
-                }
-
-                let incoming_id = incoming_id_arr.value(incoming_row);
-                if let Some(&existing_row) = existing_key_to_row.get(&key) {
-                    existing_updates[existing_row] = Some(incoming_row);
-                    remap.insert(incoming_id, existing_id_arr.value(existing_row));
-                } else {
-                    let assigned_id = *next_node_id;
-                    *next_node_id = next_node_id.saturating_add(1);
-                    new_rows.push((incoming_row, assigned_id));
-                    remap.insert(incoming_id, assigned_id);
-                }
-            }
-
-            let existing_schema = existing.schema();
-            let mut out_columns: Vec<ArrayRef> = Vec::with_capacity(existing.num_columns());
-            for col_idx in 0..existing.num_columns() {
-                if col_idx == 0 {
-                    let mut id_builder =
-                        UInt64Builder::with_capacity(existing.num_rows() + new_rows.len());
-                    for row in 0..existing.num_rows() {
-                        id_builder.append_value(existing_id_arr.value(row));
-                    }
-                    for (_, new_id) in &new_rows {
-                        id_builder.append_value(*new_id);
-                    }
-                    out_columns.push(Arc::new(id_builder.finish()) as ArrayRef);
-                    continue;
-                }
-
-                let mut values: Vec<serde_json::Value> =
-                    Vec::with_capacity(existing.num_rows() + new_rows.len());
-                for existing_row in 0..existing.num_rows() {
-                    let (source, source_row) =
-                        if let Some(incoming_row) = existing_updates[existing_row] {
-                            (incoming.column(col_idx), incoming_row)
-                        } else {
-                            (existing.column(col_idx), existing_row)
-                        };
-                    values.push(array_value_to_json(source, source_row));
-                }
-                for (incoming_row, _) in &new_rows {
-                    values.push(array_value_to_json(incoming.column(col_idx), *incoming_row));
-                }
-
-                let field = existing_schema.field(col_idx);
-                let arr = json_values_to_array(&values, field.data_type(), field.is_nullable())?;
-                out_columns.push(arr);
-            }
-
-            let out_batch = RecordBatch::try_new(existing_schema, out_columns)
-                .map_err(|e| NanoError::Storage(format!("merge keyed batch error: {}", e)))?;
-            Ok((Some(out_batch), remap))
-        }
-    }
-}
-
-fn reassign_node_ids(
-    batch: &RecordBatch,
-    next_node_id: &mut u64,
-) -> Result<(RecordBatch, HashMap<u64, u64>)> {
-    let id_arr = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<UInt64Array>()
-        .ok_or_else(|| NanoError::Storage("node batch id column is not UInt64".to_string()))?;
-
-    let mut remap = HashMap::new();
-    let mut id_builder = UInt64Builder::with_capacity(batch.num_rows());
-    for row in 0..batch.num_rows() {
-        let old_id = id_arr.value(row);
-        let new_id = *next_node_id;
-        *next_node_id = next_node_id.saturating_add(1);
-        remap.insert(old_id, new_id);
-        id_builder.append_value(new_id);
-    }
-
-    let mut out_columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
-    out_columns.push(Arc::new(id_builder.finish()) as ArrayRef);
-    for col in batch.columns().iter().skip(1) {
-        out_columns.push(col.clone());
-    }
-
-    let out_batch = RecordBatch::try_new(batch.schema(), out_columns)
-        .map_err(|e| NanoError::Storage(format!("reassign node id batch error: {}", e)))?;
-    Ok((out_batch, remap))
-}
-
-fn merge_edge_batches(
-    existing: Option<&RecordBatch>,
-    incoming: Option<&RecordBatch>,
-    src_remap: &HashMap<u64, u64>,
-    dst_remap: &HashMap<u64, u64>,
-    edge_name: &str,
-    preserve_existing: bool,
-    next_edge_id: &mut u64,
-) -> Result<Option<RecordBatch>> {
-    let remapped_existing = if preserve_existing {
-        existing.cloned()
-    } else {
-        None
-    };
-    let remapped_incoming = incoming
-        .map(|batch| remap_edge_batch_endpoints(batch, src_remap, dst_remap, edge_name))
-        .transpose()?;
-
-    let schema = remapped_incoming
-        .as_ref()
-        .map(|b| b.schema())
-        .or_else(|| remapped_existing.as_ref().map(|b| b.schema()));
-    let Some(schema) = schema else {
-        return Ok(None);
-    };
-
-    // No multigraph support: keep one row per (src, dst) edge.
-    // Existing rows are loaded first and incoming rows overwrite duplicates.
-    let mut row_order: Vec<(u64, u64)> = Vec::new();
-    let mut row_props: HashMap<(u64, u64), Vec<serde_json::Value>> = HashMap::new();
-    let prop_indices: Vec<usize> = schema
-        .fields()
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, field)| {
-            if field.name() == "id" || field.name() == "src" || field.name() == "dst" {
-                None
-            } else {
-                Some(idx)
-            }
-        })
-        .collect();
-
-    let mut ingest = |batch: &RecordBatch, overwrite: bool| -> Result<()> {
-        let src_arr = batch
-            .column_by_name("src")
-            .ok_or_else(|| NanoError::Storage("edge batch missing src column".to_string()))?
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| NanoError::Storage("edge src column is not UInt64".to_string()))?;
-        let dst_arr = batch
-            .column_by_name("dst")
-            .ok_or_else(|| NanoError::Storage("edge batch missing dst column".to_string()))?
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| NanoError::Storage("edge dst column is not UInt64".to_string()))?;
-
-        for row in 0..batch.num_rows() {
-            let key = (src_arr.value(row), dst_arr.value(row));
-            let props = prop_indices
-                .iter()
-                .map(|&idx| array_value_to_json(batch.column(idx), row))
-                .collect::<Vec<_>>();
-            if row_props.contains_key(&key) {
-                if overwrite {
-                    row_props.insert(key, props);
-                }
-            } else {
-                row_order.push(key);
-                row_props.insert(key, props);
-            }
-        }
-
-        Ok(())
-    };
-
-    if let Some(batch) = remapped_existing.as_ref() {
-        ingest(batch, false)?;
-    }
-    if let Some(batch) = remapped_incoming.as_ref() {
-        ingest(batch, true)?;
-    }
-    if row_order.is_empty() {
-        return Ok(None);
-    }
-
-    let mut id_builder = UInt64Builder::with_capacity(row_order.len());
-    let mut src_builder = UInt64Builder::with_capacity(row_order.len());
-    let mut dst_builder = UInt64Builder::with_capacity(row_order.len());
-    let mut prop_values: Vec<Vec<serde_json::Value>> = (0..prop_indices.len())
-        .map(|_| Vec::with_capacity(row_order.len()))
-        .collect();
-
-    for (src, dst) in &row_order {
-        let edge_id = *next_edge_id;
-        *next_edge_id = next_edge_id.saturating_add(1);
-        id_builder.append_value(edge_id);
-        src_builder.append_value(*src);
-        dst_builder.append_value(*dst);
-
-        let props = row_props.get(&(*src, *dst)).ok_or_else(|| {
-            NanoError::Storage(format!(
-                "internal edge dedup error for {} at ({}, {})",
-                edge_name, src, dst
-            ))
-        })?;
-        for (idx, prop) in props.iter().enumerate() {
-            prop_values[idx].push(prop.clone());
-        }
-    }
-
-    let mut built_props: HashMap<String, ArrayRef> = HashMap::new();
-    for (prop_pos, &col_idx) in prop_indices.iter().enumerate() {
-        let field = schema.field(col_idx);
-        let arr = json_values_to_array(
-            &prop_values[prop_pos],
-            field.data_type(),
-            field.is_nullable(),
-        )?;
-        built_props.insert(field.name().clone(), arr);
-    }
-
-    let id_arr: ArrayRef = Arc::new(id_builder.finish());
-    let src_arr: ArrayRef = Arc::new(src_builder.finish());
-    let dst_arr: ArrayRef = Arc::new(dst_builder.finish());
-    let mut out_columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
-    for field in schema.fields() {
-        match field.name().as_str() {
-            "id" => out_columns.push(id_arr.clone()),
-            "src" => out_columns.push(src_arr.clone()),
-            "dst" => out_columns.push(dst_arr.clone()),
-            name => {
-                let arr = built_props.get(name).ok_or_else(|| {
-                    NanoError::Storage(format!(
-                        "missing merged edge property column {} for {}",
-                        name, edge_name
-                    ))
-                })?;
-                out_columns.push(arr.clone());
-            }
-        }
-    }
-
-    let batch = RecordBatch::try_new(schema, out_columns)
-        .map_err(|e| NanoError::Storage(format!("edge merge batch error: {}", e)))?;
-    Ok(Some(batch))
-}
-
-fn remap_edge_batch_endpoints(
-    batch: &RecordBatch,
-    src_remap: &HashMap<u64, u64>,
-    dst_remap: &HashMap<u64, u64>,
-    _edge_name: &str,
-) -> Result<RecordBatch> {
-    let src_arr = batch
-        .column_by_name("src")
-        .ok_or_else(|| NanoError::Storage("edge batch missing src column".to_string()))?
-        .as_any()
-        .downcast_ref::<UInt64Array>()
-        .ok_or_else(|| NanoError::Storage("edge src column is not UInt64".to_string()))?;
-    let dst_arr = batch
-        .column_by_name("dst")
-        .ok_or_else(|| NanoError::Storage("edge batch missing dst column".to_string()))?
-        .as_any()
-        .downcast_ref::<UInt64Array>()
-        .ok_or_else(|| NanoError::Storage("edge dst column is not UInt64".to_string()))?;
-
-    let mut src_builder = UInt64Builder::with_capacity(batch.num_rows());
-    let mut dst_builder = UInt64Builder::with_capacity(batch.num_rows());
-    for row in 0..batch.num_rows() {
-        let src = src_arr.value(row);
-        let dst = dst_arr.value(row);
-        let mapped_src = src_remap.get(&src).copied().unwrap_or(src);
-        let mapped_dst = dst_remap.get(&dst).copied().unwrap_or(dst);
-        src_builder.append_value(mapped_src);
-        dst_builder.append_value(mapped_dst);
-    }
-    let src_arr: ArrayRef = Arc::new(src_builder.finish());
-    let dst_arr: ArrayRef = Arc::new(dst_builder.finish());
-
-    let mut out_columns = Vec::with_capacity(batch.num_columns());
-    for (idx, field) in batch.schema().fields().iter().enumerate() {
-        match field.name().as_str() {
-            "src" => out_columns.push(src_arr.clone()),
-            "dst" => out_columns.push(dst_arr.clone()),
-            _ => out_columns.push(batch.column(idx).clone()),
-        }
-    }
-
-    RecordBatch::try_new(batch.schema(), out_columns)
-        .map_err(|e| NanoError::Storage(format!("edge remap batch error: {}", e)))
-}
-
-fn key_value_string(array: &ArrayRef, row: usize, prop_name: &str) -> Result<String> {
-    let value = scalar_value_string(array, row, "key", None, prop_name)?;
-    if let Some(value) = value {
-        return Ok(value);
-    }
-    Err(NanoError::Storage(format!(
-        "@key property {} cannot be null",
-        prop_name
-    )))
-}
-
-fn unique_value_string(
-    array: &ArrayRef,
-    row: usize,
-    type_name: &str,
-    prop_name: &str,
-) -> Result<Option<String>> {
-    scalar_value_string(array, row, "unique", Some(type_name), prop_name)
-}
-
-fn scalar_value_string(
-    array: &ArrayRef,
-    row: usize,
-    annotation: &str,
-    type_name: Option<&str>,
-    prop_name: &str,
-) -> Result<Option<String>> {
-    if array.is_null(row) {
-        return Ok(None);
-    }
-
-    use arrow::array::*;
-    let value = match array.data_type() {
-        DataType::Utf8 => array
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .map(|a| a.value(row).to_string()),
-        DataType::Boolean => array
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .map(|a| a.value(row).to_string()),
-        DataType::Int32 => array
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .map(|a| a.value(row).to_string()),
-        DataType::Int64 => array
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .map(|a| a.value(row).to_string()),
-        DataType::UInt32 => array
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .map(|a| a.value(row).to_string()),
-        DataType::UInt64 => array
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .map(|a| a.value(row).to_string()),
-        DataType::Float32 => array
-            .as_any()
-            .downcast_ref::<Float32Array>()
-            .map(|a| a.value(row).to_string()),
-        DataType::Float64 => array
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .map(|a| a.value(row).to_string()),
-        DataType::Date32 => array
-            .as_any()
-            .downcast_ref::<Date32Array>()
-            .map(|a| a.value(row).to_string()),
-        DataType::Date64 => array
-            .as_any()
-            .downcast_ref::<Date64Array>()
-            .map(|a| a.value(row).to_string()),
-        _ => None,
-    };
-
-    let value = value.ok_or_else(|| {
-        let target = match type_name {
-            Some(name) => format!("{}.{}", name, prop_name),
-            None => prop_name.to_string(),
-        };
-        NanoError::Storage(format!(
-            "unsupported @{} data type {:?} for {}",
-            annotation,
-            array.data_type(),
-            target
-        ))
-    })?;
-
-    Ok(Some(value))
-}
-
-fn array_value_to_json(array: &ArrayRef, row: usize) -> serde_json::Value {
-    if array.is_null(row) {
-        return serde_json::Value::Null;
-    }
-
-    use arrow::array::*;
-    match array.data_type() {
-        DataType::Utf8 => array
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .map(|a| serde_json::Value::String(a.value(row).to_string()))
-            .unwrap_or(serde_json::Value::Null),
-        DataType::Boolean => array
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .map(|a| serde_json::Value::Bool(a.value(row)))
-            .unwrap_or(serde_json::Value::Null),
-        DataType::Int32 => array
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .map(|a| serde_json::Value::Number((a.value(row) as i64).into()))
-            .unwrap_or(serde_json::Value::Null),
-        DataType::Int64 => array
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .map(|a| serde_json::Value::Number(a.value(row).into()))
-            .unwrap_or(serde_json::Value::Null),
-        DataType::UInt32 => array
-            .as_any()
-            .downcast_ref::<UInt32Array>()
-            .map(|a| serde_json::Value::Number((a.value(row) as u64).into()))
-            .unwrap_or(serde_json::Value::Null),
-        DataType::UInt64 => array
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .map(|a| serde_json::Value::Number(a.value(row).into()))
-            .unwrap_or(serde_json::Value::Null),
-        DataType::Float32 => array
-            .as_any()
-            .downcast_ref::<Float32Array>()
-            .and_then(|a| {
-                serde_json::Number::from_f64(a.value(row) as f64).map(serde_json::Value::Number)
-            })
-            .unwrap_or(serde_json::Value::Null),
-        DataType::Float64 => array
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .and_then(|a| serde_json::Number::from_f64(a.value(row)).map(serde_json::Value::Number))
-            .unwrap_or(serde_json::Value::Null),
-        DataType::Date32 => array
-            .as_any()
-            .downcast_ref::<Date32Array>()
-            .map(|a| serde_json::Value::Number((a.value(row) as i64).into()))
-            .unwrap_or(serde_json::Value::Null),
-        DataType::Date64 => array
-            .as_any()
-            .downcast_ref::<Date64Array>()
-            .map(|a| serde_json::Value::Number(a.value(row).into()))
-            .unwrap_or(serde_json::Value::Null),
-        _ => serde_json::Value::Null,
-    }
 }
 
 /// Remove Lance dirs under nodes/ and edges/ that are not in the manifest.
@@ -1472,8 +705,10 @@ fn next_schema_identity_counters(ir: &SchemaIR) -> (u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::Array;
+    use arrow::array::{Array, StringArray, UInt64Array};
     use arrow::datatypes::{Field, Schema};
+    use lance_index::DatasetIndexExt;
+    use std::collections::HashSet;
     use tempfile::TempDir;
 
     fn test_schema_src() -> &'static str {
@@ -1539,6 +774,17 @@ edge Knows: Person -> Person
 "#
     }
 
+    fn keyed_data_append_duplicate() -> &'static str {
+        r#"{"type": "Person", "data": {"name": "Alice", "age": 99}}
+"#
+    }
+
+    fn append_data_new_person_with_edge_to_existing() -> &'static str {
+        r#"{"type": "Person", "data": {"name": "Diana", "age": 28}}
+{"edge": "Knows", "from": "Diana", "to": "Alice"}
+"#
+    }
+
     fn unique_schema_src() -> &'static str {
         r#"node Person {
     name: String @key
@@ -1569,6 +815,21 @@ edge Knows: Person -> Person
     name: String
     nick: String? @unique
 }
+"#
+    }
+
+    fn indexed_schema_src() -> &'static str {
+        r#"node Person {
+    name: String @key
+    handle: String @index
+    age: I32?
+}
+"#
+    }
+
+    fn indexed_data_src() -> &'static str {
+        r#"{"type": "Person", "data": {"name": "Alice", "handle": "a", "age": 30}}
+{"type": "Person", "data": {"name": "Bob", "handle": "b", "age": 25}}
 "#
     }
 
@@ -1715,6 +976,262 @@ edge Knows: Person -> Person
 
         let knows_seg = &db.storage.edge_segments["Knows"];
         assert_eq!(knows_seg.edge_ids.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_load_mode_overwrite_replaces_existing_data() {
+        let dir = test_dir("mode_overwrite");
+        let path = dir.path();
+
+        let mut db = Database::init(path, test_schema_src()).await.unwrap();
+        db.load_with_mode(test_data_src(), LoadMode::Overwrite)
+            .await
+            .unwrap();
+        db.load_with_mode(
+            r#"{"type": "Person", "data": {"name": "OnlyOne", "age": 77}}"#,
+            LoadMode::Overwrite,
+        )
+        .await
+        .unwrap();
+
+        let persons = db.storage.get_all_nodes("Person").unwrap().unwrap();
+        assert_eq!(persons.num_rows(), 1);
+        let names = persons
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(names.value(0), "OnlyOne");
+    }
+
+    #[tokio::test]
+    async fn test_load_mode_append_adds_rows_and_can_reference_existing_nodes() {
+        let dir = test_dir("mode_append");
+        let path = dir.path();
+
+        let mut db = Database::init(path, test_schema_src()).await.unwrap();
+        db.load_with_mode(test_data_src(), LoadMode::Overwrite)
+            .await
+            .unwrap();
+        db.load_with_mode(
+            append_data_new_person_with_edge_to_existing(),
+            LoadMode::Append,
+        )
+        .await
+        .unwrap();
+
+        let persons = db.storage.get_all_nodes("Person").unwrap().unwrap();
+        assert_eq!(persons.num_rows(), 4);
+        let alice_id = person_id_by_name(&persons, "Alice");
+        let diana_id = person_id_by_name(&persons, "Diana");
+        let knows = db.storage.edge_batch_for_save("Knows").unwrap().unwrap();
+        let src = knows
+            .column_by_name("src")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let dst = knows
+            .column_by_name("dst")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert!(
+            (0..knows.num_rows())
+                .any(|row| src.value(row) == diana_id && dst.value(row) == alice_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_mode_merge_requires_keyed_schema() {
+        let dir = test_dir("mode_merge_requires_key");
+        let path = dir.path();
+
+        let mut db = Database::init(path, test_schema_src()).await.unwrap();
+        let err = db
+            .load_with_mode(test_data_src(), LoadMode::Merge)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("requires at least one node @key"));
+    }
+
+    #[tokio::test]
+    async fn test_load_mode_merge_upserts_keyed_rows() {
+        let dir = test_dir("mode_merge_keyed");
+        let path = dir.path();
+
+        let mut db = Database::init(path, keyed_schema_src()).await.unwrap();
+        db.load_with_mode(keyed_data_initial(), LoadMode::Overwrite)
+            .await
+            .unwrap();
+        db.load_with_mode(keyed_data_upsert(), LoadMode::Merge)
+            .await
+            .unwrap();
+
+        let persons = db.storage.get_all_nodes("Person").unwrap().unwrap();
+        assert_eq!(persons.num_rows(), 3);
+        assert_eq!(person_age_by_name(&persons, "Alice"), Some(31));
+    }
+
+    #[tokio::test]
+    async fn test_load_mode_append_rejects_duplicate_key_values() {
+        let dir = test_dir("mode_append_key_duplicate");
+        let path = dir.path();
+
+        let mut db = Database::init(path, keyed_schema_src()).await.unwrap();
+        db.load_with_mode(keyed_data_initial(), LoadMode::Overwrite)
+            .await
+            .unwrap();
+        let err = db
+            .load_with_mode(keyed_data_append_duplicate(), LoadMode::Append)
+            .await
+            .unwrap_err();
+        match err {
+            NanoError::UniqueConstraint {
+                type_name,
+                property,
+                value,
+                ..
+            } => {
+                assert_eq!(type_name, "Person");
+                assert_eq!(property, "name");
+                assert_eq!(value, "Alice");
+            }
+            other => panic!("expected UniqueConstraint, got {}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_load_modes_table_driven() {
+        struct Case {
+            name: &'static str,
+            schema: &'static str,
+            initial: &'static str,
+            next_data: &'static str,
+            mode: LoadMode,
+            expected_person_rows: Option<usize>,
+            expected_error_contains: Option<&'static str>,
+        }
+
+        let cases = vec![
+            Case {
+                name: "overwrite",
+                schema: test_schema_src(),
+                initial: test_data_src(),
+                next_data: r#"{"type": "Person", "data": {"name": "OnlyOne", "age": 1}}"#,
+                mode: LoadMode::Overwrite,
+                expected_person_rows: Some(1),
+                expected_error_contains: None,
+            },
+            Case {
+                name: "append",
+                schema: test_schema_src(),
+                initial: test_data_src(),
+                next_data: r#"{"type": "Person", "data": {"name": "Eve", "age": 44}}"#,
+                mode: LoadMode::Append,
+                expected_person_rows: Some(4),
+                expected_error_contains: None,
+            },
+            Case {
+                name: "merge_requires_key",
+                schema: test_schema_src(),
+                initial: test_data_src(),
+                next_data: r#"{"type": "Person", "data": {"name": "Eve", "age": 44}}"#,
+                mode: LoadMode::Merge,
+                expected_person_rows: None,
+                expected_error_contains: Some("requires at least one node @key"),
+            },
+        ];
+
+        for case in cases {
+            let dir = test_dir(&format!("mode_table_{}", case.name));
+            let path = dir.path();
+            let mut db = Database::init(path, case.schema).await.unwrap();
+            db.load_with_mode(case.initial, LoadMode::Overwrite)
+                .await
+                .unwrap();
+            let result = db.load_with_mode(case.next_data, case.mode).await;
+
+            if let Some(msg) = case.expected_error_contains {
+                let err = result.unwrap_err();
+                assert!(
+                    err.to_string().contains(msg),
+                    "case {} expected error containing '{}', got '{}'",
+                    case.name,
+                    msg,
+                    err
+                );
+                continue;
+            }
+
+            result.unwrap();
+            let persons = db.storage.get_all_nodes("Person").unwrap().unwrap();
+            assert_eq!(
+                persons.num_rows(),
+                case.expected_person_rows.unwrap(),
+                "case {} person row count",
+                case.name
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_load_builds_scalar_indexes_for_indexed_properties() {
+        let dir = test_dir("indexed_props");
+        let path = dir.path();
+
+        let mut db = Database::init(path, indexed_schema_src()).await.unwrap();
+        db.load(indexed_data_src()).await.unwrap();
+
+        let user = db
+            .schema_ir
+            .node_types()
+            .find(|n| n.name == "Person")
+            .expect("person node type");
+        let expected_index_names: Vec<String> = user
+            .properties
+            .iter()
+            .filter(|p| p.index)
+            .map(|p| crate::store::indexing::scalar_index_name(user.type_id, &p.name))
+            .collect();
+        let dataset_path = path.join("nodes").join(SchemaIR::dir_name(user.type_id));
+
+        let uri = dataset_path.to_string_lossy().to_string();
+        let dataset = Dataset::open(&uri).await.unwrap();
+        let index_names: HashSet<String> = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .map(|idx| idx.name.clone())
+            .collect();
+        for expected in &expected_index_names {
+            assert!(
+                index_names.contains(expected),
+                "expected scalar index {} to exist",
+                expected
+            );
+        }
+
+        drop(db);
+        Database::open(path).await.unwrap();
+        let reopened = Dataset::open(&uri).await.unwrap();
+        let reopened_names: HashSet<String> = reopened
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .map(|idx| idx.name.clone())
+            .collect();
+        for expected in &expected_index_names {
+            assert!(
+                reopened_names.contains(expected),
+                "expected scalar index {} after reopen",
+                expected
+            );
+        }
     }
 
     #[tokio::test]
@@ -1875,10 +1392,22 @@ edge Knows: Person -> Person
         db.storage.insert_nodes("Person", batch).unwrap();
 
         let err = db.load("").await.unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("@unique constraint violation"));
-        assert!(msg.contains("Person.email"));
-        assert!(msg.contains("dupe@example.com"));
+        match err {
+            NanoError::UniqueConstraint {
+                type_name,
+                property,
+                value,
+                first_row,
+                second_row,
+            } => {
+                assert_eq!(type_name, "Person");
+                assert_eq!(property, "email");
+                assert_eq!(value, "dupe@example.com");
+                assert_eq!(first_row, 0);
+                assert_eq!(second_row, 1);
+            }
+            other => panic!("expected UniqueConstraint, got {}", other),
+        }
     }
 
     #[tokio::test]
@@ -1893,10 +1422,19 @@ edge Knows: Person -> Person
             .load(unique_data_existing_incoming_conflict())
             .await
             .unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("@unique constraint violation"));
-        assert!(msg.contains("Person.email"));
-        assert!(msg.contains("bob@example.com"));
+        match err {
+            NanoError::UniqueConstraint {
+                type_name,
+                property,
+                value,
+                ..
+            } => {
+                assert_eq!(type_name, "Person");
+                assert_eq!(property, "email");
+                assert_eq!(value, "bob@example.com");
+            }
+            other => panic!("expected UniqueConstraint, got {}", other),
+        }
 
         let persons = db.storage.get_all_nodes("Person").unwrap().unwrap();
         assert_eq!(persons.num_rows(), 2);
@@ -1913,10 +1451,19 @@ edge Knows: Person -> Person
             .load(unique_data_incoming_incoming_conflict())
             .await
             .unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("@unique constraint violation"));
-        assert!(msg.contains("Person.email"));
-        assert!(msg.contains("charlie@example.com"));
+        match err {
+            NanoError::UniqueConstraint {
+                type_name,
+                property,
+                value,
+                ..
+            } => {
+                assert_eq!(type_name, "Person");
+                assert_eq!(property, "email");
+                assert_eq!(value, "charlie@example.com");
+            }
+            other => panic!("expected UniqueConstraint, got {}", other),
+        }
 
         assert!(db.storage.get_all_nodes("Person").unwrap().is_none());
     }
@@ -1942,10 +1489,19 @@ edge Knows: Person -> Person
         assert!(nick_col.is_null(1));
 
         let err = db.load(nullable_unique_duplicate_data()).await.unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("@unique constraint violation"));
-        assert!(msg.contains("Person.nick"));
-        assert!(msg.contains("ally"));
+        match err {
+            NanoError::UniqueConstraint {
+                type_name,
+                property,
+                value,
+                ..
+            } => {
+                assert_eq!(type_name, "Person");
+                assert_eq!(property, "nick");
+                assert_eq!(value, "ally");
+            }
+            other => panic!("expected UniqueConstraint, got {}", other),
+        }
 
         let persons_after_err = db.storage.get_all_nodes("Person").unwrap().unwrap();
         assert_eq!(persons_after_err.num_rows(), 2);

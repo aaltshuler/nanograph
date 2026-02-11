@@ -1,10 +1,15 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
 use arrow::array::{Array, StringArray};
+use lance::Dataset;
+use lance_index::DatasetIndexExt;
 use tempfile::TempDir;
 
+use nanograph::catalog::schema_ir::SchemaIR;
 use nanograph::store::database::Database;
+use nanograph::store::indexing::scalar_index_name;
 use nanograph::store::manifest::GraphManifest;
 use nanograph::store::migration::{MigrationStatus, MigrationStep, execute_schema_migration};
 
@@ -137,6 +142,26 @@ node Account {
     nickname: String?
 }
 edge ConnectedTo: Account -> Account
+"#
+}
+
+fn schema_with_index_annotation() -> &'static str {
+    r#"
+node User {
+    name: String @index
+    age: I32?
+}
+edge Knows: User -> User
+"#
+}
+
+fn schema_with_key_auto_index() -> &'static str {
+    r#"
+node User {
+    name: String @key
+    age: I32?
+}
+edge Knows: User -> User
 "#
 }
 
@@ -487,6 +512,88 @@ async fn migration_sequential_runs_increment_schema_identity_version() {
 
     let manifest = GraphManifest::read(&db_path).expect("read manifest");
     assert_eq!(manifest.schema_identity_version, 3);
+}
+
+#[tokio::test]
+async fn migration_preserves_index_annotations_in_schema_ir() {
+    let (_dir, db_path) = init_db_with_data(base_schema()).await;
+    write_schema(&db_path, schema_with_index_annotation());
+
+    let exec = execute_schema_migration(&db_path, false, false)
+        .await
+        .expect("apply migration");
+    assert_eq!(exec.status, MigrationStatus::Applied);
+
+    let db = Database::open(&db_path).await.expect("re-open migrated db");
+    let user = db
+        .schema_ir
+        .node_types()
+        .find(|n| n.name == "User")
+        .unwrap();
+    let name_prop = user.properties.iter().find(|p| p.name == "name").unwrap();
+    let age_prop = user.properties.iter().find(|p| p.name == "age").unwrap();
+
+    assert!(name_prop.index);
+    assert!(!name_prop.key);
+    assert!(!age_prop.index);
+}
+
+#[tokio::test]
+async fn migration_auto_indexes_key_properties_in_schema_ir() {
+    let (_dir, db_path) = init_db_with_data(base_schema()).await;
+    write_schema(&db_path, schema_with_key_auto_index());
+
+    let exec = execute_schema_migration(&db_path, false, false)
+        .await
+        .expect("apply migration");
+    assert_eq!(exec.status, MigrationStatus::Applied);
+
+    let db = Database::open(&db_path).await.expect("re-open migrated db");
+    let user = db
+        .schema_ir
+        .node_types()
+        .find(|n| n.name == "User")
+        .unwrap();
+    let name_prop = user.properties.iter().find(|p| p.name == "name").unwrap();
+
+    assert!(name_prop.key);
+    assert!(name_prop.index);
+}
+
+#[tokio::test]
+async fn migration_builds_scalar_indexes_for_indexed_properties() {
+    let (_dir, db_path) = init_db_with_data(base_schema()).await;
+    write_schema(&db_path, schema_with_index_annotation());
+
+    let exec = execute_schema_migration(&db_path, false, false)
+        .await
+        .expect("apply migration");
+    assert_eq!(exec.status, MigrationStatus::Applied);
+
+    let db = Database::open(&db_path).await.expect("re-open migrated db");
+    let user = db
+        .schema_ir
+        .node_types()
+        .find(|n| n.name == "User")
+        .expect("user node");
+    let dataset_path = db_path.join("nodes").join(SchemaIR::dir_name(user.type_id));
+    let dataset = Dataset::open(dataset_path.to_string_lossy().as_ref())
+        .await
+        .expect("open user dataset");
+    let index_names: HashSet<String> = dataset
+        .load_indices()
+        .await
+        .expect("load indices")
+        .iter()
+        .map(|idx| idx.name.clone())
+        .collect();
+
+    let expected_name_idx = scalar_index_name(user.type_id, "name");
+    assert!(
+        index_names.contains(&expected_name_idx),
+        "expected migration-created scalar index {}",
+        expected_name_idx
+    );
 }
 
 #[tokio::test]

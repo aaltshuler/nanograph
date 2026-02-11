@@ -51,6 +51,12 @@ pub struct PropDef {
     #[serde(rename = "type")]
     pub scalar_type: String,
     pub nullable: bool,
+    #[serde(default)]
+    pub key: bool,
+    #[serde(default)]
+    pub unique: bool,
+    #[serde(default)]
+    pub index: bool,
 }
 
 // ── FNV-1a hashing ──────────────────────────────────────────────────────────
@@ -120,6 +126,10 @@ pub fn build_schema_ir(schema: &SchemaFile) -> Result<SchemaIR> {
                             prop_id,
                             scalar_type: p.prop_type.scalar.to_string(),
                             nullable: p.prop_type.nullable,
+                            key: p.annotations.iter().any(|a| a.name == "key"),
+                            unique: p.annotations.iter().any(|a| a.name == "unique"),
+                            index: p.annotations.iter().any(|a| a.name == "key")
+                                || p.annotations.iter().any(|a| a.name == "index"),
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -170,6 +180,9 @@ pub fn build_schema_ir(schema: &SchemaFile) -> Result<SchemaIR> {
                             prop_id,
                             scalar_type: p.prop_type.scalar.to_string(),
                             nullable: p.prop_type.nullable,
+                            key: false,
+                            unique: false,
+                            index: false,
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -205,6 +218,7 @@ pub fn build_catalog_from_ir(ir: &SchemaIR) -> Result<Catalog> {
         match typedef {
             TypeDef::Node(n) => {
                 let mut properties = HashMap::new();
+                let mut indexed_properties = HashSet::new();
                 let mut fields = vec![Field::new("id", arrow::datatypes::DataType::UInt64, false)];
 
                 for prop in &n.properties {
@@ -218,6 +232,9 @@ pub fn build_catalog_from_ir(ir: &SchemaIR) -> Result<Catalog> {
                             nullable: prop.nullable,
                         },
                     );
+                    if prop.index {
+                        indexed_properties.insert(prop.name.clone());
+                    }
                     fields.push(Field::new(&prop.name, scalar.to_arrow(), prop.nullable));
                 }
 
@@ -226,6 +243,7 @@ pub fn build_catalog_from_ir(ir: &SchemaIR) -> Result<Catalog> {
                     NodeType {
                         name: n.name.clone(),
                         properties,
+                        indexed_properties,
                         arrow_schema: Arc::new(Schema::new(fields)),
                     },
                 );
@@ -361,6 +379,48 @@ edge WorksAt: Person -> Company
     }
 
     #[test]
+    fn test_build_schema_ir_preserves_key_unique_metadata() {
+        let schema = parse_schema(
+            r#"
+node Person {
+    id: U64 @key
+    email: String @unique
+    handle: String @index
+    age: I32?
+}
+"#,
+        )
+        .unwrap();
+        let ir = build_schema_ir(&schema).unwrap();
+        let person = ir.node_types().find(|n| n.name == "Person").unwrap();
+        let id_prop = person.properties.iter().find(|p| p.name == "id").unwrap();
+        let email_prop = person
+            .properties
+            .iter()
+            .find(|p| p.name == "email")
+            .unwrap();
+        let handle_prop = person
+            .properties
+            .iter()
+            .find(|p| p.name == "handle")
+            .unwrap();
+        let age_prop = person.properties.iter().find(|p| p.name == "age").unwrap();
+
+        assert!(id_prop.key);
+        assert!(!id_prop.unique);
+        assert!(id_prop.index);
+        assert!(!email_prop.key);
+        assert!(email_prop.unique);
+        assert!(!email_prop.index);
+        assert!(!handle_prop.key);
+        assert!(!handle_prop.unique);
+        assert!(handle_prop.index);
+        assert!(!age_prop.key);
+        assert!(!age_prop.unique);
+        assert!(!age_prop.index);
+    }
+
+    #[test]
     fn test_ir_ids_are_deterministic() {
         let schema = parse_schema(test_schema_src()).unwrap();
         let ir1 = build_schema_ir(&schema).unwrap();
@@ -405,6 +465,31 @@ edge WorksAt: Person -> Company
         let ir2: SchemaIR = serde_json::from_str(&json).unwrap();
         assert_eq!(ir.types.len(), ir2.types.len());
         assert_eq!(ir.ir_version, ir2.ir_version);
+    }
+
+    #[test]
+    fn test_legacy_ir_without_constraint_fields_deserializes() {
+        let legacy = r#"
+{
+  "ir_version": 1,
+  "types": [
+    {
+      "kind": "node",
+      "name": "Person",
+      "type_id": 123,
+      "properties": [
+        { "name": "name", "prop_id": 1, "type": "String", "nullable": false }
+      ]
+    }
+  ]
+}
+"#;
+        let ir: SchemaIR = serde_json::from_str(legacy).unwrap();
+        let person = ir.node_types().next().unwrap();
+        let prop = person.properties.first().unwrap();
+        assert!(!prop.key);
+        assert!(!prop.unique);
+        assert!(!prop.index);
     }
 
     #[test]

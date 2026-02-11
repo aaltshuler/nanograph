@@ -19,6 +19,7 @@ use crate::schema::ast::{Annotation, PropDecl, SchemaDecl, SchemaFile};
 use crate::schema::parser::parse_schema;
 use crate::store::database::Database;
 use crate::store::graph::GraphStorage;
+use crate::store::indexing::rebuild_node_scalar_indexes;
 use crate::store::manifest::{DatasetEntry, GraphManifest, hash_string};
 use crate::types::ScalarType;
 
@@ -426,6 +427,10 @@ fn build_desired_schema_ir(
                 prop_id,
                 scalar_type: prop.prop_type.scalar.to_string(),
                 nullable: prop.prop_type.nullable,
+                key: prop.annotations.iter().any(|a| a.name == "key"),
+                unique: prop.annotations.iter().any(|a| a.name == "unique"),
+                index: prop.annotations.iter().any(|a| a.name == "key")
+                    || prop.annotations.iter().any(|a| a.name == "index"),
             });
         }
 
@@ -520,6 +525,9 @@ fn build_desired_schema_ir(
                 prop_id,
                 scalar_type: prop.prop_type.scalar.to_string(),
                 nullable: prop.prop_type.nullable,
+                key: false,
+                unique: false,
+                index: false,
             });
         }
 
@@ -1507,6 +1515,7 @@ async fn write_staged_db(
                 .join("nodes")
                 .join(SchemaIR::dir_name(node_def.type_id));
             write_lance_batch(&dataset_path, batch).await?;
+            rebuild_node_scalar_indexes(&dataset_path, node_def).await?;
         }
     }
     for edge_def in schema_ir.edge_types() {

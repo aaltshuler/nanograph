@@ -168,7 +168,7 @@ fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
         match decl {
             SchemaDecl::Node(node) => {
                 for ann in &node.annotations {
-                    if ann.name == "key" || ann.name == "unique" {
+                    if ann.name == "key" || ann.name == "unique" || ann.name == "index" {
                         return Err(NanoError::Parse(format!(
                             "@{} is only supported on node properties (node {})",
                             ann.name, node.name
@@ -180,6 +180,7 @@ fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
                 for prop in &node.properties {
                     let mut key_seen = false;
                     let mut unique_seen = false;
+                    let mut index_seen = false;
                     for ann in &prop.annotations {
                         if ann.name == "key" {
                             if ann.value.is_some() {
@@ -210,6 +211,20 @@ fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
                                 )));
                             }
                             unique_seen = true;
+                        } else if ann.name == "index" {
+                            if ann.value.is_some() {
+                                return Err(NanoError::Parse(format!(
+                                    "@index on {}.{} does not accept a value",
+                                    node.name, prop.name
+                                )));
+                            }
+                            if index_seen {
+                                return Err(NanoError::Parse(format!(
+                                    "property {}.{} declares @index multiple times",
+                                    node.name, prop.name
+                                )));
+                            }
+                            index_seen = true;
                         }
                     }
                 }
@@ -223,7 +238,7 @@ fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
             }
             SchemaDecl::Edge(edge) => {
                 for ann in &edge.annotations {
-                    if ann.name == "key" || ann.name == "unique" {
+                    if ann.name == "key" || ann.name == "unique" || ann.name == "index" {
                         return Err(NanoError::Parse(format!(
                             "@{} is not supported on edges (edge {})",
                             ann.name, edge.name
@@ -233,7 +248,7 @@ fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
 
                 for prop in &edge.properties {
                     for ann in &prop.annotations {
-                        if ann.name == "key" || ann.name == "unique" {
+                        if ann.name == "key" || ann.name == "unique" || ann.name == "index" {
                             return Err(NanoError::Parse(format!(
                                 "@{} is not supported on edge properties (edge {}.{})",
                                 ann.name, edge.name, prop.name
@@ -329,6 +344,7 @@ node Employee : Person {
 node Person {
     name: String @unique
     id: U64 @key
+    handle: String @index
 }
 "#;
         let schema = parse_schema(input).unwrap();
@@ -337,6 +353,7 @@ node Person {
                 assert_eq!(n.properties[0].annotations.len(), 1);
                 assert_eq!(n.properties[0].annotations[0].name, "unique");
                 assert_eq!(n.properties[1].annotations[0].name, "key");
+                assert_eq!(n.properties[2].annotations[0].name, "index");
             }
             _ => panic!("expected Node"),
         }
@@ -416,9 +433,35 @@ node Person {
     }
 
     #[test]
+    fn test_reject_index_with_value() {
+        let input = r#"
+node Person {
+    email: String @index("x")
+}
+"#;
+        let err = parse_schema(input).unwrap_err();
+        assert!(err.to_string().contains("@index"));
+        assert!(err.to_string().contains("does not accept a value"));
+    }
+
+    #[test]
     fn test_reject_unique_on_node_annotation() {
         let input = r#"
 node Person @unique {
+    email: String
+}
+"#;
+        let err = parse_schema(input).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("only supported on node properties")
+        );
+    }
+
+    #[test]
+    fn test_reject_index_on_node_annotation() {
+        let input = r#"
+node Person @index {
     email: String
 }
 "#;
@@ -435,6 +478,18 @@ node Person @unique {
 node Person { name: String }
 edge Knows: Person -> Person {
     weight: I32 @unique
+}
+"#;
+        let err = parse_schema(input).unwrap_err();
+        assert!(err.to_string().contains("edge properties"));
+    }
+
+    #[test]
+    fn test_reject_index_on_edge_property() {
+        let input = r#"
+node Person { name: String }
+edge Knows: Person -> Person {
+    weight: I32 @index
 }
 "#;
         let err = parse_schema(input).unwrap_err();

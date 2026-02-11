@@ -13,6 +13,11 @@ pub fn lower_query(
     query: &QueryDecl,
     type_ctx: &TypeContext,
 ) -> Result<QueryIR> {
+    if query.mutation.is_some() {
+        return Err(crate::error::NanoError::Plan(
+            "cannot lower mutation query with read-query lowerer".to_string(),
+        ));
+    }
     let param_names: HashSet<String> = query.params.iter().map(|p| p.name.clone()).collect();
 
     let mut pipeline = Vec::new();
@@ -52,6 +57,57 @@ pub fn lower_query(
         return_exprs,
         order_by,
         limit: query.limit,
+    })
+}
+
+pub fn lower_mutation_query(query: &QueryDecl) -> Result<MutationIR> {
+    let mutation = query.mutation.as_ref().ok_or_else(|| {
+        crate::error::NanoError::Plan("query does not contain a mutation body".to_string())
+    })?;
+    let param_names: HashSet<String> = query.params.iter().map(|p| p.name.clone()).collect();
+
+    let op = match mutation {
+        Mutation::Insert(insert) => MutationOpIR::Insert {
+            type_name: insert.type_name.clone(),
+            assignments: insert
+                .assignments
+                .iter()
+                .map(|a| IRAssignment {
+                    property: a.property.clone(),
+                    value: lower_match_value(&a.value, &param_names),
+                })
+                .collect(),
+        },
+        Mutation::Update(update) => MutationOpIR::Update {
+            type_name: update.type_name.clone(),
+            assignments: update
+                .assignments
+                .iter()
+                .map(|a| IRAssignment {
+                    property: a.property.clone(),
+                    value: lower_match_value(&a.value, &param_names),
+                })
+                .collect(),
+            predicate: IRMutationPredicate {
+                property: update.predicate.property.clone(),
+                op: update.predicate.op,
+                value: lower_match_value(&update.predicate.value, &param_names),
+            },
+        },
+        Mutation::Delete(delete) => MutationOpIR::Delete {
+            type_name: delete.type_name.clone(),
+            predicate: IRMutationPredicate {
+                property: delete.predicate.property.clone(),
+                op: delete.predicate.op,
+                value: lower_match_value(&delete.predicate.value, &param_names),
+            },
+        },
+    };
+
+    Ok(MutationIR {
+        name: query.name.clone(),
+        params: query.params.clone(),
+        op,
     })
 }
 
@@ -294,12 +350,25 @@ fn lower_expr(expr: &Expr, param_names: &HashSet<String>) -> IRExpr {
     }
 }
 
+fn lower_match_value(value: &MatchValue, param_names: &HashSet<String>) -> IRExpr {
+    match value {
+        MatchValue::Literal(l) => IRExpr::Literal(l.clone()),
+        MatchValue::Variable(v) => {
+            if param_names.contains(v) {
+                IRExpr::Param(v.clone())
+            } else {
+                IRExpr::Variable(v.clone())
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::catalog::build_catalog;
     use crate::query::parser::parse_query;
-    use crate::query::typecheck::typecheck_query;
+    use crate::query::typecheck::{CheckedQuery, typecheck_query, typecheck_query_decl};
     use crate::schema::parser::parse_schema;
 
     fn setup() -> Catalog {
@@ -357,5 +426,35 @@ query q() {
 
         assert_eq!(ir.pipeline.len(), 2); // NodeScan + AntiJoin
         matches!(&ir.pipeline[1], IROp::AntiJoin { .. });
+    }
+
+    #[test]
+    fn test_lower_mutation_update() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q($name: String, $age: I32) {
+    update Person set { age: $age } where name = $name
+}
+"#,
+        )
+        .unwrap();
+        let checked = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap();
+        assert!(matches!(checked, CheckedQuery::Mutation(_)));
+
+        let ir = lower_mutation_query(&qf.queries[0]).unwrap();
+        match ir.op {
+            MutationOpIR::Update {
+                type_name,
+                assignments,
+                predicate,
+            } => {
+                assert_eq!(type_name, "Person");
+                assert_eq!(assignments.len(), 1);
+                assert_eq!(assignments[0].property, "age");
+                assert_eq!(predicate.property, "name");
+            }
+            _ => panic!("expected update mutation op"),
+        }
     }
 }

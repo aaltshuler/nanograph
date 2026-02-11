@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use ahash::{AHashMap, AHashSet};
@@ -166,9 +167,15 @@ fn build_physical_plan(
                     Arc::new(Schema::new(vec![struct_field]))
                 };
 
-                let mut pushdown_filters = build_scan_pushdown_filters(variable, filters, params);
-                pushdown_filters
-                    .extend(build_explicit_pushdown_filters(variable, pipeline, params));
+                let indexed_props = &node_schema.indexed_properties;
+                let mut pushdown_filters =
+                    build_scan_pushdown_filters(variable, filters, params, Some(indexed_props));
+                pushdown_filters.extend(build_explicit_pushdown_filters(
+                    variable,
+                    pipeline,
+                    params,
+                    Some(indexed_props),
+                ));
 
                 let scan = NodeScanExec::new(
                     type_name.clone(),
@@ -295,9 +302,15 @@ fn build_physical_plan_with_input(
                     Arc::new(Schema::new(vec![struct_field]))
                 };
 
-                let mut pushdown_filters = build_scan_pushdown_filters(variable, filters, params);
-                pushdown_filters
-                    .extend(build_explicit_pushdown_filters(variable, pipeline, params));
+                let indexed_props = &node_schema.indexed_properties;
+                let mut pushdown_filters =
+                    build_scan_pushdown_filters(variable, filters, params, Some(indexed_props));
+                pushdown_filters.extend(build_explicit_pushdown_filters(
+                    variable,
+                    pipeline,
+                    params,
+                    Some(indexed_props),
+                ));
 
                 let scan = NodeScanExec::new(
                     type_name.clone(),
@@ -375,10 +388,14 @@ fn build_scan_pushdown_filters(
     variable: &str,
     filters: &[IRFilter],
     params: &ParamMap,
+    indexed_props: Option<&HashSet<String>>,
 ) -> Vec<NodeScanPredicate> {
     filters
         .iter()
-        .filter_map(|filter| pushdown_scan_filter(variable, filter, params))
+        .filter_map(|filter| {
+            pushdown_scan_filter(variable, filter, params)
+                .map(|pred| with_index_eligibility(pred, indexed_props))
+        })
         .collect()
 }
 
@@ -386,14 +403,33 @@ fn build_explicit_pushdown_filters(
     variable: &str,
     pipeline: &[IROp],
     params: &ParamMap,
+    indexed_props: Option<&HashSet<String>>,
 ) -> Vec<NodeScanPredicate> {
     pipeline
         .iter()
         .filter_map(|op| match op {
-            IROp::Filter(filter) => pushdown_scan_filter(variable, filter, params),
+            IROp::Filter(filter) => pushdown_scan_filter(variable, filter, params)
+                .map(|pred| with_index_eligibility(pred, indexed_props)),
             _ => None,
         })
         .collect()
+}
+
+fn with_index_eligibility(
+    mut predicate: NodeScanPredicate,
+    indexed_props: Option<&HashSet<String>>,
+) -> NodeScanPredicate {
+    predicate.index_eligible = is_index_eligible(indexed_props, &predicate.property, predicate.op);
+    predicate
+}
+
+fn is_index_eligible(indexed_props: Option<&HashSet<String>>, property: &str, op: CompOp) -> bool {
+    matches!(
+        op,
+        CompOp::Eq | CompOp::Gt | CompOp::Lt | CompOp::Ge | CompOp::Le
+    ) && indexed_props
+        .map(|props| props.contains(property))
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone)]
@@ -608,6 +644,7 @@ fn pushdown_scan_filter(
             property: property.clone(),
             op: filter.op,
             literal,
+            index_eligible: false,
         }),
         (
             lhs,
@@ -619,6 +656,7 @@ fn pushdown_scan_filter(
             property: property.clone(),
             op: flip_comp_op(filter.op),
             literal,
+            index_eligible: false,
         }),
         _ => None,
     }
@@ -1669,5 +1707,68 @@ impl ExecutionPlan for AntiJoinExec {
                 stream,
             ),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::query::ast::Literal;
+
+    #[test]
+    fn pushdown_marks_index_eligible_for_indexed_property() {
+        let filter = IRFilter {
+            left: IRExpr::PropAccess {
+                variable: "p".to_string(),
+                property: "name".to_string(),
+            },
+            op: CompOp::Eq,
+            right: IRExpr::Literal(Literal::String("Alice".to_string())),
+        };
+        let mut indexed_props = HashSet::new();
+        indexed_props.insert("name".to_string());
+
+        let predicates =
+            build_scan_pushdown_filters("p", &[filter], &ParamMap::new(), Some(&indexed_props));
+        assert_eq!(predicates.len(), 1);
+        assert!(predicates[0].index_eligible);
+    }
+
+    #[test]
+    fn pushdown_marks_non_indexed_property_as_not_index_eligible() {
+        let filter = IRFilter {
+            left: IRExpr::PropAccess {
+                variable: "p".to_string(),
+                property: "age".to_string(),
+            },
+            op: CompOp::Eq,
+            right: IRExpr::Literal(Literal::Integer(30)),
+        };
+        let mut indexed_props = HashSet::new();
+        indexed_props.insert("name".to_string());
+
+        let predicates =
+            build_scan_pushdown_filters("p", &[filter], &ParamMap::new(), Some(&indexed_props));
+        assert_eq!(predicates.len(), 1);
+        assert!(!predicates[0].index_eligible);
+    }
+
+    #[test]
+    fn pushdown_marks_not_equal_as_not_index_eligible() {
+        let filter = IRFilter {
+            left: IRExpr::PropAccess {
+                variable: "p".to_string(),
+                property: "name".to_string(),
+            },
+            op: CompOp::Ne,
+            right: IRExpr::Literal(Literal::String("Alice".to_string())),
+        };
+        let mut indexed_props = HashSet::new();
+        indexed_props.insert("name".to_string());
+
+        let predicates =
+            build_scan_pushdown_filters("p", &[filter], &ParamMap::new(), Some(&indexed_props));
+        assert_eq!(predicates.len(), 1);
+        assert!(!predicates[0].index_eligible);
     }
 }

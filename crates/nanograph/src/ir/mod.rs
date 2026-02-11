@@ -15,6 +15,43 @@ pub struct QueryIR {
     pub limit: Option<u64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct MutationIR {
+    pub name: String,
+    pub params: Vec<Param>,
+    pub op: MutationOpIR,
+}
+
+#[derive(Debug, Clone)]
+pub enum MutationOpIR {
+    Insert {
+        type_name: String,
+        assignments: Vec<IRAssignment>,
+    },
+    Update {
+        type_name: String,
+        assignments: Vec<IRAssignment>,
+        predicate: IRMutationPredicate,
+    },
+    Delete {
+        type_name: String,
+        predicate: IRMutationPredicate,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct IRAssignment {
+    pub property: String,
+    pub value: IRExpr,
+}
+
+#[derive(Debug, Clone)]
+pub struct IRMutationPredicate {
+    pub property: String,
+    pub op: CompOp,
+    pub value: IRExpr,
+}
+
 /// Resolved runtime parameters: param name → literal value.
 pub type ParamMap = HashMap<String, Literal>;
 

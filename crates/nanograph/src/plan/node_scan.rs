@@ -30,6 +30,7 @@ pub struct NodeScanPredicate {
     pub property: String,
     pub op: CompOp,
     pub literal: Literal,
+    pub index_eligible: bool,
 }
 
 /// TableProvider for a single node type. Registers with DataFusion as a table.
@@ -143,21 +144,43 @@ impl NodeTypeTable {
             Expr::BinaryExpr(binary) => {
                 let op = comp_from_operator(binary.op)?;
                 match (binary.left.as_ref(), binary.right.as_ref()) {
-                    (Expr::Column(col), rhs) => Some(NodeScanPredicate {
-                        property: property_from_column(col, &self.variable_name)?,
-                        op,
-                        literal: literal_from_expr(rhs)?,
-                    }),
-                    (lhs, Expr::Column(col)) => Some(NodeScanPredicate {
-                        property: property_from_column(col, &self.variable_name)?,
-                        op: flip_comp_op(op),
-                        literal: literal_from_expr(lhs)?,
-                    }),
+                    (Expr::Column(col), rhs) => {
+                        let property = property_from_column(col, &self.variable_name)?;
+                        Some(NodeScanPredicate {
+                            index_eligible: self.is_index_eligible(&property, op),
+                            property,
+                            op,
+                            literal: literal_from_expr(rhs)?,
+                        })
+                    }
+                    (lhs, Expr::Column(col)) => {
+                        let property = property_from_column(col, &self.variable_name)?;
+                        let op = flip_comp_op(op);
+                        Some(NodeScanPredicate {
+                            index_eligible: self.is_index_eligible(&property, op),
+                            property,
+                            op,
+                            literal: literal_from_expr(lhs)?,
+                        })
+                    }
                     _ => None,
                 }
             }
             _ => None,
         }
+    }
+
+    fn is_index_eligible(&self, property: &str, op: CompOp) -> bool {
+        matches!(
+            op,
+            CompOp::Eq | CompOp::Gt | CompOp::Lt | CompOp::Ge | CompOp::Le
+        ) && self
+            .storage
+            .catalog
+            .node_types
+            .get(&self.type_name)
+            .map(|node| node.indexed_properties.contains(property))
+            .unwrap_or(false)
     }
 }
 
@@ -419,14 +442,21 @@ impl NodeScanExec {
             .map(|p| p.to_path_buf())
             .filter(|p| p.exists())
     }
+
+    fn has_index_eligible_pushdown(&self) -> bool {
+        self.pushdown_filters.iter().any(|p| p.index_eligible)
+    }
 }
 
 impl DisplayAs for NodeScanExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "NodeScanExec: ${}: {}",
-            self.variable_name, self.type_name
+            "NodeScanExec: ${}: {} (filters={}, index_eligible={})",
+            self.variable_name,
+            self.type_name,
+            self.pushdown_filters.len(),
+            self.has_index_eligible_pushdown()
         )
     }
 }
@@ -533,6 +563,7 @@ impl ExecutionPlan for NodeScanExec {
                 node_type = %self.type_name,
                 filter_sql = ?filter_sql_for_debug,
                 limit = ?self.limit,
+                index_eligible = self.has_index_eligible_pushdown(),
                 "using Lance-native node scan pushdown path"
             );
 

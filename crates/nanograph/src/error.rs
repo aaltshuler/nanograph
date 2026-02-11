@@ -49,6 +49,17 @@ pub enum NanoError {
     #[error("storage error: {0}")]
     Storage(String),
 
+    #[error(
+        "@unique constraint violation on {type_name}.{property}: duplicate value '{value}' at rows {first_row} and {second_row}"
+    )]
+    UniqueConstraint {
+        type_name: String,
+        property: String,
+        value: String,
+        first_row: usize,
+        second_row: usize,
+    },
+
     #[error("plan error: {0}")]
     Plan(String),
 

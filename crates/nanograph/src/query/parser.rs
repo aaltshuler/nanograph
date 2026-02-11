@@ -51,6 +51,7 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
     let mut return_clause = Vec::new();
     let mut order_clause = Vec::new();
     let mut limit = None;
+    let mut mutation = None;
 
     for item in inner {
         match item.as_rule() {
@@ -61,35 +62,55 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
                     }
                 }
             }
-            Rule::match_clause => {
-                for c in item.into_inner() {
-                    if let Rule::clause = c.as_rule() {
-                        match_clause.push(parse_clause(c)?);
+            Rule::query_body => {
+                let body = item
+                    .into_inner()
+                    .next()
+                    .ok_or_else(|| NanoError::Parse("query body cannot be empty".to_string()))?;
+                match body.as_rule() {
+                    Rule::read_query_body => {
+                        for section in body.into_inner() {
+                            match section.as_rule() {
+                                Rule::match_clause => {
+                                    for c in section.into_inner() {
+                                        if let Rule::clause = c.as_rule() {
+                                            match_clause.push(parse_clause(c)?);
+                                        }
+                                    }
+                                }
+                                Rule::return_clause => {
+                                    for proj in section.into_inner() {
+                                        if let Rule::projection = proj.as_rule() {
+                                            return_clause.push(parse_projection(proj)?);
+                                        }
+                                    }
+                                }
+                                Rule::order_clause => {
+                                    for ord in section.into_inner() {
+                                        if let Rule::ordering = ord.as_rule() {
+                                            order_clause.push(parse_ordering(ord)?);
+                                        }
+                                    }
+                                }
+                                Rule::limit_clause => {
+                                    let int_pair = section.into_inner().next().unwrap();
+                                    limit =
+                                        Some(int_pair.as_str().parse::<u64>().map_err(|e| {
+                                            NanoError::Parse(format!("invalid limit: {}", e))
+                                        })?);
+                                }
+                                _ => {}
+                            }
+                        }
                     }
-                }
-            }
-            Rule::return_clause => {
-                for proj in item.into_inner() {
-                    if let Rule::projection = proj.as_rule() {
-                        return_clause.push(parse_projection(proj)?);
+                    Rule::mutation_stmt => {
+                        let stmt = body.into_inner().next().ok_or_else(|| {
+                            NanoError::Parse("mutation statement cannot be empty".to_string())
+                        })?;
+                        mutation = Some(parse_mutation_stmt(stmt)?);
                     }
+                    _ => {}
                 }
-            }
-            Rule::order_clause => {
-                for ord in item.into_inner() {
-                    if let Rule::ordering = ord.as_rule() {
-                        order_clause.push(parse_ordering(ord)?);
-                    }
-                }
-            }
-            Rule::limit_clause => {
-                let int_pair = item.into_inner().next().unwrap();
-                limit = Some(
-                    int_pair
-                        .as_str()
-                        .parse::<u64>()
-                        .map_err(|e| NanoError::Parse(format!("invalid limit: {}", e)))?,
-                );
             }
             _ => {}
         }
@@ -102,6 +123,7 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
         return_clause,
         order_clause,
         limit,
+        mutation,
     })
 }
 
@@ -171,23 +193,111 @@ fn parse_prop_match(pair: pest::iterators::Pair<Rule>) -> Result<PropMatch> {
     let mut inner = pair.into_inner();
     let prop_name = inner.next().unwrap().as_str().to_string();
     let value_pair = inner.next().unwrap();
-    let value_inner = value_pair.into_inner().next().unwrap();
-
-    let value = match value_inner.as_rule() {
-        Rule::variable => {
-            let v = value_inner.as_str();
-            MatchValue::Variable(v.strip_prefix('$').unwrap_or(v).to_string())
-        }
-        Rule::literal => MatchValue::Literal(parse_literal(value_inner)?),
-        _ => {
-            return Err(NanoError::Parse(format!(
-                "unexpected match value: {:?}",
-                value_inner.as_rule()
-            )));
-        }
-    };
+    let value = parse_match_value(value_pair)?;
 
     Ok(PropMatch { prop_name, value })
+}
+
+fn parse_mutation_stmt(pair: pest::iterators::Pair<Rule>) -> Result<Mutation> {
+    match pair.as_rule() {
+        Rule::insert_stmt => parse_insert_mutation(pair).map(Mutation::Insert),
+        Rule::update_stmt => parse_update_mutation(pair).map(Mutation::Update),
+        Rule::delete_stmt => parse_delete_mutation(pair).map(Mutation::Delete),
+        other => Err(NanoError::Parse(format!(
+            "unexpected mutation statement rule: {:?}",
+            other
+        ))),
+    }
+}
+
+fn parse_insert_mutation(pair: pest::iterators::Pair<Rule>) -> Result<InsertMutation> {
+    let mut inner = pair.into_inner();
+    let type_name = inner.next().unwrap().as_str().to_string();
+    let mut assignments = Vec::new();
+    for item in inner {
+        if let Rule::mutation_assignment = item.as_rule() {
+            assignments.push(parse_mutation_assignment(item)?);
+        }
+    }
+    Ok(InsertMutation {
+        type_name,
+        assignments,
+    })
+}
+
+fn parse_update_mutation(pair: pest::iterators::Pair<Rule>) -> Result<UpdateMutation> {
+    let mut inner = pair.into_inner();
+    let type_name = inner.next().unwrap().as_str().to_string();
+
+    let mut assignments = Vec::new();
+    let mut predicate = None;
+
+    for item in inner {
+        match item.as_rule() {
+            Rule::mutation_assignment => assignments.push(parse_mutation_assignment(item)?),
+            Rule::mutation_predicate => predicate = Some(parse_mutation_predicate(item)?),
+            _ => {}
+        }
+    }
+
+    let predicate = predicate.ok_or_else(|| {
+        NanoError::Parse("update mutation requires a where predicate".to_string())
+    })?;
+
+    Ok(UpdateMutation {
+        type_name,
+        assignments,
+        predicate,
+    })
+}
+
+fn parse_delete_mutation(pair: pest::iterators::Pair<Rule>) -> Result<DeleteMutation> {
+    let mut inner = pair.into_inner();
+    let type_name = inner.next().unwrap().as_str().to_string();
+    let predicate = inner
+        .next()
+        .ok_or_else(|| NanoError::Parse("delete mutation requires a where predicate".to_string()))
+        .and_then(parse_mutation_predicate)?;
+    Ok(DeleteMutation {
+        type_name,
+        predicate,
+    })
+}
+
+fn parse_mutation_assignment(pair: pest::iterators::Pair<Rule>) -> Result<MutationAssignment> {
+    let mut inner = pair.into_inner();
+    let property = inner.next().unwrap().as_str().to_string();
+    let value = parse_match_value(inner.next().unwrap())?;
+    Ok(MutationAssignment { property, value })
+}
+
+fn parse_mutation_predicate(pair: pest::iterators::Pair<Rule>) -> Result<MutationPredicate> {
+    let mut inner = pair.into_inner();
+    let property = inner.next().unwrap().as_str().to_string();
+    let op = parse_comp_op(inner.next().unwrap())?;
+    let value = parse_match_value(inner.next().unwrap())?;
+    Ok(MutationPredicate {
+        property,
+        op,
+        value,
+    })
+}
+
+fn parse_match_value(pair: pest::iterators::Pair<Rule>) -> Result<MatchValue> {
+    let value_inner = pair.into_inner().next().unwrap();
+    match value_inner.as_rule() {
+        Rule::variable => {
+            let v = value_inner.as_str();
+            Ok(MatchValue::Variable(
+                v.strip_prefix('$').unwrap_or(v).to_string(),
+            ))
+        }
+        Rule::literal => Ok(MatchValue::Literal(parse_literal(value_inner)?)),
+        _ => Err(NanoError::Parse(format!(
+            "unexpected match value: {:?}",
+            value_inner.as_rule()
+        ))),
+    }
 }
 
 fn parse_traversal(pair: pest::iterators::Pair<Rule>) -> Result<Traversal> {
@@ -575,6 +685,68 @@ query avg_age_by_company() {
         let qf = parse_query(input).unwrap();
         let q = &qf.queries[0];
         assert_eq!(q.return_clause.len(), 3);
+    }
+
+    #[test]
+    fn test_parse_insert_mutation() {
+        let input = r#"
+query add_person($name: String, $age: I32) {
+    insert Person {
+        name: $name
+        age: $age
+    }
+}
+"#;
+        let qf = parse_query(input).unwrap();
+        let q = &qf.queries[0];
+        match q.mutation.as_ref().expect("expected mutation") {
+            Mutation::Insert(ins) => {
+                assert_eq!(ins.type_name, "Person");
+                assert_eq!(ins.assignments.len(), 2);
+            }
+            _ => panic!("expected Insert mutation"),
+        }
+    }
+
+    #[test]
+    fn test_parse_update_mutation() {
+        let input = r#"
+query set_age($name: String, $age: I32) {
+    update Person set {
+        age: $age
+    } where name = $name
+}
+"#;
+        let qf = parse_query(input).unwrap();
+        let q = &qf.queries[0];
+        match q.mutation.as_ref().expect("expected mutation") {
+            Mutation::Update(upd) => {
+                assert_eq!(upd.type_name, "Person");
+                assert_eq!(upd.assignments.len(), 1);
+                assert_eq!(upd.predicate.property, "name");
+                assert_eq!(upd.predicate.op, CompOp::Eq);
+            }
+            _ => panic!("expected Update mutation"),
+        }
+    }
+
+    #[test]
+    fn test_parse_delete_mutation() {
+        let input = r#"
+query drop_person($name: String) {
+    delete Person where name = $name
+}
+"#;
+        let qf = parse_query(input).unwrap();
+        let q = &qf.queries[0];
+        match q.mutation.as_ref().expect("expected mutation") {
+            Mutation::Delete(del) => {
+                assert_eq!(del.type_name, "Person");
+                assert_eq!(del.predicate.property, "name");
+                assert_eq!(del.predicate.op, CompOp::Eq);
+            }
+            _ => panic!("expected Delete mutation"),
+        }
     }
 
     #[test]

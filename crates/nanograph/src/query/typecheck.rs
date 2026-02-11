@@ -41,7 +41,36 @@ pub enum ResolvedType {
     Aggregate,
 }
 
+#[derive(Debug, Clone)]
+pub struct MutationTypeContext {
+    pub target_type: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum CheckedQuery {
+    Read(TypeContext),
+    Mutation(MutationTypeContext),
+}
+
+pub fn typecheck_query_decl(catalog: &Catalog, query: &QueryDecl) -> Result<CheckedQuery> {
+    if let Some(mutation) = &query.mutation {
+        let target_type = typecheck_mutation(catalog, mutation, &query.params)?;
+        Ok(CheckedQuery::Mutation(MutationTypeContext { target_type }))
+    } else {
+        Ok(CheckedQuery::Read(typecheck_read_query(catalog, query)?))
+    }
+}
+
 pub fn typecheck_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeContext> {
+    if query.mutation.is_some() {
+        return Err(NanoError::Type(
+            "mutation query cannot be typechecked with read-query API".to_string(),
+        ));
+    }
+    typecheck_read_query(catalog, query)
+}
+
+fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeContext> {
     let mut ctx = TypeContext {
         bindings: HashMap::new(),
         aliases: HashMap::new(),
@@ -71,6 +100,176 @@ pub fn typecheck_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeConte
     }
 
     Ok(ctx)
+}
+
+fn typecheck_mutation(catalog: &Catalog, mutation: &Mutation, params: &[Param]) -> Result<String> {
+    let param_types: HashMap<String, ScalarType> = params
+        .iter()
+        .filter_map(|p| ScalarType::from_str_name(&p.type_name).map(|s| (p.name.clone(), s)))
+        .collect();
+
+    match mutation {
+        Mutation::Insert(insert) => {
+            let node_type = catalog.node_types.get(&insert.type_name).ok_or_else(|| {
+                NanoError::Type(format!("T10: unknown node type `{}`", insert.type_name))
+            })?;
+
+            if insert.assignments.is_empty() {
+                return Err(NanoError::Type(
+                    "T10: insert mutation requires at least one assignment".to_string(),
+                ));
+            }
+
+            ensure_no_duplicate_assignment_names(&insert.assignments)?;
+
+            for assignment in &insert.assignments {
+                let prop_type =
+                    node_type
+                        .properties
+                        .get(&assignment.property)
+                        .ok_or_else(|| {
+                            NanoError::Type(format!(
+                                "T11: type `{}` has no property `{}`",
+                                insert.type_name, assignment.property
+                            ))
+                        })?;
+                check_match_value_type(
+                    &assignment.value,
+                    &param_types,
+                    &prop_type.scalar,
+                    &assignment.property,
+                )?;
+            }
+
+            for (prop_name, prop_type) in &node_type.properties {
+                if prop_type.nullable {
+                    continue;
+                }
+                if !insert.assignments.iter().any(|a| &a.property == prop_name) {
+                    return Err(NanoError::Type(format!(
+                        "T12: insert for `{}` must provide non-nullable property `{}`",
+                        insert.type_name, prop_name
+                    )));
+                }
+            }
+
+            Ok(insert.type_name.clone())
+        }
+        Mutation::Update(update) => {
+            let node_type = catalog.node_types.get(&update.type_name).ok_or_else(|| {
+                NanoError::Type(format!("T10: unknown node type `{}`", update.type_name))
+            })?;
+
+            if update.assignments.is_empty() {
+                return Err(NanoError::Type(
+                    "T10: update mutation requires at least one assignment".to_string(),
+                ));
+            }
+            ensure_no_duplicate_assignment_names(&update.assignments)?;
+
+            for assignment in &update.assignments {
+                let prop_type =
+                    node_type
+                        .properties
+                        .get(&assignment.property)
+                        .ok_or_else(|| {
+                            NanoError::Type(format!(
+                                "T11: type `{}` has no property `{}`",
+                                update.type_name, assignment.property
+                            ))
+                        })?;
+                check_match_value_type(
+                    &assignment.value,
+                    &param_types,
+                    &prop_type.scalar,
+                    &assignment.property,
+                )?;
+            }
+
+            typecheck_mutation_predicate(
+                &update.type_name,
+                &update.predicate,
+                node_type,
+                &param_types,
+            )?;
+            Ok(update.type_name.clone())
+        }
+        Mutation::Delete(delete) => {
+            let node_type = catalog.node_types.get(&delete.type_name).ok_or_else(|| {
+                NanoError::Type(format!("T10: unknown node type `{}`", delete.type_name))
+            })?;
+            typecheck_mutation_predicate(
+                &delete.type_name,
+                &delete.predicate,
+                node_type,
+                &param_types,
+            )?;
+            Ok(delete.type_name.clone())
+        }
+    }
+}
+
+fn ensure_no_duplicate_assignment_names(assignments: &[MutationAssignment]) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for assignment in assignments {
+        if !seen.insert(&assignment.property) {
+            return Err(NanoError::Type(format!(
+                "T13: duplicate assignment for property `{}`",
+                assignment.property
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn typecheck_mutation_predicate(
+    type_name: &str,
+    predicate: &MutationPredicate,
+    node_type: &crate::catalog::NodeType,
+    param_types: &HashMap<String, ScalarType>,
+) -> Result<()> {
+    let prop_type = node_type
+        .properties
+        .get(&predicate.property)
+        .ok_or_else(|| {
+            NanoError::Type(format!(
+                "T11: type `{}` has no property `{}`",
+                type_name, predicate.property
+            ))
+        })?;
+    check_match_value_type(
+        &predicate.value,
+        param_types,
+        &prop_type.scalar,
+        &predicate.property,
+    )?;
+    Ok(())
+}
+
+fn check_match_value_type(
+    value: &MatchValue,
+    params: &HashMap<String, ScalarType>,
+    expected: &ScalarType,
+    property: &str,
+) -> Result<()> {
+    match value {
+        MatchValue::Literal(lit) => check_literal_type(lit, expected, property),
+        MatchValue::Variable(v) => {
+            let Some(actual) = params.get(v) else {
+                return Err(NanoError::Type(format!(
+                    "T14: mutation variable `${}` must be a declared query parameter",
+                    v
+                )));
+            };
+            if !types_compatible(actual, expected) {
+                return Err(NanoError::Type(format!(
+                    "T7: cannot assign/compare {} with {} for property `{}`",
+                    actual, expected, property
+                )));
+            }
+            Ok(())
+        }
+    }
 }
 
 fn typecheck_clauses(
@@ -698,5 +897,71 @@ query q($name: String) {
         let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
         assert!(ctx.bindings.contains_key("mid"));
         assert!(ctx.bindings.contains_key("fof"));
+    }
+
+    #[test]
+    fn test_mutation_insert_typecheck_ok() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query add_person($name: String, $age: I32) {
+    insert Person {
+        name: $name
+        age: $age
+    }
+}
+"#,
+        )
+        .unwrap();
+        let checked = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap();
+        match checked {
+            CheckedQuery::Mutation(ctx) => assert_eq!(ctx.target_type, "Person"),
+            _ => panic!("expected mutation typecheck result"),
+        }
+    }
+
+    #[test]
+    fn test_mutation_insert_missing_required_property() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query add_person($age: I32) {
+    insert Person { age: $age }
+}
+"#,
+        )
+        .unwrap();
+        let err = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap_err();
+        assert!(err.to_string().contains("T12"));
+    }
+
+    #[test]
+    fn test_mutation_update_bad_property() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query update_person($name: String) {
+    update Person set { salary: 100 } where name = $name
+}
+"#,
+        )
+        .unwrap();
+        let err = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap_err();
+        assert!(err.to_string().contains("T11"));
+    }
+
+    #[test]
+    fn test_mutation_delete_bad_type() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query del($name: String) {
+    delete Unknown where name = $name
+}
+"#,
+        )
+        .unwrap();
+        let err = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap_err();
+        assert!(err.to_string().contains("T10"));
     }
 }

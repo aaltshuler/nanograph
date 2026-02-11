@@ -11,15 +11,16 @@ use tracing::{debug, info, instrument};
 use tracing_subscriber::EnvFilter;
 
 use nanograph::catalog::build_catalog;
-use nanograph::error::ParseDiagnostic;
+use nanograph::error::{NanoError, ParseDiagnostic};
 use nanograph::ir::ParamMap;
-use nanograph::ir::lower::lower_query;
+use nanograph::ir::lower::{lower_mutation_query, lower_query};
+use nanograph::plan::physical::{MutationExecResult, execute_mutation};
 use nanograph::plan::planner::execute_query;
 use nanograph::query::ast::Literal;
 use nanograph::query::parser::parse_query_diagnostic;
-use nanograph::query::typecheck::typecheck_query;
+use nanograph::query::typecheck::{CheckedQuery, typecheck_query, typecheck_query_decl};
 use nanograph::schema::parser::parse_schema_diagnostic;
-use nanograph::store::database::{Database, DeleteOp, DeletePredicate};
+use nanograph::store::database::{Database, DeleteOp, DeletePredicate, LoadMode};
 use nanograph::store::graph::GraphStorage;
 use nanograph::store::loader::load_jsonl_data;
 use nanograph::store::migration::{
@@ -51,6 +52,9 @@ enum Commands {
         db_path: PathBuf,
         #[arg(long)]
         data: PathBuf,
+        /// Load mode: overwrite, append, or merge
+        #[arg(long, value_enum)]
+        mode: LoadModeArg,
     },
     /// Delete nodes by predicate, cascading incident edges
     Delete {
@@ -111,6 +115,23 @@ enum Commands {
     },
 }
 
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadModeArg {
+    Overwrite,
+    Append,
+    Merge,
+}
+
+impl From<LoadModeArg> for LoadMode {
+    fn from(value: LoadModeArg) -> Self {
+        match value {
+            LoadModeArg::Overwrite => LoadMode::Overwrite,
+            LoadModeArg::Append => LoadMode::Append,
+            LoadModeArg::Merge => LoadMode::Merge,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
@@ -120,7 +141,11 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Init { db_path, schema } => cmd_init(&db_path, &schema).await,
-        Commands::Load { db_path, data } => cmd_load(&db_path, &data).await,
+        Commands::Load {
+            db_path,
+            data,
+            mode,
+        } => cmd_load(&db_path, &data, mode).await,
         Commands::Delete {
             db_path,
             type_name,
@@ -312,18 +337,42 @@ async fn cmd_init(db_path: &PathBuf, schema_path: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-#[instrument(skip(data_path), fields(db_path = %db_path.display()))]
-async fn cmd_load(db_path: &PathBuf, data_path: &PathBuf) -> Result<()> {
+#[instrument(skip(data_path), fields(db_path = %db_path.display(), mode = ?mode))]
+async fn cmd_load(db_path: &PathBuf, data_path: &PathBuf, mode: LoadModeArg) -> Result<()> {
     let data_src = std::fs::read_to_string(data_path)
         .wrap_err_with(|| format!("failed to read data: {}", data_path.display()))?;
 
     let mut db = Database::open(db_path).await?;
 
-    db.load(&data_src).await?;
+    if let Err(err) = db.load_with_mode(&data_src, mode.into()).await {
+        render_load_error(db_path, &err);
+        return Err(err.into());
+    }
 
     info!("data load complete");
     println!("Loaded data into {}", db_path.display());
     Ok(())
+}
+
+fn render_load_error(db_path: &Path, err: &NanoError) {
+    if let NanoError::UniqueConstraint {
+        type_name,
+        property,
+        value,
+        first_row,
+        second_row,
+    } = err
+    {
+        eprintln!("Load failed for {}.", db_path.display());
+        eprintln!(
+            "Unique constraint violation: {}.{} has duplicate value '{}'.",
+            type_name, property, value
+        );
+        eprintln!(
+            "Conflicting rows in loaded dataset: {} and {}.",
+            first_row, second_row
+        );
+    }
 }
 
 #[instrument(skip(type_name, predicate), fields(db_path = %db_path.display(), type_name = type_name))]
@@ -371,8 +420,9 @@ async fn cmd_check(
 
     let mut error_count = 0;
     for q in &queries.queries {
-        match typecheck_query(&catalog, q) {
-            Ok(_) => println!("OK: query `{}`", q.name),
+        match typecheck_query_decl(&catalog, q) {
+            Ok(CheckedQuery::Read(_)) => println!("OK: query `{}` (read)", q.name),
+            Ok(CheckedQuery::Mutation(_)) => println!("OK: query `{}` (mutation)", q.name),
             Err(e) => {
                 println!("ERROR: query `{}`: {}", q.name, e);
                 error_count += 1;
@@ -406,32 +456,6 @@ async fn cmd_run(
     let query_src = std::fs::read_to_string(query_path)
         .wrap_err_with(|| format!("failed to read query: {}", query_path.display()))?;
 
-    let (catalog, storage) = if let Some(db_path) = db {
-        // DB mode
-        let db = Database::open(&db_path).await?;
-        let catalog = db.catalog().clone();
-        let storage = db.snapshot();
-        (catalog, storage)
-    } else if let Some(schema_path) = schema {
-        // Legacy mode
-        let schema_src = std::fs::read_to_string(&schema_path)
-            .wrap_err_with(|| format!("failed to read schema: {}", schema_path.display()))?;
-        let data_path =
-            data.ok_or_else(|| eyre!("--data is required in legacy mode (with --schema)"))?;
-        let data_src = std::fs::read_to_string(&data_path)
-            .wrap_err_with(|| format!("failed to read data: {}", data_path.display()))?;
-
-        let schema_file = parse_schema_or_report(&schema_path, &schema_src)?;
-        let catalog = build_catalog(&schema_file)?;
-
-        let mut gs = GraphStorage::new(catalog.clone());
-        load_jsonl_data(&mut gs, &data_src)?;
-        gs.build_indices()?;
-        (catalog, Arc::new(gs))
-    } else {
-        return Err(eyre!("either --db or --schema is required"));
-    };
-
     // Parse queries and find the named one
     let queries = parse_query_or_report(query_path, &query_src)?;
     let query = queries
@@ -441,44 +465,100 @@ async fn cmd_run(
         .ok_or_else(|| eyre!("query `{}` not found", query_name))?;
     info!("executing query");
 
-    // Typecheck
-    let type_ctx = typecheck_query(&catalog, query)?;
+    // Build param map from CLI args, using query param type info for inference
+    let param_map = build_param_map(&query.params, &raw_params)?;
 
-    // Lower to IR
+    if query.mutation.is_some() {
+        let db_path = db.ok_or_else(|| {
+            eyre!("mutation queries require --db mode; legacy --schema/--data mode is read-only")
+        })?;
+        if schema.is_some() || data.is_some() {
+            return Err(eyre!(
+                "mutation queries only support --db mode; remove --schema/--data"
+            ));
+        }
+
+        let mut db = Database::open(&db_path).await?;
+        let checked = typecheck_query_decl(db.catalog(), query)?;
+        if !matches!(checked, CheckedQuery::Mutation(_)) {
+            return Err(eyre!("expected mutation query"));
+        }
+
+        let mutation_ir = lower_mutation_query(query)?;
+        let result = execute_mutation(&mutation_ir, &mut db, &param_map).await?;
+        let result_batch = mutation_result_batch(result)?;
+        return render_results(format, &[result_batch]);
+    }
+
+    let (catalog, storage) = if let Some(db_path) = db {
+        let db = Database::open(&db_path).await?;
+        (db.catalog().clone(), db.snapshot())
+    } else if let Some(schema_path) = schema {
+        let schema_src = std::fs::read_to_string(&schema_path)
+            .wrap_err_with(|| format!("failed to read schema: {}", schema_path.display()))?;
+        let data_path =
+            data.ok_or_else(|| eyre!("--data is required in legacy mode (with --schema)"))?;
+        let data_src = std::fs::read_to_string(&data_path)
+            .wrap_err_with(|| format!("failed to read data: {}", data_path.display()))?;
+
+        let schema_file = parse_schema_or_report(&schema_path, &schema_src)?;
+        let catalog = build_catalog(&schema_file)?;
+        let mut gs = GraphStorage::new(catalog.clone());
+        load_jsonl_data(&mut gs, &data_src)?;
+        gs.build_indices()?;
+        (catalog, Arc::new(gs))
+    } else {
+        return Err(eyre!("either --db or --schema is required"));
+    };
+
+    let type_ctx = typecheck_query(&catalog, query)?;
     let ir = lower_query(&catalog, query, &type_ctx)?;
     debug!(pipeline_len = ir.pipeline.len(), "query lowered");
-
-    // Build param map from CLI args, using query param type info for inference
-    let param_map = build_param_map(&ir.params, &raw_params)?;
-
-    // Execute
     let results = execute_query(&ir, storage, &param_map).await?;
+    render_results(format, &results)
+}
 
-    // Output
+fn render_results(format: &str, results: &[RecordBatch]) -> Result<()> {
     match format {
         "table" => {
             if results.is_empty() {
                 println!("(empty result)");
             } else {
-                let formatted = arrow::util::pretty::pretty_format_batches(&results)
+                let formatted = arrow::util::pretty::pretty_format_batches(results)
                     .wrap_err("failed to render table output")?;
                 println!("{}", formatted);
             }
         }
         "csv" => {
-            for batch in &results {
+            for batch in results {
                 print_csv(batch);
             }
         }
         "jsonl" => {
-            for batch in &results {
+            for batch in results {
                 print_jsonl(batch);
             }
         }
         _ => return Err(eyre!("unknown format: {}", format)),
     }
-
     Ok(())
+}
+
+fn mutation_result_batch(result: MutationExecResult) -> Result<RecordBatch> {
+    use arrow::array::UInt64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("affected_nodes", DataType::UInt64, false),
+        Field::new("affected_edges", DataType::UInt64, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(UInt64Array::from(vec![result.affected_nodes as u64])),
+            Arc::new(UInt64Array::from(vec![result.affected_edges as u64])),
+        ],
+    )
+    .map_err(|e| eyre!("failed to build mutation result batch: {}", e))
 }
 
 fn print_csv(batch: &RecordBatch) {
@@ -611,4 +691,217 @@ fn build_param_map(
         map.insert(key.clone(), lit);
     }
     Ok(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Int32Array, StringArray};
+    use tempfile::TempDir;
+
+    fn write_file(path: &Path, content: &str) {
+        std::fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn parse_load_mode_from_cli() {
+        let cli = Cli::parse_from([
+            "nanograph",
+            "load",
+            "/tmp/db",
+            "--data",
+            "/tmp/data.jsonl",
+            "--mode",
+            "append",
+        ]);
+        match cli.command {
+            Commands::Load { mode, .. } => assert_eq!(mode, LoadModeArg::Append),
+            _ => panic!("expected load command"),
+        }
+    }
+
+    #[tokio::test]
+    async fn load_mode_merge_requires_keyed_schema() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("db");
+        let schema_path = dir.path().join("schema.pg");
+        let data_path = dir.path().join("data.jsonl");
+
+        write_file(
+            &schema_path,
+            r#"node Person {
+    name: String
+}"#,
+        );
+        write_file(&data_path, r#"{"type":"Person","data":{"name":"Alice"}}"#);
+
+        cmd_init(&db_path, &schema_path).await.unwrap();
+        let err = cmd_load(&db_path, &data_path, LoadModeArg::Merge)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("requires at least one node @key"));
+    }
+
+    #[tokio::test]
+    async fn load_mode_append_and_merge_behave_as_expected() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("db");
+        let schema_path = dir.path().join("schema.pg");
+        let data_initial = dir.path().join("initial.jsonl");
+        let data_append = dir.path().join("append.jsonl");
+        let data_merge = dir.path().join("merge.jsonl");
+
+        write_file(
+            &schema_path,
+            r#"node Person {
+    name: String @key
+    age: I32?
+}"#,
+        );
+        write_file(
+            &data_initial,
+            r#"{"type":"Person","data":{"name":"Alice","age":30}}"#,
+        );
+        write_file(
+            &data_append,
+            r#"{"type":"Person","data":{"name":"Bob","age":22}}"#,
+        );
+        write_file(
+            &data_merge,
+            r#"{"type":"Person","data":{"name":"Alice","age":31}}"#,
+        );
+
+        cmd_init(&db_path, &schema_path).await.unwrap();
+        cmd_load(&db_path, &data_initial, LoadModeArg::Overwrite)
+            .await
+            .unwrap();
+        cmd_load(&db_path, &data_append, LoadModeArg::Append)
+            .await
+            .unwrap();
+        cmd_load(&db_path, &data_merge, LoadModeArg::Merge)
+            .await
+            .unwrap();
+
+        let db = Database::open(&db_path).await.unwrap();
+        let batch = db.storage.get_all_nodes("Person").unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        let names = batch
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let ages = batch
+            .column_by_name("age")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let mut alice_age = None;
+        let mut has_bob = false;
+        for row in 0..batch.num_rows() {
+            if names.value(row) == "Alice" {
+                alice_age = Some(ages.value(row));
+            }
+            if names.value(row) == "Bob" {
+                has_bob = true;
+            }
+        }
+        assert_eq!(alice_age, Some(31));
+        assert!(has_bob);
+    }
+
+    #[tokio::test]
+    async fn run_mutation_requires_db_mode() {
+        let dir = TempDir::new().unwrap();
+        let schema_path = dir.path().join("schema.pg");
+        let data_path = dir.path().join("data.jsonl");
+        let query_path = dir.path().join("mut.gq");
+
+        write_file(
+            &schema_path,
+            r#"node Person {
+    name: String
+}"#,
+        );
+        write_file(&data_path, r#"{"type":"Person","data":{"name":"Alice"}}"#);
+        write_file(
+            &query_path,
+            r#"
+query add_person($name: String) {
+    insert Person { name: $name }
+}
+"#,
+        );
+
+        let err = cmd_run(
+            None,
+            Some(schema_path.clone()),
+            &query_path,
+            "add_person",
+            Some(data_path),
+            "table",
+            vec![("name".to_string(), "Bob".to_string())],
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("mutation queries require --db mode"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_mutation_insert_in_db_mode() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("db");
+        let schema_path = dir.path().join("schema.pg");
+        let query_path = dir.path().join("mut.gq");
+
+        write_file(
+            &schema_path,
+            r#"node Person {
+    name: String
+    age: I32?
+}"#,
+        );
+        write_file(
+            &query_path,
+            r#"
+query add_person($name: String, $age: I32) {
+    insert Person {
+        name: $name
+        age: $age
+    }
+}
+"#,
+        );
+
+        cmd_init(&db_path, &schema_path).await.unwrap();
+        cmd_run(
+            Some(db_path.clone()),
+            None,
+            &query_path,
+            "add_person",
+            None,
+            "table",
+            vec![
+                ("name".to_string(), "Eve".to_string()),
+                ("age".to_string(), "29".to_string()),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let db = Database::open(&db_path).await.unwrap();
+        let people = db.storage.get_all_nodes("Person").unwrap().unwrap();
+        let names = people
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!((0..people.num_rows()).any(|row| names.value(row) == "Eve"));
+    }
 }

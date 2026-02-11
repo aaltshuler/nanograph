@@ -1,6 +1,6 @@
 pub mod schema_ir;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -21,6 +21,7 @@ pub struct Catalog {
 pub struct NodeType {
     pub name: String,
     pub properties: HashMap<String, PropType>,
+    pub indexed_properties: HashSet<String>,
     pub arrow_schema: SchemaRef,
 }
 
@@ -61,8 +62,16 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
             }
 
             let mut properties = HashMap::new();
+            let mut indexed_properties = HashSet::new();
             for prop in &node.properties {
                 properties.insert(prop.name.clone(), prop.prop_type.clone());
+                if prop
+                    .annotations
+                    .iter()
+                    .any(|a| a.name == "key" || a.name == "index")
+                {
+                    indexed_properties.insert(prop.name.clone());
+                }
             }
 
             // Build Arrow schema: id: U64 + all properties
@@ -81,6 +90,7 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
                 NodeType {
                     name: node.name.clone(),
                     properties,
+                    indexed_properties,
                     arrow_schema,
                 },
             );

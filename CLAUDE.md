@@ -48,9 +48,9 @@ Two crates: `nanograph` (library) and `nanograph-cli` (binary named `nanograph`)
 | `schema/` | `schema.pest` grammar + parser for `.pg` schema files → schema AST |
 | `query/` | `query.pest` grammar + parser for `.gq` query files → query AST; `typecheck.rs` validates queries against catalog |
 | `catalog/` | `schema_ir.rs` — compiled schema representation used at runtime |
-| `ir/` | `lower.rs` — lowers typed query AST into flat IR (NodeScan, Expand, Filter, AntiJoin operators) |
-| `plan/` | `planner.rs` — converts IR to DataFusion physical plans; `node_scan.rs` — custom NodeScanExec; `physical.rs` — ExpandExec, CrossJoinExec, AntiJoinExec |
-| `store/` | `graph.rs` — in-memory GraphStorage with CSR/CSC indices; `database.rs` — Lance-backed persistence; `loader.rs` — JSONL data loading; `manifest.rs` — dataset inventory; `migration.rs` — schema evolution |
+| `ir/` | `lower.rs` — lowers typed query AST into flat IR (NodeScan, Expand, Filter, AntiJoin operators); also lowers mutation queries (insert/update/delete) |
+| `plan/` | `planner.rs` — converts IR to DataFusion physical plans; `node_scan.rs` — custom NodeScanExec with Lance pushdown; `physical.rs` — ExpandExec, CrossJoinExec, AntiJoinExec, mutation execution |
+| `store/` | `graph.rs` — in-memory GraphStorage with CSR/CSC indices; `database.rs` — Lance-backed persistence + delete API + load modes; `loader.rs` — orchestration facade with submodules (`loader/jsonl.rs`, `loader/constraints.rs`, `loader/merge.rs`); `indexing.rs` — Lance scalar index lifecycle; `manifest.rs` — dataset inventory; `migration.rs` — schema evolution |
 | `types.rs` | Core type definitions, Arrow type mappings |
 | `error.rs` | `NanoError` error type; `ariadne` crate used for pretty source-span diagnostics |
 
@@ -78,28 +78,57 @@ Type IDs are FNV-1a hashes of `"node:TypeName"` / `"edge:TypeName"` → u32 hex.
 
 ### CLI Commands
 
-`nanograph init` / `load` / `migrate` / `check` / `run`. Supports both DB mode (`--db path.nanograph`) and legacy mode (`--schema`/`--data` flags for in-memory operation).
+`nanograph init` / `load` / `migrate` / `check` / `run` / `delete`. Supports both DB mode (`--db path.nanograph`) and legacy mode (`--schema`/`--data` flags for in-memory operation).
 
-- `run` supports `--format table|csv|jsonl` and `--param key=value` for parameterized queries.
+- `load` requires `--mode overwrite|append|merge` for explicit load semantics.
+- `run` supports `--format table|csv|jsonl` and `--param key=value` for parameterized queries. Mutation queries (`insert`/`update`/`delete`) are supported in DB mode.
+- `delete` supports `--type` and `--where` for predicate-based node deletion with edge cascade.
 - `migrate` supports `--dry-run`, `--auto-approve`, and `--format table|json`.
 
 ### Schema Migration
 
 Schema evolution via `nanograph migrate`. Edit `<db>/schema.pg` then run migrate. Uses `@rename_from("old_name")` annotations on types/properties to track renames. Migration steps have safety levels: `safe` (auto-apply), `confirm` (needs `--auto-approve` or interactive confirmation), `blocked` (e.g. adding non-nullable property to populated type).
 
+### Schema Annotations
+
+- `@key` — single property per node type, used for keyed merge (stable IDs across loads). Auto-indexed.
+- `@unique` — enforced on load/upsert. Multiple per node type. Nullable unique allows multiple nulls.
+- `@index` — creates a Lance scalar (B-tree) index on the property. Enables index-backed filtering.
+- `@rename_from("old")` — tracks type/property renames for migration.
+
+### Query Mutations
+
+Mutation queries use a direct syntax (not Datalog pattern matching):
+
+```
+query add_person($name: String, $age: I32) {
+    insert Person { name: $name, age: $age }
+}
+query update_person($name: String, $age: I32) {
+    update Person set { age: $age } where name = $name
+}
+query remove_person($name: String) {
+    delete Person where name = $name
+}
+```
+
+- `insert` uses append mode. `update` requires `@key` and uses merge mode. `delete` cascades edges.
+- Typechecked at compile time (T10-T14 rules).
+
 ## Version Constraints
 
-Arrow 57, DataFusion 52, Lance 2.0 — these must stay compatible with each other. Pest 2 for both grammars.
+Arrow 57, DataFusion 52, Lance 2.0 + lance-index 2.0 — these must stay compatible with each other. Pest 2 for both grammars.
 
 ## Design Documents
 
-- `grammar.ebnf` — formal grammar for both DSLs, includes 12 type rules (T1-T12)
+- `grammar.ebnf` — formal grammar for both DSLs, includes type rules (T1-T14; T10-T14 cover mutations)
 - `docs/specs.md` — product spec (v0)
 - `docs/datafusion_mapping.md` — how each query construct maps to DataFusion execution
+- `docs/execution-checklist.md` — implementation checklist with phase status and milestone gates
 
 ## Test Fixtures
 
-Test schemas, queries, and data live in `crates/nanograph/tests/fixtures/` (test.pg, test.gq, test.jsonl). Star Wars example in `examples/starwars/`. Migration tests in `tests/schema_migration.rs`.
+Test schemas, queries, and data live in `crates/nanograph/tests/fixtures/` (test.pg, test.gq, test.jsonl). Star Wars example in `examples/starwars/`. Migration tests in `tests/schema_migration.rs`. Index performance harness in `tests/index_perf.rs` (run with `--ignored`). Mutation CLI script in `tests/test_query_mutations.sh`.
 
 ## Known Pitfalls
 

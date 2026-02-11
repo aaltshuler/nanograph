@@ -1,6 +1,6 @@
 # NanoGraph Implementation Checklist
 
-Last updated: 2026-02-10
+Last updated: 2026-02-11
 Source roadmap: `/Users/andrew/code/hyperdb/docs/db-features.md`
 
 ## Priority Order
@@ -27,7 +27,7 @@ Source roadmap: `/Users/andrew/code/hyperdb/docs/db-features.md`
 ### Tests / Validation
 
 - [x] Add/extend pushdown tests in `/Users/andrew/code/hyperdb/crates/nanograph/tests/e2e.rs`.
-- [ ] Verify correctness parity for pushed vs non-pushed plans.
+- [x] Verify correctness parity for pushed vs non-pushed plans.
 - [x] Confirm limit + filter + projection combinations.
 
 ### Done Criteria
@@ -39,18 +39,20 @@ Source roadmap: `/Users/andrew/code/hyperdb/docs/db-features.md`
 
 ### Tasks
 
-- [ ] Add storage-native keyed merge path with Lance merge APIs in `/Users/andrew/code/hyperdb/crates/nanograph/src/store/database.rs`.
-- [ ] Refactor merge/load orchestration in `/Users/andrew/code/hyperdb/crates/nanograph/src/store/loader.rs`.
-- [ ] Introduce/extend uniqueness metadata in schema IR in `/Users/andrew/code/hyperdb/crates/nanograph/src/catalog/schema_ir.rs`.
+- [x] Add storage-native keyed merge path with Lance merge APIs in `/Users/andrew/code/hyperdb/crates/nanograph/src/store/database.rs`.
+- [x] Refactor merge/load orchestration in `/Users/andrew/code/hyperdb/crates/nanograph/src/store/loader.rs`.
+- [x] Split loader implementation into focused modules in `/Users/andrew/code/hyperdb/crates/nanograph/src/store/loader/jsonl.rs`, `/Users/andrew/code/hyperdb/crates/nanograph/src/store/loader/constraints.rs`, and `/Users/andrew/code/hyperdb/crates/nanograph/src/store/loader/merge.rs`, with `/Users/andrew/code/hyperdb/crates/nanograph/src/store/loader.rs` as orchestration facade.
+- [x] Introduce/extend uniqueness metadata in schema IR in `/Users/andrew/code/hyperdb/crates/nanograph/src/catalog/schema_ir.rs`.
 - [x] Wire parser support/validation for `@unique` semantics in `/Users/andrew/code/hyperdb/crates/nanograph/src/schema/parser.rs`.
 - [x] Enforce `@unique` checks in load/upsert path in `/Users/andrew/code/hyperdb/crates/nanograph/src/store/database.rs`.
-- [ ] Add typed uniqueness diagnostics surfaced to CLI in `/Users/andrew/code/hyperdb/crates/nanograph-cli/src/main.rs`.
+- [x] Add typed uniqueness diagnostics surfaced to CLI in `/Users/andrew/code/hyperdb/crates/nanograph-cli/src/main.rs`.
 
 ### Tests / Validation
 
 - [x] Add tests for duplicate `@unique` collisions (existing-existing, existing-incoming, incoming-incoming).
 - [x] Add tests for nullable vs non-nullable unique columns.
 - [x] Ensure idempotent repeated keyed loads still preserve node IDs and edge consistency.
+- [x] Add focused loader module tests in `/Users/andrew/code/hyperdb/crates/nanograph/src/store/loader/jsonl.rs`, `/Users/andrew/code/hyperdb/crates/nanograph/src/store/loader/constraints.rs`, and `/Users/andrew/code/hyperdb/crates/nanograph/src/store/loader/merge.rs`.
 
 ### Done Criteria
 
@@ -61,17 +63,17 @@ Source roadmap: `/Users/andrew/code/hyperdb/docs/db-features.md`
 
 ### Tasks
 
-- [ ] Add index metadata support (`@index`, auto-index `@key`) in `/Users/andrew/code/hyperdb/crates/nanograph/src/catalog/schema_ir.rs`.
-- [ ] Parse and validate index annotations in `/Users/andrew/code/hyperdb/crates/nanograph/src/schema/parser.rs`.
-- [ ] Add index lifecycle hooks (build/rebuild) in `/Users/andrew/code/hyperdb/crates/nanograph/src/store/database.rs`.
-- [ ] Extend migration handling for index creation/backfill in `/Users/andrew/code/hyperdb/crates/nanograph/src/store/migration.rs`.
-- [ ] Teach planner scan path to exploit index-eligible predicates in `/Users/andrew/code/hyperdb/crates/nanograph/src/plan/planner.rs`.
+- [x] Add index metadata support (`@index`, auto-index `@key`) in `/Users/andrew/code/hyperdb/crates/nanograph/src/catalog/schema_ir.rs`.
+- [x] Parse and validate index annotations in `/Users/andrew/code/hyperdb/crates/nanograph/src/schema/parser.rs`.
+- [x] Add index lifecycle hooks (build/rebuild) in `/Users/andrew/code/hyperdb/crates/nanograph/src/store/database.rs`.
+- [x] Extend migration handling for index creation/backfill in `/Users/andrew/code/hyperdb/crates/nanograph/src/store/migration.rs`.
+- [x] Teach planner scan path to exploit index-eligible predicates in `/Users/andrew/code/hyperdb/crates/nanograph/src/plan/planner.rs`.
 
 ### Tests / Validation
 
-- [ ] Add index annotation tests in `/Users/andrew/code/hyperdb/crates/nanograph/tests/schema_migration.rs`.
-- [ ] Add query tests demonstrating index-backed point lookup in `/Users/andrew/code/hyperdb/crates/nanograph/tests/e2e.rs`.
-- [ ] Add performance regression harness (baseline scan vs indexed lookup).
+- [x] Add index annotation tests in `/Users/andrew/code/hyperdb/crates/nanograph/tests/schema_migration.rs`.
+- [x] Add query tests demonstrating index-backed point lookup in `/Users/andrew/code/hyperdb/crates/nanograph/tests/e2e.rs`.
+- [x] Add performance regression harness (baseline scan vs indexed lookup) in `/Users/andrew/code/hyperdb/crates/nanograph/tests/index_perf.rs` (ignored/manual run).
 
 ### Done Criteria
 
@@ -82,15 +84,15 @@ Source roadmap: `/Users/andrew/code/hyperdb/docs/db-features.md`
 
 ### Tasks
 
-- [ ] Add load mode enum (`overwrite|append|merge`) in `/Users/andrew/code/hyperdb/crates/nanograph/src/store/database.rs`.
-- [ ] Update loader logic for explicit mode behavior in `/Users/andrew/code/hyperdb/crates/nanograph/src/store/loader.rs`.
-- [ ] Add CLI flag wiring in `/Users/andrew/code/hyperdb/crates/nanograph-cli/src/main.rs`.
-- [ ] Add unsafe-combo guards (for example keyed append without uniqueness checks).
+- [x] Add load mode enum (`overwrite|append|merge`) in `/Users/andrew/code/hyperdb/crates/nanograph/src/store/database.rs`.
+- [x] Update loader logic for explicit mode behavior in `/Users/andrew/code/hyperdb/crates/nanograph/src/store/loader.rs`.
+- [x] Add CLI flag wiring in `/Users/andrew/code/hyperdb/crates/nanograph-cli/src/main.rs`.
+- [x] Add unsafe-combo guards (for example keyed append without uniqueness checks).
 
 ### Tests / Validation
 
-- [ ] Table-driven mode tests in `/Users/andrew/code/hyperdb/crates/nanograph/src/store/database.rs`.
-- [ ] CLI integration tests for mode parsing and behavior.
+- [x] Table-driven mode tests in `/Users/andrew/code/hyperdb/crates/nanograph/src/store/database.rs`.
+- [x] CLI integration tests for mode parsing and behavior.
 
 ### Done Criteria
 
@@ -100,18 +102,18 @@ Source roadmap: `/Users/andrew/code/hyperdb/docs/db-features.md`
 
 ### Tasks
 
-- [ ] Extend grammar for `insert/update/delete` in `/Users/andrew/code/hyperdb/crates/nanograph/src/query/query.pest`.
-- [ ] Add AST nodes in `/Users/andrew/code/hyperdb/crates/nanograph/src/query/ast.rs`.
-- [ ] Parse mutations in `/Users/andrew/code/hyperdb/crates/nanograph/src/query/parser.rs`.
-- [ ] Add typechecking rules in `/Users/andrew/code/hyperdb/crates/nanograph/src/query/typecheck.rs`.
-- [ ] Lower mutation IR in `/Users/andrew/code/hyperdb/crates/nanograph/src/ir/lower.rs`.
-- [ ] Add physical mutation execution path in `/Users/andrew/code/hyperdb/crates/nanograph/src/plan/physical.rs`.
-- [ ] Expose via CLI query runner in `/Users/andrew/code/hyperdb/crates/nanograph-cli/src/main.rs`.
+- [x] Extend grammar for `insert/update/delete` in `/Users/andrew/code/hyperdb/crates/nanograph/src/query/query.pest`.
+- [x] Add AST nodes in `/Users/andrew/code/hyperdb/crates/nanograph/src/query/ast.rs`.
+- [x] Parse mutations in `/Users/andrew/code/hyperdb/crates/nanograph/src/query/parser.rs`.
+- [x] Add typechecking rules in `/Users/andrew/code/hyperdb/crates/nanograph/src/query/typecheck.rs`.
+- [x] Lower mutation IR in `/Users/andrew/code/hyperdb/crates/nanograph/src/ir/lower.rs`.
+- [x] Add physical mutation execution path in `/Users/andrew/code/hyperdb/crates/nanograph/src/plan/physical.rs`.
+- [x] Expose via CLI query runner in `/Users/andrew/code/hyperdb/crates/nanograph-cli/src/main.rs`.
 
 ### Tests / Validation
 
-- [ ] Add parse + typecheck mutation tests.
-- [ ] Add end-to-end mutation query tests in `/Users/andrew/code/hyperdb/crates/nanograph/tests/e2e.rs`.
+- [x] Add parse + typecheck mutation tests.
+- [x] Add end-to-end mutation query tests in `/Users/andrew/code/hyperdb/crates/nanograph/tests/e2e.rs`.
 
 ### Done Criteria
 
@@ -176,6 +178,7 @@ Use this cadence so new features are validated at the right times without runnin
 - Recommended command set:
   - `cargo test -p nanograph`
   - `cargo test -p nanograph-cli`
+  - `bash /Users/andrew/code/hyperdb/crates/nanograph/tests/test_query_mutations.sh`
 
 ### Release hardening pass
 

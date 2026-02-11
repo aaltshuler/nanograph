@@ -1,6 +1,6 @@
 [package]
 name = "nanograph-cli"
-version = "0.2.0"
+version = "0.4.0"
 edition = "2024"
 description = "CLI for NanoGraph — embedded typed property graph database"
 repository = "https://github.com/aaltshuler/nanograph"
@@ -21,3 +21,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 color-eyre = { workspace = true }
 ariadne = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
