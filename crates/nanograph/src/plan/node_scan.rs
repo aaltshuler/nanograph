@@ -6,18 +6,14 @@ use std::sync::Arc;
 use arrow::array::{
     ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, StructArray,
 };
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use datafusion::catalog::Session;
-use datafusion::common::{Column, Result, ScalarValue};
-use datafusion::datasource::{TableProvider, TableType};
+use arrow::datatypes::{DataType, Field, SchemaRef};
+use datafusion::common::Result;
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::TaskContext;
-use datafusion::logical_expr::{Operator, TableProviderFilterPushDown};
 use datafusion::physical_plan::memory::MemoryStream;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
-use datafusion::prelude::Expr;
 use futures::StreamExt;
 use lance::Dataset;
 use tracing::debug;
@@ -26,230 +22,16 @@ use crate::query::ast::{CompOp, Literal};
 use crate::store::graph::GraphStorage;
 
 #[derive(Debug, Clone)]
-pub struct NodeScanPredicate {
-    pub property: String,
-    pub op: CompOp,
-    pub literal: Literal,
-    pub index_eligible: bool,
-}
-
-/// TableProvider for a single node type. Registers with DataFusion as a table.
-#[derive(Debug)]
-pub struct NodeTypeTable {
-    pub type_name: String,
-    pub variable_name: String,
-    pub struct_schema: SchemaRef,
-    pub storage: Arc<GraphStorage>,
-}
-
-impl NodeTypeTable {
-    pub fn new(type_name: String, variable_name: String, storage: Arc<GraphStorage>) -> Self {
-        let node_type = &storage.catalog.node_types[&type_name];
-        let struct_fields: Vec<Field> = node_type
-            .arrow_schema
-            .fields()
-            .iter()
-            .map(|f| f.as_ref().clone())
-            .collect();
-        let struct_field = Field::new(
-            &variable_name,
-            DataType::Struct(struct_fields.into()),
-            false,
-        );
-        let struct_schema = Arc::new(Schema::new(vec![struct_field]));
-
-        Self {
-            type_name,
-            variable_name,
-            struct_schema,
-            storage,
-        }
-    }
-
-    fn scan_filter_from_expr(&self, expr: &Expr) -> Option<NodeScanPredicate> {
-        fn comp_from_operator(op: Operator) -> Option<CompOp> {
-            match op {
-                Operator::Eq => Some(CompOp::Eq),
-                Operator::NotEq => Some(CompOp::Ne),
-                Operator::Gt => Some(CompOp::Gt),
-                Operator::Lt => Some(CompOp::Lt),
-                Operator::GtEq => Some(CompOp::Ge),
-                Operator::LtEq => Some(CompOp::Le),
-                _ => None,
-            }
-        }
-
-        fn flip_comp_op(op: CompOp) -> CompOp {
-            match op {
-                CompOp::Eq => CompOp::Eq,
-                CompOp::Ne => CompOp::Ne,
-                CompOp::Gt => CompOp::Lt,
-                CompOp::Lt => CompOp::Gt,
-                CompOp::Ge => CompOp::Le,
-                CompOp::Le => CompOp::Ge,
-            }
-        }
-
-        fn literal_from_scalar(value: &ScalarValue) -> Option<Literal> {
-            match value {
-                ScalarValue::Boolean(Some(v)) => Some(Literal::Bool(*v)),
-                ScalarValue::Int8(Some(v)) => Some(Literal::Integer(*v as i64)),
-                ScalarValue::Int16(Some(v)) => Some(Literal::Integer(*v as i64)),
-                ScalarValue::Int32(Some(v)) => Some(Literal::Integer(*v as i64)),
-                ScalarValue::Int64(Some(v)) => Some(Literal::Integer(*v)),
-                ScalarValue::UInt8(Some(v)) => Some(Literal::Integer(*v as i64)),
-                ScalarValue::UInt16(Some(v)) => Some(Literal::Integer(*v as i64)),
-                ScalarValue::UInt32(Some(v)) => Some(Literal::Integer(*v as i64)),
-                ScalarValue::UInt64(Some(v)) => i64::try_from(*v).ok().map(Literal::Integer),
-                ScalarValue::Float32(Some(v)) => Some(Literal::Float(*v as f64)),
-                ScalarValue::Float64(Some(v)) => Some(Literal::Float(*v)),
-                ScalarValue::Utf8(Some(v))
-                | ScalarValue::Utf8View(Some(v))
-                | ScalarValue::LargeUtf8(Some(v)) => Some(Literal::String(v.clone())),
-                _ => None,
-            }
-        }
-
-        fn literal_from_expr(expr: &Expr) -> Option<Literal> {
-            match expr {
-                Expr::Literal(value, _) => literal_from_scalar(value),
-                Expr::Cast(cast) => literal_from_expr(&cast.expr),
-                Expr::TryCast(cast) => literal_from_expr(&cast.expr),
-                _ => None,
-            }
-        }
-
-        fn property_from_column(column: &Column, variable_name: &str) -> Option<String> {
-            if let Some(relation) = &column.relation {
-                if relation.to_string() == variable_name {
-                    return Some(column.name.clone());
-                }
-                return None;
-            }
-
-            if column.name == variable_name {
-                return None;
-            }
-            if let Some((var, prop)) = column.name.split_once('.') {
-                if var == variable_name {
-                    return Some(prop.to_string());
-                }
-                return None;
-            }
-
-            Some(column.name.clone())
-        }
-
-        match expr {
-            Expr::BinaryExpr(binary) => {
-                let op = comp_from_operator(binary.op)?;
-                match (binary.left.as_ref(), binary.right.as_ref()) {
-                    (Expr::Column(col), rhs) => {
-                        let property = property_from_column(col, &self.variable_name)?;
-                        Some(NodeScanPredicate {
-                            index_eligible: self.is_index_eligible(&property, op),
-                            property,
-                            op,
-                            literal: literal_from_expr(rhs)?,
-                        })
-                    }
-                    (lhs, Expr::Column(col)) => {
-                        let property = property_from_column(col, &self.variable_name)?;
-                        let op = flip_comp_op(op);
-                        Some(NodeScanPredicate {
-                            index_eligible: self.is_index_eligible(&property, op),
-                            property,
-                            op,
-                            literal: literal_from_expr(lhs)?,
-                        })
-                    }
-                    _ => None,
-                }
-            }
-            _ => None,
-        }
-    }
-
-    fn is_index_eligible(&self, property: &str, op: CompOp) -> bool {
-        matches!(
-            op,
-            CompOp::Eq | CompOp::Gt | CompOp::Lt | CompOp::Ge | CompOp::Le
-        ) && self
-            .storage
-            .catalog
-            .node_types
-            .get(&self.type_name)
-            .map(|node| node.indexed_properties.contains(property))
-            .unwrap_or(false)
-    }
-}
-
-#[async_trait::async_trait]
-impl TableProvider for NodeTypeTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        self.struct_schema.clone()
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::Base
-    }
-
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> Result<Vec<TableProviderFilterPushDown>> {
-        Ok(filters
-            .iter()
-            .map(|filter| {
-                if self.scan_filter_from_expr(filter).is_some() {
-                    TableProviderFilterPushDown::Exact
-                } else {
-                    TableProviderFilterPushDown::Unsupported
-                }
-            })
-            .collect())
-    }
-
-    async fn scan(
-        &self,
-        _state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Table schema is a single struct column for the bound variable.
-        // Accept projections that keep column 0 and ignore identity projections.
-        if let Some(projection) = projection {
-            if !projection.iter().all(|idx| *idx == 0) {
-                return Err(datafusion::error::DataFusionError::Plan(
-                    "NodeTypeTable only supports projecting the variable struct column".to_string(),
-                ));
-            }
-        }
-
-        let pushdown_filters = filters
-            .iter()
-            .filter_map(|expr| self.scan_filter_from_expr(expr))
-            .collect();
-
-        Ok(Arc::new(NodeScanExec::new(
-            self.type_name.clone(),
-            self.variable_name.clone(),
-            self.struct_schema.clone(),
-            pushdown_filters,
-            limit,
-            self.storage.clone(),
-        )))
-    }
+pub(crate) struct NodeScanPredicate {
+    pub(crate) property: String,
+    pub(crate) op: CompOp,
+    pub(crate) literal: Literal,
+    pub(crate) index_eligible: bool,
 }
 
 /// Physical execution plan that scans all nodes of a type, outputting a Struct column.
 #[derive(Debug)]
-pub struct NodeScanExec {
+pub(crate) struct NodeScanExec {
     type_name: String,
     variable_name: String,
     output_schema: SchemaRef,
@@ -260,7 +42,7 @@ pub struct NodeScanExec {
 }
 
 impl NodeScanExec {
-    pub fn new(
+    pub(crate) fn new(
         type_name: String,
         variable_name: String,
         output_schema: SchemaRef,

@@ -7,11 +7,12 @@ use lance::Dataset;
 use lance_index::DatasetIndexExt;
 use tempfile::TempDir;
 
-use nanograph::catalog::schema_ir::SchemaIR;
+use nanograph::schema_ir::SchemaIR;
 use nanograph::store::database::Database;
-use nanograph::store::indexing::scalar_index_name;
 use nanograph::store::manifest::GraphManifest;
 use nanograph::store::migration::{MigrationStatus, MigrationStep, execute_schema_migration};
+use nanograph::store::scalar_index_name;
+use nanograph::store::txlog::read_tx_catalog_entries;
 
 fn base_schema() -> &'static str {
     r#"
@@ -515,6 +516,25 @@ async fn migration_sequential_runs_increment_schema_identity_version() {
 }
 
 #[tokio::test]
+async fn migration_appends_tx_catalog_row() {
+    let (_dir, db_path) = init_db_with_data(base_schema()).await;
+    write_schema(&db_path, rename_schema());
+
+    let exec = execute_schema_migration(&db_path, false, true)
+        .await
+        .expect("apply migration");
+    assert_eq!(exec.status, MigrationStatus::Applied);
+
+    let manifest = GraphManifest::read(&db_path).expect("read manifest");
+    let tx_rows = read_tx_catalog_entries(&db_path).expect("read tx catalog");
+    let last = tx_rows.last().expect("at least one tx row");
+
+    assert_eq!(last.db_version, manifest.db_version);
+    assert_eq!(last.tx_id, manifest.last_tx_id);
+    assert_eq!(last.op_summary, "schema_migration");
+}
+
+#[tokio::test]
 async fn migration_preserves_index_annotations_in_schema_ir() {
     let (_dir, db_path) = init_db_with_data(base_schema()).await;
     write_schema(&db_path, schema_with_index_annotation());
@@ -605,8 +625,8 @@ async fn migration_bootstraps_identity_counters_from_legacy_manifest() {
         .types
         .iter()
         .map(|t| match t {
-            nanograph::catalog::schema_ir::TypeDef::Node(n) => n.type_id,
-            nanograph::catalog::schema_ir::TypeDef::Edge(e) => e.type_id,
+            nanograph::schema_ir::TypeDef::Node(n) => n.type_id,
+            nanograph::schema_ir::TypeDef::Edge(e) => e.type_id,
         })
         .max()
         .expect("at least one type");

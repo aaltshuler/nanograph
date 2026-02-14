@@ -1,6 +1,6 @@
 [package]
 name = "nanograph"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 description = "Embedded local-first typed property graph database. Arrow-native, DataFusion-backed."
 repository = "https://github.com/aaltshuler/nanograph"

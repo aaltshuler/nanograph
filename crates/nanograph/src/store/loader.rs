@@ -10,7 +10,7 @@ mod constraints;
 mod jsonl;
 mod merge;
 
-pub use jsonl::{json_values_to_array, load_jsonl_data, load_jsonl_data_with_name_seed};
+pub(crate) use jsonl::{json_values_to_array, load_jsonl_data, load_jsonl_data_with_name_seed};
 
 /// Build the next storage snapshot for a `Database::load` operation.
 ///
@@ -19,7 +19,7 @@ pub use jsonl::{json_values_to_array, load_jsonl_data, load_jsonl_data_with_name
 /// - `append`: append incoming nodes/edges to existing data.
 /// - `merge`: keyed node merge with stable IDs and edge endpoint remap.
 /// - Always enforces node-level `@unique`/`@key` uniqueness before returning.
-pub async fn build_next_storage_for_load(
+pub(crate) async fn build_next_storage_for_load(
     db_path: &Path,
     existing: &GraphStorage,
     schema_ir: &SchemaIR,

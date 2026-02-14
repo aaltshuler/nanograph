@@ -28,3 +28,13 @@ ariadne = "0.4"
 
 [profile.dev]
 debug = 0
+
+# Optimize deps in dev mode so tests run at reasonable speed
+# while nanograph crate itself stays unoptimized for fast rebuilds
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+codegen-units = 16

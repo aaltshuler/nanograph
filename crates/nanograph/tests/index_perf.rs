@@ -1,11 +1,9 @@
 use std::time::{Duration, Instant};
 
-use nanograph::ir::ParamMap;
-use nanograph::ir::lower::lower_query;
-use nanograph::plan::planner::execute_query;
 use nanograph::query::parser::parse_query;
 use nanograph::query::typecheck::typecheck_query;
 use nanograph::store::database::Database;
+use nanograph::{ParamMap, execute_query, lower_query};
 use tempfile::TempDir;
 
 fn schema_source(indexed: bool) -> &'static str {

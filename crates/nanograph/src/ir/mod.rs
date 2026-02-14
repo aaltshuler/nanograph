@@ -1,4 +1,4 @@
-pub mod lower;
+pub(crate) mod lower;
 
 use std::collections::HashMap;
 

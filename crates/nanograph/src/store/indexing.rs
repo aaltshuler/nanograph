@@ -14,7 +14,7 @@ pub fn scalar_index_name(type_id: u32, property: &str) -> String {
     format!("nano_{:08x}_{}{}", type_id, property, SCALAR_INDEX_SUFFIX)
 }
 
-pub async fn rebuild_node_scalar_indexes(
+pub(crate) async fn rebuild_node_scalar_indexes(
     dataset_path: &Path,
     node_def: &NodeTypeDef,
 ) -> Result<()> {

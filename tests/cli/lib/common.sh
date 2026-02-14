@@ -59,6 +59,17 @@ assert_str_eq() {
     fi
 }
 
+assert_contains() {
+    local haystack="$1"
+    local needle="$2"
+    local message="$3"
+    if echo "$haystack" | grep -F -q "$needle"; then
+        pass "$message"
+    else
+        fail "$message (missing '$needle')"
+    fi
+}
+
 create_character_name_keyed_schema() {
     local source_schema="$1"
     local output_schema="$2"

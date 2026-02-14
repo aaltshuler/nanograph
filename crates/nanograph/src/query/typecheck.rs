@@ -112,10 +112,6 @@ fn typecheck_mutation(catalog: &Catalog, mutation: &Mutation, params: &[Param]) 
 
     match mutation {
         Mutation::Insert(insert) => {
-            let node_type = catalog.node_types.get(&insert.type_name).ok_or_else(|| {
-                NanoError::Type(format!("T10: unknown node type `{}`", insert.type_name))
-            })?;
-
             if insert.assignments.is_empty() {
                 return Err(NanoError::Type(
                     "T10: insert mutation requires at least one assignment".to_string(),
@@ -124,43 +120,130 @@ fn typecheck_mutation(catalog: &Catalog, mutation: &Mutation, params: &[Param]) 
 
             ensure_no_duplicate_assignment_names(&insert.assignments)?;
 
-            for assignment in &insert.assignments {
-                let prop_type =
-                    node_type
-                        .properties
-                        .get(&assignment.property)
-                        .ok_or_else(|| {
-                            NanoError::Type(format!(
-                                "T11: type `{}` has no property `{}`",
-                                insert.type_name, assignment.property
-                            ))
-                        })?;
-                check_match_value_type(
-                    &assignment.value,
-                    &param_types,
-                    &prop_type.scalar,
-                    &assignment.property,
-                )?;
+            if let Some(node_type) = catalog.node_types.get(&insert.type_name) {
+                for assignment in &insert.assignments {
+                    let prop_type =
+                        node_type
+                            .properties
+                            .get(&assignment.property)
+                            .ok_or_else(|| {
+                                NanoError::Type(format!(
+                                    "T11: type `{}` has no property `{}`",
+                                    insert.type_name, assignment.property
+                                ))
+                            })?;
+                    check_match_value_type(
+                        &assignment.value,
+                        &param_types,
+                        &prop_type.scalar,
+                        &assignment.property,
+                    )?;
+                }
+
+                for (prop_name, prop_type) in &node_type.properties {
+                    if prop_type.nullable {
+                        continue;
+                    }
+                    if !insert.assignments.iter().any(|a| &a.property == prop_name) {
+                        return Err(NanoError::Type(format!(
+                            "T12: insert for `{}` must provide non-nullable property `{}`",
+                            insert.type_name, prop_name
+                        )));
+                    }
+                }
+                return Ok(insert.type_name.clone());
             }
 
-            for (prop_name, prop_type) in &node_type.properties {
-                if prop_type.nullable {
-                    continue;
+            if let Some(edge_type) = catalog.edge_types.get(&insert.type_name) {
+                let mut has_from = false;
+                let mut has_to = false;
+
+                for assignment in &insert.assignments {
+                    match assignment.property.as_str() {
+                        "from" => {
+                            has_from = true;
+                            check_match_value_type(
+                                &assignment.value,
+                                &param_types,
+                                &ScalarType::String,
+                                "from",
+                            )?;
+                        }
+                        "to" => {
+                            has_to = true;
+                            check_match_value_type(
+                                &assignment.value,
+                                &param_types,
+                                &ScalarType::String,
+                                "to",
+                            )?;
+                        }
+                        _ => {
+                            let prop_type = edge_type
+                                .properties
+                                .get(&assignment.property)
+                                .ok_or_else(|| {
+                                    NanoError::Type(format!(
+                                        "T11: type `{}` has no property `{}`",
+                                        insert.type_name, assignment.property
+                                    ))
+                                })?;
+                            check_match_value_type(
+                                &assignment.value,
+                                &param_types,
+                                &prop_type.scalar,
+                                &assignment.property,
+                            )?;
+                        }
+                    }
                 }
-                if !insert.assignments.iter().any(|a| &a.property == prop_name) {
+
+                if !has_from {
                     return Err(NanoError::Type(format!(
-                        "T12: insert for `{}` must provide non-nullable property `{}`",
-                        insert.type_name, prop_name
+                        "T12: insert for `{}` must provide required endpoint `from`",
+                        insert.type_name
                     )));
                 }
+                if !has_to {
+                    return Err(NanoError::Type(format!(
+                        "T12: insert for `{}` must provide required endpoint `to`",
+                        insert.type_name
+                    )));
+                }
+
+                for (prop_name, prop_type) in &edge_type.properties {
+                    if prop_type.nullable {
+                        continue;
+                    }
+                    if !insert.assignments.iter().any(|a| &a.property == prop_name) {
+                        return Err(NanoError::Type(format!(
+                            "T12: insert for `{}` must provide non-nullable property `{}`",
+                            insert.type_name, prop_name
+                        )));
+                    }
+                }
+                return Ok(insert.type_name.clone());
             }
 
-            Ok(insert.type_name.clone())
+            Err(NanoError::Type(format!(
+                "T10: unknown node/edge type `{}`",
+                insert.type_name
+            )))
         }
         Mutation::Update(update) => {
-            let node_type = catalog.node_types.get(&update.type_name).ok_or_else(|| {
-                NanoError::Type(format!("T10: unknown node type `{}`", update.type_name))
-            })?;
+            let node_type = if let Some(node_type) = catalog.node_types.get(&update.type_name) {
+                node_type
+            } else if catalog.edge_types.contains_key(&update.type_name) {
+                return Err(NanoError::Type(format!(
+                    "T16: update mutation for edge type `{}` is not supported",
+                    update.type_name
+                )));
+            } else {
+                return Err(NanoError::Type(format!(
+                    "T10: unknown node/edge type `{}`",
+                    update.type_name
+                )));
+            };
 
             if update.assignments.is_empty() {
                 return Err(NanoError::Type(
@@ -197,16 +280,28 @@ fn typecheck_mutation(catalog: &Catalog, mutation: &Mutation, params: &[Param]) 
             Ok(update.type_name.clone())
         }
         Mutation::Delete(delete) => {
-            let node_type = catalog.node_types.get(&delete.type_name).ok_or_else(|| {
-                NanoError::Type(format!("T10: unknown node type `{}`", delete.type_name))
-            })?;
-            typecheck_mutation_predicate(
-                &delete.type_name,
-                &delete.predicate,
-                node_type,
-                &param_types,
-            )?;
-            Ok(delete.type_name.clone())
+            if let Some(node_type) = catalog.node_types.get(&delete.type_name) {
+                typecheck_mutation_predicate(
+                    &delete.type_name,
+                    &delete.predicate,
+                    node_type,
+                    &param_types,
+                )?;
+                Ok(delete.type_name.clone())
+            } else if let Some(edge_type) = catalog.edge_types.get(&delete.type_name) {
+                typecheck_edge_mutation_predicate(
+                    &delete.type_name,
+                    &delete.predicate,
+                    edge_type,
+                    &param_types,
+                )?;
+                Ok(delete.type_name.clone())
+            } else {
+                Err(NanoError::Type(format!(
+                    "T10: unknown node/edge type `{}`",
+                    delete.type_name
+                )))
+            }
         }
     }
 }
@@ -231,6 +326,39 @@ fn typecheck_mutation_predicate(
     param_types: &HashMap<String, ScalarType>,
 ) -> Result<()> {
     let prop_type = node_type
+        .properties
+        .get(&predicate.property)
+        .ok_or_else(|| {
+            NanoError::Type(format!(
+                "T11: type `{}` has no property `{}`",
+                type_name, predicate.property
+            ))
+        })?;
+    check_match_value_type(
+        &predicate.value,
+        param_types,
+        &prop_type.scalar,
+        &predicate.property,
+    )?;
+    Ok(())
+}
+
+fn typecheck_edge_mutation_predicate(
+    type_name: &str,
+    predicate: &MutationPredicate,
+    edge_type: &crate::catalog::EdgeType,
+    param_types: &HashMap<String, ScalarType>,
+) -> Result<()> {
+    if predicate.property == "from" || predicate.property == "to" {
+        return check_match_value_type(
+            &predicate.value,
+            param_types,
+            &ScalarType::String,
+            &predicate.property,
+        );
+    }
+
+    let prop_type = edge_type
         .properties
         .get(&predicate.property)
         .ok_or_else(|| {
@@ -1043,5 +1171,76 @@ query del($name: String) {
         .unwrap();
         let err = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap_err();
         assert!(err.to_string().contains("T10"));
+    }
+
+    #[test]
+    fn test_mutation_insert_edge_typecheck_ok() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query add_knows($from: String, $to: String) {
+    insert Knows {
+        from: $from
+        to: $to
+    }
+}
+"#,
+        )
+        .unwrap();
+        let checked = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap();
+        match checked {
+            CheckedQuery::Mutation(ctx) => assert_eq!(ctx.target_type, "Knows"),
+            _ => panic!("expected mutation typecheck result"),
+        }
+    }
+
+    #[test]
+    fn test_mutation_insert_edge_requires_from_and_to() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query add_knows($from: String) {
+    insert Knows {
+        from: $from
+    }
+}
+"#,
+        )
+        .unwrap();
+        let err = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap_err();
+        assert!(err.to_string().contains("T12"));
+    }
+
+    #[test]
+    fn test_mutation_delete_edge_typecheck_ok() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query del_knows($from: String) {
+    delete Knows where from = $from
+}
+"#,
+        )
+        .unwrap();
+        let checked = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap();
+        match checked {
+            CheckedQuery::Mutation(ctx) => assert_eq!(ctx.target_type, "Knows"),
+            _ => panic!("expected mutation typecheck result"),
+        }
+    }
+
+    #[test]
+    fn test_mutation_update_edge_not_supported() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query upd_knows($from: String) {
+    update Knows set { since: 2000 } where from = $from
+}
+"#,
+        )
+        .unwrap();
+        let err = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap_err();
+        assert!(err.to_string().contains("T16"));
     }
 }

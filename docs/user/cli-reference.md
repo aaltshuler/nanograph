@@ -37,11 +37,7 @@ nanograph load <db_path> --data <data.jsonl> --mode <overwrite|append|merge>
 Parse and typecheck a query file without executing.
 
 ```bash
-# DB mode
 nanograph check --db <db_path> --query <queries.gq>
-
-# Legacy mode (in-memory, no persistence)
-nanograph check --schema <schema.pg> --query <queries.gq>
 ```
 
 ### `run`
@@ -49,11 +45,7 @@ nanograph check --schema <schema.pg> --query <queries.gq>
 Execute a named query.
 
 ```bash
-# DB mode
 nanograph run --db <db_path> --query <queries.gq> --name <query_name> [options]
-
-# Legacy mode
-nanograph run --schema <schema.pg> --data <data.jsonl> --query <queries.gq> --name <query_name> [options]
 ```
 
 | Option | Description |
@@ -61,7 +53,7 @@ nanograph run --schema <schema.pg> --data <data.jsonl> --query <queries.gq> --na
 | `--format table\|csv\|jsonl` | Output format (default: `table`) |
 | `--param key=value` | Query parameter (repeatable) |
 
-Supports both read queries and mutation queries (`insert`, `update`, `delete`). Mutations require DB mode.
+Supports both read queries and mutation queries (`insert`, `update`, `delete`) in DB mode.
 
 ### `delete`
 
@@ -74,6 +66,47 @@ nanograph delete <db_path> --type <NodeType> --where <predicate>
 Predicate format: `property=value` or `property>=value`, etc.
 
 All edges where the deleted node is a source or destination are automatically removed.
+
+### `changes`
+
+Read commit-gated CDC rows from the authoritative JSONL log.
+
+```bash
+nanograph changes <db_path> [--since <db_version> | --from <db_version> --to <db_version>] [--format jsonl|json]
+```
+
+### `compact`
+
+Compact manifest-tracked Lance datasets and commit updated pinned versions.
+
+```bash
+nanograph compact <db_path> [--target-rows-per-fragment <n>] [--materialize-deletions <bool>] [--materialize-deletions-threshold <f32>]
+```
+
+### `cleanup`
+
+Prune tx/CDC history and old Lance dataset versions while preserving replay/manifest correctness.
+
+```bash
+nanograph cleanup <db_path> [--retain-tx-versions <n>] [--retain-dataset-versions <n>]
+```
+
+### `doctor`
+
+Validate manifest/dataset/log consistency and graph integrity.
+
+```bash
+nanograph doctor <db_path>
+```
+
+### `cdc-materialize`
+
+Materialize visible CDC rows into derived Lance dataset `__cdc_analytics` for analytics acceleration.
+This does not change `changes` semantics; JSONL remains authoritative.
+
+```bash
+nanograph cdc-materialize <db_path> [--min-new-rows <n>] [--force]
+```
 
 ### `migrate`
 

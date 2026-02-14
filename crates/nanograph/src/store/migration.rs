@@ -21,6 +21,7 @@ use crate::store::database::Database;
 use crate::store::graph::GraphStorage;
 use crate::store::indexing::rebuild_node_scalar_indexes;
 use crate::store::manifest::{DatasetEntry, GraphManifest, hash_string};
+use crate::store::txlog::commit_manifest_and_logs;
 use crate::types::ScalarType;
 
 const SCHEMA_PG_FILENAME: &str = "schema.pg";
@@ -1509,56 +1510,60 @@ async fn write_staged_db(
         .map_err(|e| NanoError::Manifest(format!("serialize IR error: {}", e)))?;
     std::fs::write(path.join(SCHEMA_IR_FILENAME), &ir_json)?;
 
+    let mut dataset_entries = Vec::new();
     for node_def in schema_ir.node_types() {
         if let Some(batch) = storage.get_all_nodes(&node_def.name)? {
-            let dataset_path = path
-                .join("nodes")
-                .join(SchemaIR::dir_name(node_def.type_id));
-            write_lance_batch(&dataset_path, batch).await?;
+            let row_count = batch.num_rows() as u64;
+            let dataset_rel_path = format!("nodes/{}", SchemaIR::dir_name(node_def.type_id));
+            let dataset_path = path.join(&dataset_rel_path);
+            let dataset_version = write_lance_batch(&dataset_path, batch).await?;
             rebuild_node_scalar_indexes(&dataset_path, node_def).await?;
+            dataset_entries.push(DatasetEntry {
+                type_id: node_def.type_id,
+                type_name: node_def.name.clone(),
+                kind: "node".to_string(),
+                dataset_path: dataset_rel_path,
+                dataset_version,
+                row_count,
+            });
         }
     }
     for edge_def in schema_ir.edge_types() {
         if let Some(batch) = storage.edge_batch_for_save(&edge_def.name)? {
-            let dataset_path = path
-                .join("edges")
-                .join(SchemaIR::dir_name(edge_def.type_id));
-            write_lance_batch(&dataset_path, batch).await?;
+            let row_count = batch.num_rows() as u64;
+            let dataset_rel_path = format!("edges/{}", SchemaIR::dir_name(edge_def.type_id));
+            let dataset_path = path.join(&dataset_rel_path);
+            let dataset_version = write_lance_batch(&dataset_path, batch).await?;
+            dataset_entries.push(DatasetEntry {
+                type_id: edge_def.type_id,
+                type_name: edge_def.name.clone(),
+                kind: "edge".to_string(),
+                dataset_path: dataset_rel_path,
+                dataset_version,
+                row_count,
+            });
         }
     }
 
     let mut manifest = GraphManifest::new(hash_string(&ir_json));
+    manifest.db_version = manifest_seed.db_version.saturating_add(1);
+    manifest.last_tx_id = format!("migration-{}", manifest.db_version);
+    manifest.committed_at = now_unix_seconds_string();
     manifest.next_node_id = storage.next_node_id();
     manifest.next_edge_id = storage.next_edge_id();
     manifest.next_type_id = manifest_seed.next_type_id;
     manifest.next_prop_id = manifest_seed.next_prop_id;
-    manifest.schema_identity_version = manifest_seed.schema_identity_version.saturating_add(1);
+    manifest.schema_identity_version = manifest_seed
+        .schema_identity_version
+        .saturating_add(1)
+        .max(1);
+    manifest.datasets = dataset_entries;
 
-    for node_def in schema_ir.node_types() {
-        if let Some(batch) = storage.get_all_nodes(&node_def.name)? {
-            manifest.datasets.push(DatasetEntry {
-                type_id: node_def.type_id,
-                type_name: node_def.name.clone(),
-                kind: "node".to_string(),
-                row_count: batch.num_rows() as u64,
-            });
-        }
-    }
-    for edge_def in schema_ir.edge_types() {
-        if let Some(batch) = storage.edge_batch_for_save(&edge_def.name)? {
-            manifest.datasets.push(DatasetEntry {
-                type_id: edge_def.type_id,
-                type_name: edge_def.name.clone(),
-                kind: "edge".to_string(),
-                row_count: batch.num_rows() as u64,
-            });
-        }
-    }
-    manifest.write_atomic(path)?;
+    commit_manifest_and_logs(path, &manifest, &[], "schema_migration")?;
     Ok(())
 }
 
-async fn write_lance_batch(path: &Path, batch: RecordBatch) -> Result<()> {
+async fn write_lance_batch(path: &Path, batch: RecordBatch) -> Result<u64> {
     let schema = batch.schema();
     let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
     let uri = path.to_string_lossy().to_string();
@@ -1566,10 +1571,17 @@ async fn write_lance_batch(path: &Path, batch: RecordBatch) -> Result<()> {
         mode: WriteMode::Overwrite,
         ..Default::default()
     };
-    Dataset::write(reader, &uri, Some(write_params))
+    let dataset = Dataset::write(reader, &uri, Some(write_params))
         .await
         .map_err(|e| NanoError::Lance(format!("write error: {}", e)))?;
-    Ok(())
+    Ok(dataset.version().version)
+}
+
+fn now_unix_seconds_string() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string())
 }
 
 fn bootstrap_identity_counters(ir: &SchemaIR, manifest: &mut GraphManifest) {

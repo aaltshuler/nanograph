@@ -13,13 +13,13 @@ use super::super::graph::GraphStorage;
 
 /// Load JSONL-formatted data into a GraphStorage.
 /// Each line is either a node `{"type": "...", "data": {...}}` or edge `{"edge": "...", "from": "...", "to": "..."}`.
-pub fn load_jsonl_data(storage: &mut GraphStorage, data: &str) -> Result<()> {
+pub(crate) fn load_jsonl_data(storage: &mut GraphStorage, data: &str) -> Result<()> {
     load_jsonl_data_with_name_seed(storage, data, None)
 }
 
 /// Load JSONL-formatted data into a GraphStorage with an optional pre-populated
 /// name-to-id mapping for resolving edges that reference existing nodes.
-pub fn load_jsonl_data_with_name_seed(
+pub(crate) fn load_jsonl_data_with_name_seed(
     storage: &mut GraphStorage,
     data: &str,
     name_seed: Option<&HashMap<(String, String), u64>>,
@@ -244,7 +244,7 @@ pub fn load_jsonl_data_with_name_seed(
 }
 
 /// Convert JSON values to an Arrow array based on the target DataType.
-pub fn json_values_to_array(
+pub(crate) fn json_values_to_array(
     values: &[serde_json::Value],
     dt: &DataType,
     nullable: bool,

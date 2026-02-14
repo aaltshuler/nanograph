@@ -1,12 +1,12 @@
 ---
 audience: dev
 status: active
-updated: 2026-02-12
+updated: 2026-02-14
 ---
 
 # NanoGraph — Database Features
 
-Current version: `v0.4.1`
+Current version: `v0.5.0`
 
 Detailed execution checklist: `docs/dev/execution-checklist.md`
 
@@ -76,10 +76,11 @@ Detailed execution checklist: `docs/dev/execution-checklist.md`
 |---------|--------|-------|
 | `nanograph init` | Done | Create DB from schema |
 | `nanograph load` | Done | Load JSONL with explicit mode |
-| `nanograph check` | Done | Validate schema + query files |
-| `nanograph run` | Done | Execute queries (read + mutation), DB and legacy modes |
+| `nanograph check` | Done | Validate query files against DB catalog |
+| `nanograph run` | Done | Execute queries (read + mutation) in DB mode |
 | `nanograph migrate` | Done | Schema evolution with `--dry-run`, `--auto-approve`, `--format` |
 | `nanograph delete` | Done | Predicate-based node deletion with edge cascade |
+| `nanograph cdc-materialize` | Done | Optional CDC analytics materializer (`__cdc_analytics`) with threshold/force controls; correctness path stays on JSONL |
 
 ---
 

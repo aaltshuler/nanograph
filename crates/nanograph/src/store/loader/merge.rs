@@ -1,17 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array,
     Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array, UInt64Array, UInt64Builder,
 };
 use arrow::datatypes::DataType;
-use arrow::record_batch::RecordBatchIterator;
-use futures::StreamExt;
-use lance::Dataset;
-use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams};
 
 use crate::catalog::schema_ir::SchemaIR;
 use crate::error::{NanoError, Result};
@@ -21,7 +16,7 @@ use super::constraints::key_value_string;
 use super::jsonl::json_values_to_array;
 
 pub(crate) async fn merge_storage_with_node_keys(
-    db_path: &Path,
+    _db_path: &Path,
     existing: &GraphStorage,
     incoming: &GraphStorage,
     schema_ir: &SchemaIR,
@@ -39,14 +34,11 @@ pub(crate) async fn merge_storage_with_node_keys(
 
         if let Some(key_prop) = key_props.get(&node_def.name) {
             let (merged_batch, remap) = merge_keyed_node_batches_storage_native(
-                db_path,
-                node_def.type_id,
                 existing_batch.as_ref(),
                 incoming_batch.as_ref(),
                 key_prop,
                 &mut next_node_id,
-            )
-            .await?;
+            )?;
             id_remap_by_type.insert(node_def.name.clone(), remap);
             if let Some(batch) = merged_batch {
                 merged.load_node_batch(&node_def.name, batch)?;
@@ -203,9 +195,7 @@ pub(crate) fn append_storage(
     Ok(appended)
 }
 
-async fn merge_keyed_node_batches_storage_native(
-    db_path: &Path,
-    node_type_id: u32,
+fn merge_keyed_node_batches_storage_native(
     existing: Option<&RecordBatch>,
     incoming: Option<&RecordBatch>,
     key_prop: &str,
@@ -228,14 +218,7 @@ async fn merge_keyed_node_batches_storage_native(
 
             let (source_batch, remap) =
                 rewrite_incoming_keyed_ids(existing, incoming, key_prop, next_node_id)?;
-            let merged_batch = run_lance_merge_insert_temp(
-                db_path,
-                node_type_id,
-                existing,
-                source_batch,
-                key_prop,
-            )
-            .await?;
+            let merged_batch = run_keyed_merge_insert_in_memory(existing, source_batch, key_prop)?;
             Ok((Some(merged_batch), remap))
         }
     }
@@ -319,94 +302,73 @@ fn rewrite_incoming_keyed_ids(
     Ok((rewritten, remap))
 }
 
-async fn run_lance_merge_insert_temp(
-    db_path: &Path,
-    node_type_id: u32,
+fn run_keyed_merge_insert_in_memory(
     existing: &RecordBatch,
     source_batch: RecordBatch,
     key_prop: &str,
 ) -> Result<RecordBatch> {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let tmp_root = db_path.join(".tmp");
-    std::fs::create_dir_all(&tmp_root)?;
-    let tmp_dataset_path = tmp_root.join(format!(
-        "merge_{:08x}_{}_{}",
-        node_type_id,
-        std::process::id(),
-        nanos
-    ));
+    let schema = existing.schema();
+    if source_batch.schema().fields() != schema.fields() {
+        return Err(NanoError::Storage(format!(
+            "schema mismatch while keyed merge on {}",
+            key_prop
+        )));
+    }
 
-    let merge_result = async {
-        write_lance_batch_for_merge(&tmp_dataset_path, existing.clone()).await?;
-        let uri = tmp_dataset_path.to_string_lossy().to_string();
-        let dataset = Dataset::open(&uri)
-            .await
-            .map_err(|e| NanoError::Lance(format!("merge insert open error: {}", e)))?;
+    let key_idx = schema
+        .index_of(key_prop)
+        .map_err(|e| NanoError::Storage(format!("missing key property {}: {}", key_prop, e)))?;
 
-        let mut builder =
-            MergeInsertBuilder::try_new(Arc::new(dataset), vec![key_prop.to_string()])
-                .map_err(|e| NanoError::Lance(format!("merge insert builder error: {}", e)))?;
-        builder
-            .when_matched(WhenMatched::UpdateAll)
-            .when_not_matched(WhenNotMatched::InsertAll);
+    let mut key_to_row: HashMap<String, usize> = HashMap::new();
+    let mut out_rows: Vec<Vec<serde_json::Value>> =
+        Vec::with_capacity(existing.num_rows() + source_batch.num_rows());
 
-        let source_schema = source_batch.schema();
-        let source = Box::new(RecordBatchIterator::new(
-            vec![Ok(source_batch)].into_iter(),
-            source_schema,
-        ));
+    for row in 0..existing.num_rows() {
+        let key = key_value_string(existing.column(key_idx), row, key_prop)?;
+        if key_to_row.insert(key.clone(), row).is_some() {
+            return Err(NanoError::Storage(format!(
+                "existing data contains duplicate @key value '{}' for {}",
+                key, key_prop
+            )));
+        }
+        let mut values = Vec::with_capacity(existing.num_columns());
+        for col in existing.columns() {
+            values.push(array_value_to_json(col, row));
+        }
+        out_rows.push(values);
+    }
 
-        let job = builder
-            .try_build()
-            .map_err(|e| NanoError::Lance(format!("merge insert build error: {}", e)))?;
-        let (merged_dataset, _) = job
-            .execute_reader(source)
-            .await
-            .map_err(|e| NanoError::Lance(format!("merge insert execute error: {}", e)))?;
-
-        let scanner = merged_dataset.scan();
-        let batches: Vec<RecordBatch> = scanner
-            .try_into_stream()
-            .await
-            .map_err(|e| NanoError::Lance(format!("merge insert scan error: {}", e)))?
-            .map(|b| b.map_err(|e| NanoError::Lance(format!("merge insert stream error: {}", e))))
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>>>()?;
-
-        if batches.is_empty() {
-            Ok(RecordBatch::new_empty(existing.schema()))
-        } else if batches.len() == 1 {
-            Ok(batches[0].clone())
+    for row in 0..source_batch.num_rows() {
+        let key = key_value_string(source_batch.column(key_idx), row, key_prop)?;
+        let mut values = Vec::with_capacity(source_batch.num_columns());
+        for col in source_batch.columns() {
+            values.push(array_value_to_json(col, row));
+        }
+        if let Some(existing_row) = key_to_row.get(&key).copied() {
+            out_rows[existing_row] = values;
         } else {
-            let schema = existing.schema();
-            arrow::compute::concat_batches(&schema, &batches)
-                .map_err(|e| NanoError::Storage(format!("merge keyed concat error: {}", e)))
+            let new_row = out_rows.len();
+            key_to_row.insert(key, new_row);
+            out_rows.push(values);
         }
     }
-    .await;
 
-    let _ = std::fs::remove_dir_all(&tmp_dataset_path);
-    merge_result
-}
+    if out_rows.is_empty() {
+        return Ok(RecordBatch::new_empty(schema));
+    }
 
-async fn write_lance_batch_for_merge(path: &Path, batch: RecordBatch) -> Result<()> {
-    let schema = batch.schema();
-    let uri = path.to_string_lossy().to_string();
-    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
-    let write_params = WriteParams {
-        mode: WriteMode::Overwrite,
-        ..Default::default()
-    };
+    let mut out_columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+    for (col_idx, field) in schema.fields().iter().enumerate() {
+        let values = out_rows
+            .iter()
+            .map(|row| row[col_idx].clone())
+            .collect::<Vec<_>>();
+        let arr = json_values_to_array(&values, field.data_type(), field.is_nullable())?;
+        out_columns.push(arr);
+    }
 
-    Dataset::write(reader, &uri, Some(write_params))
-        .await
-        .map_err(|e| NanoError::Lance(format!("merge insert write error: {}", e)))?;
-    Ok(())
+    RecordBatch::try_new(schema, out_columns)
+        .map_err(|e| NanoError::Storage(format!("merge keyed batch error: {}", e)))
 }
 
 fn reassign_node_ids(
@@ -457,6 +419,10 @@ fn merge_edge_batches(
     let remapped_incoming = incoming
         .map(|batch| remap_edge_batch_endpoints(batch, src_remap, dst_remap, edge_name))
         .transpose()?;
+
+    if remapped_incoming.is_none() {
+        return Ok(remapped_existing);
+    }
 
     let schema = remapped_incoming
         .as_ref()
@@ -738,6 +704,22 @@ mod tests {
         .unwrap()
     }
 
+    fn node_batch_with_age(ids: Vec<u64>, names: Vec<&str>, ages: Vec<i32>) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::UInt64, false),
+                Field::new("name", DataType::Utf8, false),
+                Field::new("age", DataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(UInt64Array::from(ids)) as ArrayRef,
+                Arc::new(StringArray::from(names)) as ArrayRef,
+                Arc::new(Int32Array::from(ages)) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    }
+
     #[test]
     fn reassign_node_ids_rewrites_ids_and_returns_remap() {
         let batch = node_batch(vec![7, 8], vec!["Alice", "Bob"]);
@@ -787,6 +769,50 @@ mod tests {
         let err =
             rewrite_incoming_keyed_ids(&existing, &incoming, "name", &mut next_id).unwrap_err();
         assert!(err.to_string().contains("duplicate @key"));
+    }
+
+    #[test]
+    fn run_keyed_merge_insert_in_memory_updates_and_inserts() {
+        let existing = node_batch_with_age(vec![10, 11], vec!["Alice", "Bob"], vec![30, 40]);
+        let incoming = node_batch_with_age(vec![1, 2], vec!["Alice", "Cara"], vec![31, 22]);
+        let mut next_id = 50;
+        let (source_batch, remap) =
+            rewrite_incoming_keyed_ids(&existing, &incoming, "name", &mut next_id).unwrap();
+        assert_eq!(remap.get(&1), Some(&10));
+        assert_eq!(remap.get(&2), Some(&50));
+
+        let merged = run_keyed_merge_insert_in_memory(&existing, source_batch, "name").unwrap();
+        assert_eq!(merged.num_rows(), 3);
+
+        let ids = merged
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let names = merged
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let ages = merged
+            .column_by_name("age")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let mut by_name = HashMap::new();
+        for row in 0..merged.num_rows() {
+            by_name.insert(
+                names.value(row).to_string(),
+                (ids.value(row), ages.value(row)),
+            );
+        }
+
+        assert_eq!(by_name.get("Alice"), Some(&(10, 31)));
+        assert_eq!(by_name.get("Bob"), Some(&(11, 40)));
+        assert_eq!(by_name.get("Cara"), Some(&(50, 22)));
     }
 
     #[test]

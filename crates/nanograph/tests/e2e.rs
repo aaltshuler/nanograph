@@ -6,18 +6,18 @@ use arrow::datatypes::{DataType, Field, Schema};
 use lance::Dataset;
 use lance_index::DatasetIndexExt;
 
-use nanograph::catalog::build_catalog;
-use nanograph::catalog::schema_ir::SchemaIR;
-use nanograph::ir::ParamMap;
-use nanograph::ir::lower::{lower_mutation_query, lower_query};
-use nanograph::plan::physical::{MutationExecResult, execute_mutation};
-use nanograph::plan::planner::execute_query;
 use nanograph::query::parser::parse_query;
 use nanograph::query::typecheck::{CheckedQuery, typecheck_query, typecheck_query_decl};
 use nanograph::schema::parser::parse_schema;
+use nanograph::schema_ir::SchemaIR;
 use nanograph::store::database::Database;
-use nanograph::store::graph::GraphStorage;
-use nanograph::store::indexing::scalar_index_name;
+use nanograph::store::manifest::GraphManifest;
+use nanograph::store::txlog::read_visible_cdc_entries;
+use nanograph::store::{GraphStorage, scalar_index_name};
+use nanograph::{
+    MutationExecResult, ParamMap, build_catalog, execute_mutation, execute_query,
+    lower_mutation_query, lower_query,
+};
 
 fn test_schema() -> &'static str {
     r#"
@@ -140,6 +140,15 @@ fn setup_storage() -> Arc<GraphStorage> {
     Arc::new(storage)
 }
 
+fn manifest_dataset_version(manifest: &GraphManifest, kind: &str, type_name: &str) -> u64 {
+    manifest
+        .datasets
+        .iter()
+        .find(|entry| entry.kind == kind && entry.type_name == type_name)
+        .map(|entry| entry.dataset_version)
+        .unwrap()
+}
+
 async fn run_query_test(query_str: &str, storage: Arc<GraphStorage>) -> Vec<RecordBatch> {
     run_query_test_with_params(query_str, storage, &ParamMap::new()).await
 }
@@ -216,24 +225,6 @@ fn extract_string_pairs(
         for i in 0..batch.num_rows() {
             if !left.is_null(i) && !right.is_null(i) {
                 result.push((left.value(i).to_string(), right.value(i).to_string()));
-            }
-        }
-    }
-    result
-}
-
-#[allow(dead_code)]
-fn extract_i32_column(batches: &[RecordBatch], col_name: &str) -> Vec<Option<i32>> {
-    let mut result = Vec::new();
-    for batch in batches {
-        let col_idx = batch.schema().index_of(col_name).unwrap();
-        let col = batch.column(col_idx);
-        let arr = col.as_any().downcast_ref::<Int32Array>().unwrap();
-        for i in 0..arr.len() {
-            if arr.is_null(i) {
-                result.push(None);
-            } else {
-                result.push(Some(arr.value(i)));
             }
         }
     }
@@ -829,6 +820,41 @@ query q() {
 }
 
 #[tokio::test]
+async fn test_insert_edge_mutation_query() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let mut db = Database::init(&db_path, test_schema()).await.unwrap();
+    db.load(test_data()).await.unwrap();
+
+    let mut params = ParamMap::new();
+    params.insert(
+        "from".to_string(),
+        nanograph::query::ast::Literal::String("Bob".to_string()),
+    );
+    params.insert(
+        "to".to_string(),
+        nanograph::query::ast::Literal::String("Charlie".to_string()),
+    );
+
+    let result = run_db_mutation_test_with_params(
+        r#"
+query add_knows($from: String, $to: String) {
+    insert Knows {
+        from: $from
+        to: $to
+    }
+}
+"#,
+        &mut db,
+        &params,
+    )
+    .await;
+    assert_eq!(result.affected_nodes, 0);
+    assert_eq!(result.affected_edges, 1);
+    assert_eq!(db.storage.edge_segments["Knows"].edge_ids.len(), 4);
+}
+
+#[tokio::test]
 async fn test_update_mutation_query_preserves_id_and_edges() {
     let dir = tempfile::TempDir::new().unwrap();
     let db_path = dir.path().join("db");
@@ -836,6 +862,7 @@ async fn test_update_mutation_query_preserves_id_and_edges() {
         .await
         .unwrap();
     db.load(keyed_mutation_data()).await.unwrap();
+    let manifest_before = GraphManifest::read(&db_path).unwrap();
 
     let before = db.storage.get_all_nodes("Person").unwrap().unwrap();
     let before_ids = before
@@ -900,6 +927,53 @@ query update_person($name: String, $age: I32) {
         .unwrap();
     assert_eq!(after_ids.value(alice_after), alice_id_before);
     assert_eq!(after_ages.value(alice_after), 31);
+    assert_eq!(db.storage.edge_segments["Knows"].edge_ids.len(), 1);
+    let manifest_after = GraphManifest::read(&db_path).unwrap();
+    assert!(
+        manifest_dataset_version(&manifest_after, "node", "Person")
+            > manifest_dataset_version(&manifest_before, "node", "Person")
+    );
+    assert_eq!(
+        manifest_dataset_version(&manifest_after, "edge", "Knows"),
+        manifest_dataset_version(&manifest_before, "edge", "Knows")
+    );
+
+    let cdc = read_visible_cdc_entries(&db_path, manifest_before.db_version, None).unwrap();
+    assert!(
+        cdc.iter().any(|row| {
+            row.db_version == manifest_after.db_version
+                && row.op == "update"
+                && row.entity_kind == "node"
+                && row.type_name == "Person"
+        }),
+        "expected node update CDC event in latest db version"
+    );
+}
+
+#[tokio::test]
+async fn test_delete_edge_mutation_query() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let mut db = Database::init(&db_path, test_schema()).await.unwrap();
+    db.load(test_data()).await.unwrap();
+
+    let mut params = ParamMap::new();
+    params.insert(
+        "from".to_string(),
+        nanograph::query::ast::Literal::String("Alice".to_string()),
+    );
+    let result = run_db_mutation_test_with_params(
+        r#"
+query delete_knows($from: String) {
+    delete Knows where from = $from
+}
+"#,
+        &mut db,
+        &params,
+    )
+    .await;
+    assert_eq!(result.affected_nodes, 0);
+    assert_eq!(result.affected_edges, 2);
     assert_eq!(db.storage.edge_segments["Knows"].edge_ids.len(), 1);
 }
 

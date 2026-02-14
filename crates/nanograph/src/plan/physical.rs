@@ -19,14 +19,14 @@ use crate::error::{NanoError, Result};
 use crate::ir::{IRAssignment, IRExpr, IRMutationPredicate, MutationIR, MutationOpIR, ParamMap};
 use crate::query::ast::{CompOp, Literal};
 use crate::store::csr::CsrIndex;
-use crate::store::database::{Database, DeleteOp, DeletePredicate, LoadMode};
+use crate::store::database::{Database, DeleteOp, DeletePredicate};
 use crate::store::graph::GraphStorage;
 use crate::types::Direction;
 
 /// Physical execution plan that expands from source nodes along an edge type,
 /// producing new destination struct columns.
 #[derive(Debug)]
-pub struct ExpandExec {
+pub(crate) struct ExpandExec {
     input: Arc<dyn ExecutionPlan>,
     src_var: String,
     dst_var: String,
@@ -41,7 +41,7 @@ pub struct ExpandExec {
 }
 
 impl ExpandExec {
-    pub fn new(
+    pub(crate) fn new(
         input: Arc<dyn ExecutionPlan>,
         src_var: String,
         dst_var: String,
@@ -504,6 +504,18 @@ async fn execute_insert_mutation(
     assignments: &[IRAssignment],
     params: &ParamMap,
 ) -> Result<MutationExecResult> {
+    let is_node_type = db.catalog.node_types.contains_key(type_name);
+    let is_edge_type = db.catalog.edge_types.contains_key(type_name);
+    if is_edge_type {
+        return execute_insert_edge_mutation(db, type_name, assignments, params).await;
+    }
+    if !is_node_type {
+        return Err(NanoError::Execution(format!(
+            "unknown mutation target type `{}`",
+            type_name
+        )));
+    }
+
     let mut data = serde_json::Map::new();
     for assignment in assignments {
         let lit = resolve_mutation_literal(&assignment.value, params)?;
@@ -514,10 +526,65 @@ async fn execute_insert_mutation(
         "data": data
     })
     .to_string();
-    db.load_with_mode(&line, LoadMode::Append).await?;
+    db.apply_append_mutation(&line, "mutation:insert_node")
+        .await?;
     Ok(MutationExecResult {
         affected_nodes: 1,
         affected_edges: 0,
+    })
+}
+
+async fn execute_insert_edge_mutation(
+    db: &mut Database,
+    type_name: &str,
+    assignments: &[IRAssignment],
+    params: &ParamMap,
+) -> Result<MutationExecResult> {
+    let mut from_name: Option<String> = None;
+    let mut to_name: Option<String> = None;
+    let mut data = serde_json::Map::new();
+
+    for assignment in assignments {
+        let lit = resolve_mutation_literal(&assignment.value, params)?;
+        match assignment.property.as_str() {
+            "from" => {
+                from_name = Some(literal_to_endpoint_name(&lit, "from")?);
+            }
+            "to" => {
+                to_name = Some(literal_to_endpoint_name(&lit, "to")?);
+            }
+            _ => {
+                data.insert(assignment.property.clone(), literal_to_json(&lit)?);
+            }
+        }
+    }
+
+    let from = from_name.ok_or_else(|| {
+        NanoError::Execution(format!(
+            "edge insert for `{}` requires endpoint property `from`",
+            type_name
+        ))
+    })?;
+    let to = to_name.ok_or_else(|| {
+        NanoError::Execution(format!(
+            "edge insert for `{}` requires endpoint property `to`",
+            type_name
+        ))
+    })?;
+
+    let line = serde_json::json!({
+        "edge": type_name,
+        "from": from,
+        "to": to,
+        "data": data
+    })
+    .to_string();
+
+    db.apply_append_mutation(&line, "mutation:insert_edge")
+        .await?;
+    Ok(MutationExecResult {
+        affected_nodes: 0,
+        affected_edges: 1,
     })
 }
 
@@ -597,7 +664,8 @@ async fn execute_update_mutation(
     }
 
     let payload = payload_lines.join("\n");
-    db.load_with_mode(&payload, LoadMode::Merge).await?;
+    db.apply_merge_mutation(&payload, "mutation:update_node")
+        .await?;
     Ok(MutationExecResult {
         affected_nodes: matched_rows.len(),
         affected_edges: 0,
@@ -610,10 +678,67 @@ async fn execute_delete_mutation(
     predicate: &IRMutationPredicate,
     params: &ParamMap,
 ) -> Result<MutationExecResult> {
+    if db.catalog.node_types.contains_key(type_name) {
+        let delete_pred = build_delete_predicate(predicate, params)?;
+        let result = db.delete_nodes(type_name, &delete_pred).await?;
+        return Ok(MutationExecResult {
+            affected_nodes: result.deleted_nodes,
+            affected_edges: result.deleted_edges,
+        });
+    }
+
+    if db.catalog.edge_types.contains_key(type_name) {
+        return execute_delete_edge_mutation(db, type_name, predicate, params).await;
+    }
+
+    Err(NanoError::Execution(format!(
+        "unknown mutation target type `{}`",
+        type_name
+    )))
+}
+
+async fn execute_delete_edge_mutation(
+    db: &mut Database,
+    type_name: &str,
+    predicate: &IRMutationPredicate,
+    params: &ParamMap,
+) -> Result<MutationExecResult> {
+    let edge_type = db
+        .catalog
+        .edge_types
+        .get(type_name)
+        .ok_or_else(|| NanoError::Execution(format!("unknown edge type `{}`", type_name)))?;
+    let src_type = edge_type.from_type.clone();
+    let dst_type = edge_type.to_type.clone();
+
     let delete_pred = build_delete_predicate(predicate, params)?;
-    let result = db.delete_nodes(type_name, &delete_pred).await?;
+    let mapped_pred = match predicate.property.as_str() {
+        "from" => {
+            let endpoint = resolve_mutation_literal(&predicate.value, params)?;
+            let endpoint_name = literal_to_endpoint_name(&endpoint, "from")?;
+            let src_id = resolve_node_id_by_name(db, &src_type, &endpoint_name)?;
+            DeletePredicate {
+                property: "src".to_string(),
+                op: delete_pred.op,
+                value: src_id.to_string(),
+            }
+        }
+        "to" => {
+            let endpoint = resolve_mutation_literal(&predicate.value, params)?;
+            let endpoint_name = literal_to_endpoint_name(&endpoint, "to")?;
+            let dst_id = resolve_node_id_by_name(db, &dst_type, &endpoint_name)?;
+            DeletePredicate {
+                property: "dst".to_string(),
+                op: delete_pred.op,
+                value: dst_id.to_string(),
+            }
+        }
+        _ => delete_pred,
+    };
+
+    let result = db.delete_edges(type_name, &mapped_pred).await?;
     Ok(MutationExecResult {
-        affected_nodes: result.deleted_nodes,
+        affected_nodes: 0,
         affected_edges: result.deleted_edges,
     })
 }
@@ -679,11 +804,65 @@ fn literal_to_predicate_string(lit: &Literal) -> Result<String> {
     }
 }
 
+fn literal_to_endpoint_name(lit: &Literal, endpoint: &str) -> Result<String> {
+    match lit {
+        Literal::String(s) => Ok(s.clone()),
+        _ => Err(NanoError::Execution(format!(
+            "edge endpoint `{}` must be a String literal or String parameter",
+            endpoint
+        ))),
+    }
+}
+
 fn find_key_property(db: &Database, type_name: &str) -> Option<String> {
     db.schema_ir
         .node_types()
         .find(|n| n.name == type_name)
         .and_then(|n| n.properties.iter().find(|p| p.key).map(|p| p.name.clone()))
+}
+
+fn resolve_node_id_by_name(db: &Database, node_type: &str, node_name: &str) -> Result<u64> {
+    let batch = db.storage.get_all_nodes(node_type)?.ok_or_else(|| {
+        NanoError::Execution(format!(
+            "edge endpoint lookup failed: node type `{}` has no rows",
+            node_type
+        ))
+    })?;
+
+    let id_col = batch
+        .column_by_name("id")
+        .ok_or_else(|| NanoError::Execution("node batch missing id column".to_string()))?
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| NanoError::Execution("node id column is not UInt64".to_string()))?;
+
+    let name_col = batch
+        .column_by_name("name")
+        .ok_or_else(|| {
+            NanoError::Execution(format!(
+                "edge endpoint lookup requires node type `{}` to have `name` property",
+                node_type
+            ))
+        })?
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            NanoError::Execution(format!(
+                "edge endpoint lookup requires `{}`.name to be String",
+                node_type
+            ))
+        })?;
+
+    for row in 0..batch.num_rows() {
+        if !name_col.is_null(row) && name_col.value(row) == node_name {
+            return Ok(id_col.value(row));
+        }
+    }
+
+    Err(NanoError::Execution(format!(
+        "edge endpoint node not found: {}:{}",
+        node_type, node_name
+    )))
 }
 
 fn array_value_to_json(array: &ArrayRef, row: usize) -> serde_json::Value {
