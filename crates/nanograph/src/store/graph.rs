@@ -70,7 +70,7 @@ impl GraphStorage {
             for (prop_name, prop_type) in &edge_type.properties {
                 fields.push(Field::new(
                     prop_name,
-                    prop_type.scalar.to_arrow(),
+                    prop_type.to_arrow(),
                     prop_type.nullable,
                 ));
             }

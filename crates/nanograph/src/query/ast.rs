@@ -123,6 +123,9 @@ pub enum Literal {
     Integer(i64),
     Float(f64),
     Bool(bool),
+    Date(String),
+    DateTime(String),
+    List(Vec<Literal>),
 }
 
 #[derive(Debug, Clone)]

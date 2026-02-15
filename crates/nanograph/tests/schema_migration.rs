@@ -17,7 +17,7 @@ use nanograph::store::txlog::read_tx_catalog_entries;
 fn base_schema() -> &'static str {
     r#"
 node User {
-    name: String
+    name: String @key
     age: I32?
 }
 edge Knows: User -> User
@@ -77,7 +77,7 @@ edge Knows: User -> User
 fn rebind_base_schema() -> &'static str {
     r#"
 node User {
-    name: String
+    name: String @key
 }
 node Company {
     name: String
@@ -110,10 +110,10 @@ fn rebind_data() -> &'static str {
 fn drop_type_base_schema() -> &'static str {
     r#"
 node User {
-    name: String
+    name: String @key
 }
 node Company {
-    name: String
+    name: String @key
 }
 edge WorksAt: User -> Company
 "#

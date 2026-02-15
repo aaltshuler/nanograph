@@ -1,17 +1,27 @@
 # nanograph
 
-A local-first, embedded, strongly-typed property graph database in Rust. Think SQLite/DuckDB, but for graphs.
+On-device property graph database. No server, no cloud, no connection strings. Think DuckDB, but for graphs.
 
-Arrow-native execution, Lance/Parquet storage, schema-first design.
+Schema-as-code, compile-time validated, Arrow-native.
 
-## Key ideas
+## Use cases
 
-- **Schema-first** -- define node/edge types and properties up front. Queries are validated before they run.
-- **Embedded** -- no server. A library you link or a CLI you run. Single-machine, offline-capable.
+- **Local first context graph**
+- **Memory layer for AI agents**
+- **Dependency & lineage graph**
+- **Personal knowledge graph (PKM)**
+- **Indexing & ontology layer for Obsidian**
+- **Analytics & domain exploration**
+
+## Key benefits
+
+- **Schema-as-code** -- schema files live in your repo, version with git, review in PRs. No "property not found" at runtime. Ever.
+- **Local-first** -- no server. A library you link or a CLI you run. Works offline, works in CI, works on a plane.
 - **CLI workflow** -- `nanograph init` / `load` / `check` / `run`. DB as a build artifact, not a service.
 - **Graph-native operators** -- traversal, neighbor expansion, and path primitives are first-class, not bolted onto relational joins.
 - **Columnar execution** -- batch/vectorized through Arrow RecordBatches. Results integrate naturally with the Arrow ecosystem.
-- **Lance + Parquet storage** -- Lance as the operational format, Parquet as the interchange format.
+- **Built-in CDC** -- every mutation is logged to a commit-gated journal. Replay decision traces, sync downstream, or audit changes from any version.
+- **Fast** -- Rust, Arrow columnar execution, Lance storage with scalar indexes. Sub-millisecond opens, vectorized scans, zero cold-start.
 
 ## Quick start
 
@@ -23,7 +33,7 @@ cargo build
 nanograph init my.nanograph --schema schema.pg
 
 # Load data
-nanograph load my.nanograph --data data.jsonl
+nanograph load my.nanograph --data data.jsonl --mode overwrite
 
 # Typecheck queries
 nanograph check --db my.nanograph --query queries.gq
@@ -32,20 +42,29 @@ nanograph check --db my.nanograph --query queries.gq
 nanograph run --db my.nanograph --query queries.gq --name my_query
 ```
 
-## Testing
+See `examples/starwars/` for a ready-to-run demo (66 nodes, 146 edges, 27 queries).
 
-```bash
-# Engine + library tests
-cargo test -p nanograph
-cargo test -p nanograph-cli
+## Schema language
 
-# CLI end-to-end scenarios
-bash tests/cli/run-cli-e2e.sh
+Schema files are source code — version them with git, review them in PRs, catch relationship bugs at compile time.
+
 ```
+node Character {
+    slug: String @key
+    name: String
+    alignment: enum(hero, villain, neutral)
+    era: enum(prequel, original, sequel)
+    tags: [String]?
+}
 
-Test framework details: `test-framework.md`.
+node Film {
+    slug: String @key
+    name: String
+    release_date: Date
+}
 
-Documentation index: `docs/README.md`.
+edge DebutsIn: Character -> Film
+```
 
 ## Query language
 
@@ -61,6 +80,42 @@ query friends_of($name: String) {
 }
 ```
 
+Mutations are first-class:
+
+```
+query add_person($name: String, $age: I32) {
+    insert Person { name: $name, age: $age }
+}
+
+query update_age($name: String, $age: I32) {
+    update Person set { age: $age } where name = $name
+}
+
+query remove_person($name: String) {
+    delete Person where name = $name
+}
+```
+
+## Change tracking
+
+Every mutation is logged to a commit-gated CDC journal. Replay changes since any version:
+
+```bash
+nanograph changes my.nanograph --since 3 --format jsonl
+nanograph changes my.nanograph --from 1 --to 5 --format json
+```
+
+## Testing
+
+```bash
+# Engine + library tests
+cargo test -p nanograph
+cargo test -p nanograph-cli
+
+# CLI end-to-end scenarios
+bash tests/cli/run-cli-e2e.sh
+```
+
 ## Origin
 
-Born from using DuckDB as a ledger for Claude Code projects -- the same instant-open, single-file, zero-infra experience, applied to property graphs and agentic memory.
+Inspired by using DuckDB as a ledger for Claude Code projects -- the same instant-open, zero-infra experience, applied to property graphs and agentic memory.

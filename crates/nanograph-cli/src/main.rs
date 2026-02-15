@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
@@ -19,6 +20,7 @@ use nanograph::store::database::{
     CdcAnalyticsMaterializeOptions, CleanupOptions, CompactOptions, Database, DeleteOp,
     DeletePredicate, LoadMode,
 };
+use nanograph::store::manifest::GraphManifest;
 use nanograph::store::migration::{
     MigrationExecution, MigrationPlan, MigrationStatus, MigrationStep, execute_schema_migration,
 };
@@ -44,6 +46,30 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Show binary and optional database manifest version information
+    Version {
+        /// Optional database directory for manifest/db version details
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+    /// Describe database schema, manifest, and dataset summaries
+    Describe {
+        /// Database directory
+        #[arg(long)]
+        db: PathBuf,
+        /// Output format: table or json
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
+    /// Export full graph as JSONL or JSON (nodes first, then edges)
+    Export {
+        /// Database directory
+        #[arg(long)]
+        db: PathBuf,
+        /// Output format: jsonl or json
+        #[arg(long, default_value = "jsonl")]
+        format: String,
+    },
     /// Initialize a new database
     Init {
         /// Path to the database directory
@@ -194,6 +220,9 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Version { db } => cmd_version(db, cli.json).await,
+        Commands::Describe { db, format } => cmd_describe(db, &format, cli.json).await,
+        Commands::Export { db, format } => cmd_export(db, &format, cli.json).await,
         Commands::Init { db_path, schema } => cmd_init(&db_path, &schema, cli.json).await,
         Commands::Load {
             db_path,
@@ -373,6 +402,469 @@ fn migration_step_kind(step: &MigrationStep) -> &'static str {
         MigrationStep::AlterPropertyType { .. } => "AlterPropertyType",
         MigrationStep::AlterPropertyNullability { .. } => "AlterPropertyNullability",
         MigrationStep::RebindEdgeEndpoints { .. } => "RebindEdgeEndpoints",
+    }
+}
+
+#[instrument(fields(db = ?db_path.as_ref().map(|p| p.display().to_string())))]
+async fn cmd_version(db_path: Option<PathBuf>, json: bool) -> Result<()> {
+    let payload = build_version_payload(db_path.as_deref())?;
+
+    if json {
+        let out =
+            serde_json::to_string_pretty(&payload).wrap_err("failed to serialize version JSON")?;
+        println!("{}", out);
+        return Ok(());
+    }
+
+    print_version_table(&payload);
+    Ok(())
+}
+
+fn build_version_payload(db_path: Option<&Path>) -> Result<serde_json::Value> {
+    let mut payload = serde_json::json!({
+        "binary_version": env!("CARGO_PKG_VERSION"),
+    });
+
+    if let Some(path) = db_path {
+        let manifest = GraphManifest::read(path)?;
+        let dataset_versions = manifest
+            .datasets
+            .iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "kind": entry.kind,
+                    "type_name": entry.type_name,
+                    "type_id": entry.type_id,
+                    "dataset_path": entry.dataset_path,
+                    "dataset_version": entry.dataset_version,
+                    "row_count": entry.row_count,
+                })
+            })
+            .collect::<Vec<_>>();
+        payload["db"] = serde_json::json!({
+            "path": path.display().to_string(),
+            "format_version": manifest.format_version,
+            "db_version": manifest.db_version,
+            "last_tx_id": manifest.last_tx_id,
+            "committed_at": manifest.committed_at,
+            "schema_ir_hash": manifest.schema_ir_hash,
+            "schema_identity_version": manifest.schema_identity_version,
+            "next_node_id": manifest.next_node_id,
+            "next_edge_id": manifest.next_edge_id,
+            "next_type_id": manifest.next_type_id,
+            "next_prop_id": manifest.next_prop_id,
+            "dataset_count": manifest.datasets.len(),
+            "dataset_versions": dataset_versions,
+        });
+    }
+
+    Ok(payload)
+}
+
+fn print_version_table(payload: &serde_json::Value) {
+    println!(
+        "nanograph {}",
+        payload["binary_version"].as_str().unwrap_or_default()
+    );
+    if let Some(db) = payload.get("db") {
+        println!("Database: {}", db["path"].as_str().unwrap_or_default());
+        println!(
+            "Manifest: format v{}, db_version {}",
+            db["format_version"].as_u64().unwrap_or(0),
+            db["db_version"].as_u64().unwrap_or(0)
+        );
+        println!(
+            "Last TX: {} @ {}",
+            db["last_tx_id"].as_str().unwrap_or_default(),
+            db["committed_at"].as_str().unwrap_or_default()
+        );
+        println!(
+            "Schema hash: {} (identity v{})",
+            db["schema_ir_hash"].as_str().unwrap_or_default(),
+            db["schema_identity_version"].as_u64().unwrap_or(0)
+        );
+        println!(
+            "Next IDs: node={} edge={} type={} prop={}",
+            db["next_node_id"].as_u64().unwrap_or(0),
+            db["next_edge_id"].as_u64().unwrap_or(0),
+            db["next_type_id"].as_u64().unwrap_or(0),
+            db["next_prop_id"].as_u64().unwrap_or(0)
+        );
+        println!("Datasets: {}", db["dataset_count"].as_u64().unwrap_or(0));
+        if let Some(entries) = db["dataset_versions"].as_array() {
+            for entry in entries {
+                println!(
+                    "  - {} {}: v{} (rows={})",
+                    entry["kind"].as_str().unwrap_or_default(),
+                    entry["type_name"].as_str().unwrap_or_default(),
+                    entry["dataset_version"].as_u64().unwrap_or(0),
+                    entry["row_count"].as_u64().unwrap_or(0),
+                );
+            }
+        }
+    }
+}
+
+#[instrument(fields(db_path = %db_path.display(), format = format))]
+async fn cmd_describe(db_path: PathBuf, format: &str, json: bool) -> Result<()> {
+    let db = Database::open(&db_path).await?;
+    let manifest = GraphManifest::read(&db_path)?;
+    let payload = build_describe_payload(&db_path, &db, &manifest)?;
+    let effective_format = if json { "json" } else { format };
+
+    match effective_format {
+        "json" => {
+            let out = serde_json::to_string_pretty(&payload)
+                .wrap_err("failed to serialize describe JSON")?;
+            println!("{}", out);
+        }
+        "table" => print_describe_table(&payload),
+        other => return Err(eyre!("unknown format: {} (supported: table, json)", other)),
+    }
+
+    Ok(())
+}
+
+fn build_describe_payload(
+    db_path: &Path,
+    db: &Database,
+    manifest: &GraphManifest,
+) -> Result<serde_json::Value> {
+    let dataset_map = manifest
+        .datasets
+        .iter()
+        .map(|d| ((d.kind.clone(), d.type_name.clone()), d))
+        .collect::<HashMap<_, _>>();
+
+    let mut nodes = Vec::new();
+    for node in db.schema_ir.node_types() {
+        let rows = db
+            .storage
+            .get_all_nodes(&node.name)?
+            .map(|b| b.num_rows() as u64)
+            .unwrap_or(0);
+        let dataset = dataset_map.get(&("node".to_string(), node.name.clone()));
+        let properties = node
+            .properties
+            .iter()
+            .map(|prop| {
+                serde_json::json!({
+                    "name": prop.name,
+                    "prop_id": prop.prop_id,
+                    "type": prop_type_string(prop),
+                    "key": prop.key,
+                    "unique": prop.unique,
+                    "index": prop.index,
+                })
+            })
+            .collect::<Vec<_>>();
+        nodes.push(serde_json::json!({
+            "name": node.name,
+            "type_id": node.type_id,
+            "rows": rows,
+            "dataset_path": dataset.map(|d| d.dataset_path.clone()),
+            "dataset_version": dataset.map(|d| d.dataset_version),
+            "properties": properties,
+        }));
+    }
+
+    let mut edges = Vec::new();
+    for edge in db.schema_ir.edge_types() {
+        let rows = db
+            .storage
+            .edge_batch_for_save(&edge.name)?
+            .map(|b| b.num_rows() as u64)
+            .unwrap_or(0);
+        let dataset = dataset_map.get(&("edge".to_string(), edge.name.clone()));
+        let properties = edge
+            .properties
+            .iter()
+            .map(|prop| {
+                serde_json::json!({
+                    "name": prop.name,
+                    "prop_id": prop.prop_id,
+                    "type": prop_type_string(prop),
+                })
+            })
+            .collect::<Vec<_>>();
+        edges.push(serde_json::json!({
+            "name": edge.name,
+            "type_id": edge.type_id,
+            "src_type": edge.src_type_name,
+            "dst_type": edge.dst_type_name,
+            "rows": rows,
+            "dataset_path": dataset.map(|d| d.dataset_path.clone()),
+            "dataset_version": dataset.map(|d| d.dataset_version),
+            "properties": properties,
+        }));
+    }
+
+    Ok(serde_json::json!({
+        "db_path": db_path.display().to_string(),
+        "binary_version": env!("CARGO_PKG_VERSION"),
+        "manifest": {
+            "format_version": manifest.format_version,
+            "db_version": manifest.db_version,
+            "last_tx_id": manifest.last_tx_id,
+            "committed_at": manifest.committed_at,
+            "schema_ir_hash": manifest.schema_ir_hash,
+            "schema_identity_version": manifest.schema_identity_version,
+            "datasets": manifest.datasets.len(),
+        },
+        "schema_ir_version": db.schema_ir.ir_version,
+        "nodes": nodes,
+        "edges": edges,
+    }))
+}
+
+fn print_describe_table(payload: &serde_json::Value) {
+    println!(
+        "Database: {}",
+        payload["db_path"].as_str().unwrap_or_default()
+    );
+    println!(
+        "Manifest: format v{}, db_version {}",
+        payload["manifest"]["format_version"].as_u64().unwrap_or(0),
+        payload["manifest"]["db_version"].as_u64().unwrap_or(0)
+    );
+    println!(
+        "Last TX: {} @ {}",
+        payload["manifest"]["last_tx_id"]
+            .as_str()
+            .unwrap_or_default(),
+        payload["manifest"]["committed_at"]
+            .as_str()
+            .unwrap_or_default()
+    );
+    println!(
+        "Schema: ir_version {}, hash {}",
+        payload["schema_ir_version"].as_u64().unwrap_or(0),
+        payload["manifest"]["schema_ir_hash"]
+            .as_str()
+            .unwrap_or_default()
+    );
+    println!();
+
+    println!("Node Types");
+    if let Some(nodes) = payload["nodes"].as_array() {
+        for node in nodes {
+            let version = node["dataset_version"]
+                .as_u64()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            println!(
+                "- {} (type_id={}, rows={}, dataset_version={})",
+                node["name"].as_str().unwrap_or_default(),
+                node["type_id"].as_u64().unwrap_or(0),
+                node["rows"].as_u64().unwrap_or(0),
+                version,
+            );
+            if let Some(props) = node["properties"].as_array() {
+                for prop in props {
+                    let mut anns = Vec::new();
+                    if prop["key"].as_bool().unwrap_or(false) {
+                        anns.push("@key");
+                    }
+                    if prop["unique"].as_bool().unwrap_or(false) {
+                        anns.push("@unique");
+                    }
+                    if prop["index"].as_bool().unwrap_or(false) {
+                        anns.push("@index");
+                    }
+                    let ann_suffix = if anns.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {}", anns.join(" "))
+                    };
+                    println!(
+                        "  - {}: {}{}",
+                        prop["name"].as_str().unwrap_or_default(),
+                        prop["type"].as_str().unwrap_or_default(),
+                        ann_suffix
+                    );
+                }
+            }
+        }
+    }
+    println!();
+
+    println!("Edge Types");
+    if let Some(edges) = payload["edges"].as_array() {
+        for edge in edges {
+            let version = edge["dataset_version"]
+                .as_u64()
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            println!(
+                "- {}: {} -> {} (type_id={}, rows={}, dataset_version={})",
+                edge["name"].as_str().unwrap_or_default(),
+                edge["src_type"].as_str().unwrap_or_default(),
+                edge["dst_type"].as_str().unwrap_or_default(),
+                edge["type_id"].as_u64().unwrap_or(0),
+                edge["rows"].as_u64().unwrap_or(0),
+                version,
+            );
+            if let Some(props) = edge["properties"].as_array() {
+                for prop in props {
+                    println!(
+                        "  - {}: {}",
+                        prop["name"].as_str().unwrap_or_default(),
+                        prop["type"].as_str().unwrap_or_default()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[instrument(fields(db_path = %db_path.display(), format = format))]
+async fn cmd_export(db_path: PathBuf, format: &str, json: bool) -> Result<()> {
+    let db = Database::open(&db_path).await?;
+    let rows = build_export_rows(&db)?;
+    let effective_format = if json { "json" } else { format };
+
+    match effective_format {
+        "jsonl" => {
+            for row in rows {
+                println!(
+                    "{}",
+                    serde_json::to_string(&row).wrap_err("failed to serialize export row")?
+                );
+            }
+        }
+        "json" => {
+            let out =
+                serde_json::to_string_pretty(&rows).wrap_err("failed to serialize export JSON")?;
+            println!("{}", out);
+        }
+        other => return Err(eyre!("unknown format: {} (supported: jsonl, json)", other)),
+    }
+
+    Ok(())
+}
+
+fn build_export_rows(db: &Database) -> Result<Vec<serde_json::Value>> {
+    use arrow::array::{Array, StringArray, UInt64Array};
+
+    let mut rows = Vec::new();
+    let mut node_labels: HashMap<String, HashMap<u64, String>> = HashMap::new();
+
+    for node in db.schema_ir.node_types() {
+        let Some(batch) = db.storage.get_all_nodes(&node.name)? else {
+            continue;
+        };
+        let id_arr = batch
+            .column_by_name("id")
+            .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| eyre!("node batch '{}' missing UInt64 id column", node.name))?;
+        let name_arr = batch
+            .column_by_name("name")
+            .and_then(|col| col.as_any().downcast_ref::<StringArray>());
+
+        let mut labels = HashMap::new();
+        for row_idx in 0..batch.num_rows() {
+            let id = id_arr.value(row_idx);
+            let label = name_arr
+                .filter(|arr| !arr.is_null(row_idx))
+                .map(|arr| arr.value(row_idx).to_string())
+                .unwrap_or_else(|| id.to_string());
+            labels.insert(id, label);
+
+            let data = export_data_map(&batch, row_idx, &["id"]);
+            rows.push(serde_json::json!({
+                "type": node.name,
+                "id": id,
+                "data": data,
+            }));
+        }
+        node_labels.insert(node.name.clone(), labels);
+    }
+
+    for edge in db.schema_ir.edge_types() {
+        let Some(batch) = db.storage.edge_batch_for_save(&edge.name)? else {
+            continue;
+        };
+        let id_arr = batch
+            .column_by_name("id")
+            .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| eyre!("edge batch '{}' missing UInt64 id column", edge.name))?;
+        let src_arr = batch
+            .column_by_name("src")
+            .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| eyre!("edge batch '{}' missing UInt64 src column", edge.name))?;
+        let dst_arr = batch
+            .column_by_name("dst")
+            .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
+            .ok_or_else(|| eyre!("edge batch '{}' missing UInt64 dst column", edge.name))?;
+
+        for row_idx in 0..batch.num_rows() {
+            let id = id_arr.value(row_idx);
+            let src = src_arr.value(row_idx);
+            let dst = dst_arr.value(row_idx);
+            let from = node_labels
+                .get(&edge.src_type_name)
+                .and_then(|m| m.get(&src))
+                .cloned()
+                .unwrap_or_else(|| src.to_string());
+            let to = node_labels
+                .get(&edge.dst_type_name)
+                .and_then(|m| m.get(&dst))
+                .cloned()
+                .unwrap_or_else(|| dst.to_string());
+            let data = export_data_map(&batch, row_idx, &["id", "src", "dst"]);
+
+            rows.push(serde_json::json!({
+                "edge": edge.name,
+                "id": id,
+                "from": from,
+                "to": to,
+                "src": src,
+                "dst": dst,
+                "data": data,
+            }));
+        }
+    }
+
+    Ok(rows)
+}
+
+fn export_data_map(
+    batch: &RecordBatch,
+    row_idx: usize,
+    excluded_fields: &[&str],
+) -> serde_json::Value {
+    let excluded = excluded_fields
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect::<std::collections::HashSet<_>>();
+    let mut data = serde_json::Map::new();
+    for (col_idx, field) in batch.schema().fields().iter().enumerate() {
+        if excluded.contains(field.name()) {
+            continue;
+        }
+        data.insert(
+            field.name().clone(),
+            cli_array_value_to_json(batch.column(col_idx), row_idx),
+        );
+    }
+    serde_json::Value::Object(data)
+}
+
+fn prop_type_string(prop: &nanograph::schema_ir::PropDef) -> String {
+    let base = if prop.enum_values.is_empty() {
+        prop.scalar_type.clone()
+    } else {
+        format!("enum({})", prop.enum_values.join(", "))
+    };
+    let wrapped = if prop.list {
+        format!("[{}]", base)
+    } else {
+        base
+    };
+    if prop.nullable {
+        format!("{}?", wrapped)
+    } else {
+        wrapped
     }
 }
 
@@ -1089,7 +1581,7 @@ fn record_batches_to_json_rows(results: &[RecordBatch]) -> Vec<serde_json::Value
 fn cli_array_value_to_json(array: &arrow::array::ArrayRef, row: usize) -> serde_json::Value {
     use arrow::array::{
         Array, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int32Array,
-        Int64Array, StringArray, UInt32Array, UInt64Array,
+        Int64Array, ListArray, StringArray, UInt32Array, UInt64Array,
     };
     use arrow::datatypes::DataType;
 
@@ -1143,12 +1635,34 @@ fn cli_array_value_to_json(array: &arrow::array::ArrayRef, row: usize) -> serde_
         DataType::Date32 => array
             .as_any()
             .downcast_ref::<Date32Array>()
-            .map(|a| serde_json::Value::Number((a.value(row) as i64).into()))
+            .map(|a| {
+                let days = a.value(row);
+                arrow::temporal_conversions::date32_to_datetime(days)
+                    .map(|dt| serde_json::Value::String(dt.format("%Y-%m-%d").to_string()))
+                    .unwrap_or_else(|| serde_json::Value::Number((days as i64).into()))
+            })
             .unwrap_or(serde_json::Value::Null),
         DataType::Date64 => array
             .as_any()
             .downcast_ref::<Date64Array>()
-            .map(|a| serde_json::Value::Number(a.value(row).into()))
+            .map(|a| {
+                let ms = a.value(row);
+                arrow::temporal_conversions::date64_to_datetime(ms)
+                    .map(|dt| serde_json::Value::String(dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()))
+                    .unwrap_or_else(|| serde_json::Value::Number(ms.into()))
+            })
+            .unwrap_or(serde_json::Value::Null),
+        DataType::List(_) => array
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .map(|a| {
+                let values = a.value(row);
+                serde_json::Value::Array(
+                    (0..values.len())
+                        .map(|idx| cli_array_value_to_json(&values, idx))
+                        .collect(),
+                )
+            })
             .unwrap_or(serde_json::Value::Null),
         _ => {
             let display =
@@ -1249,6 +1763,8 @@ fn build_param_map(
                         .map_err(|_| eyre!("param '{}': expected bool, got '{}'", key, value))?;
                     Literal::Bool(b)
                 }
+                "Date" => Literal::Date(value.clone()),
+                "DateTime" => Literal::DateTime(value.clone()),
                 _ => Literal::String(value.clone()),
             }
         } else {
@@ -1263,8 +1779,9 @@ fn build_param_map(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int32Array, StringArray};
+    use arrow::array::{ArrayRef, Date32Array, Date64Array, Int32Array, StringArray};
     use nanograph::store::txlog::read_visible_cdc_entries;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     fn write_file(path: &Path, content: &str) {
@@ -1378,6 +1895,47 @@ mod tests {
                 assert!(force);
             }
             _ => panic!("expected cdc-materialize command"),
+        }
+    }
+
+    #[test]
+    fn parse_metadata_commands_from_cli() {
+        let version = Cli::parse_from(["nanograph", "version", "--db", "/tmp/db"]);
+        match version.command {
+            Commands::Version { db } => assert_eq!(db, Some(PathBuf::from("/tmp/db"))),
+            _ => panic!("expected version command"),
+        }
+
+        let describe = Cli::parse_from([
+            "nanograph",
+            "describe",
+            "--db",
+            "/tmp/db",
+            "--format",
+            "json",
+        ]);
+        match describe.command {
+            Commands::Describe { db, format } => {
+                assert_eq!(db, PathBuf::from("/tmp/db"));
+                assert_eq!(format, "json");
+            }
+            _ => panic!("expected describe command"),
+        }
+
+        let export = Cli::parse_from([
+            "nanograph",
+            "export",
+            "--db",
+            "/tmp/db",
+            "--format",
+            "jsonl",
+        ]);
+        match export.command {
+            Commands::Export { db, format } => {
+                assert_eq!(db, PathBuf::from("/tmp/db"));
+                assert_eq!(format, "jsonl");
+            }
+            _ => panic!("expected export command"),
         }
     }
 
@@ -1515,6 +2073,51 @@ mod tests {
         assert!(run_err.to_string().contains("--db"));
     }
 
+    #[test]
+    fn build_param_map_parses_date_and_datetime_types() {
+        let query_params = vec![
+            nanograph::query::ast::Param {
+                name: "d".to_string(),
+                type_name: "Date".to_string(),
+                nullable: false,
+            },
+            nanograph::query::ast::Param {
+                name: "dt".to_string(),
+                type_name: "DateTime".to_string(),
+                nullable: false,
+            },
+        ];
+        let raw = vec![
+            ("d".to_string(), "2026-02-14".to_string()),
+            ("dt".to_string(), "2026-02-14T10:00:00Z".to_string()),
+        ];
+
+        let params = build_param_map(&query_params, &raw).unwrap();
+        assert!(matches!(
+            params.get("d"),
+            Some(Literal::Date(v)) if v == "2026-02-14"
+        ));
+        assert!(matches!(
+            params.get("dt"),
+            Some(Literal::DateTime(v)) if v == "2026-02-14T10:00:00Z"
+        ));
+    }
+
+    #[test]
+    fn cli_array_value_to_json_formats_temporal_types_as_iso_strings() {
+        let date: ArrayRef = Arc::new(Date32Array::from(vec![Some(20498)]));
+        let dt: ArrayRef = Arc::new(Date64Array::from(vec![Some(1771063200000)]));
+
+        assert_eq!(
+            cli_array_value_to_json(&date, 0),
+            serde_json::Value::String("2026-02-14".to_string())
+        );
+        assert_eq!(
+            cli_array_value_to_json(&dt, 0),
+            serde_json::Value::String("2026-02-14T10:00:00.000Z".to_string())
+        );
+    }
+
     #[tokio::test]
     async fn run_mutation_insert_in_db_mode() {
         let dir = TempDir::new().unwrap();
@@ -1608,5 +2211,63 @@ query add_person($name: String, $age: I32) {
         let db = Database::open(&db_path).await.unwrap();
         let report = db.doctor().await.unwrap();
         assert!(report.tx_rows <= 1);
+    }
+
+    #[tokio::test]
+    async fn version_describe_export_helpers_work_on_real_db() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("db");
+        let schema_path = dir.path().join("schema.pg");
+        let data_path = dir.path().join("data.jsonl");
+
+        write_file(
+            &schema_path,
+            r#"node Person {
+    name: String @key
+}
+edge Knows: Person -> Person"#,
+        );
+        write_file(
+            &data_path,
+            r#"{"type":"Person","data":{"name":"Alice"}}
+{"type":"Person","data":{"name":"Bob"}}
+{"edge":"Knows","from":"Alice","to":"Bob"}"#,
+        );
+
+        cmd_init(&db_path, &schema_path, false).await.unwrap();
+        cmd_load(&db_path, &data_path, LoadModeArg::Overwrite, false)
+            .await
+            .unwrap();
+
+        let version = build_version_payload(Some(&db_path)).unwrap();
+        assert_eq!(
+            version["db"]["db_version"].as_u64(),
+            Some(1),
+            "expected one committed load version"
+        );
+        assert_eq!(version["db"]["dataset_count"].as_u64(), Some(2));
+        assert_eq!(
+            version["db"]["dataset_versions"].as_array().unwrap().len(),
+            2
+        );
+
+        let db = Database::open(&db_path).await.unwrap();
+        let manifest = GraphManifest::read(&db_path).unwrap();
+        let describe = build_describe_payload(&db_path, &db, &manifest).unwrap();
+        assert_eq!(describe["nodes"].as_array().unwrap().len(), 1);
+        assert_eq!(describe["edges"].as_array().unwrap().len(), 1);
+        assert_eq!(describe["nodes"][0]["rows"].as_u64(), Some(2));
+        assert_eq!(describe["edges"][0]["rows"].as_u64(), Some(1));
+
+        let rows = build_export_rows(&db).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(
+            rows.iter()
+                .any(|row| row["type"] == "Person" && row["data"]["name"] == "Alice")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row["edge"] == "Knows" && row["from"] == "Alice" && row["to"] == "Bob")
+        );
     }
 }

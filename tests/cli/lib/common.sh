@@ -73,19 +73,19 @@ assert_contains() {
 create_character_name_keyed_schema() {
     local source_schema="$1"
     local output_schema="$2"
-    info "Preparing keyed Star Wars schema (Character.name @key)..."
+    info "Preparing keyed Star Wars schema (all node name fields @key)..."
     awk '
-        /^node Character[[:space:]]*{/ { in_character = 1; print; next }
-        in_character && /^[[:space:]]*name:[[:space:]]*String[[:space:]]*$/ {
+        /^node[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*{/ { in_node = 1; print; next }
+        in_node && /^[[:space:]]*name:[[:space:]]*String[[:space:]]*$/ {
             print "    name: String @key"
             next
         }
-        in_character && /^}/ { in_character = 0; print; next }
+        in_node && /^}/ { in_node = 0; print; next }
         { print }
     ' "$source_schema" > "$output_schema"
 
     grep -q 'name: String @key' "$output_schema" \
-        || fail "failed to inject @key into Character.name"
+        || fail "failed to inject @key into node name fields"
     pass "Keyed schema generated"
 }
 
@@ -100,9 +100,17 @@ run_query_jsonl() {
     local query_name="$3"
     shift 3
     local out
-    if ! out=$("$NG" run --db "$db" --query "$query_file" --name "$query_name" --format jsonl "$@" 2>/dev/null); then
-        fail "query '$query_name' failed"
+    local err_file
+    err_file="$(mktemp /tmp/nanograph_query_err.XXXXXX)"
+    if ! out=$("$NG" run --db "$db" --query "$query_file" --name "$query_name" --format jsonl "$@" 2>"$err_file"); then
+        echo -e "${RED}✗ query '$query_name' failed${NC}" >&2
+        if [ -s "$err_file" ]; then
+            cat "$err_file" >&2
+        fi
+        rm -f "$err_file"
+        return 1
     fi
+    rm -f "$err_file"
     echo "$out" | sed -n '/^{/p'
 }
 
@@ -112,7 +120,9 @@ run_query_count() {
     local query_name="$3"
     shift 3
     local out
-    out="$(run_query_jsonl "$db" "$query_file" "$query_name" "$@")"
+    if ! out="$(run_query_jsonl "$db" "$query_file" "$query_name" "$@")"; then
+        return 1
+    fi
     if [ -z "$out" ]; then
         echo 0
     else
@@ -123,5 +133,25 @@ run_query_count() {
 json_field() {
     local jsonl="$1"
     local field="$2"
-    echo "$jsonl" | sed -n '/^{/p' | head -n 1 | sed -n "s/.*\"$field\":\"\\([^\"]*\\)\".*/\\1/p"
+    echo "$jsonl" | sed -n '/^{/p' | head -n 1 | perl -MJSON::PP -e '
+use strict;
+use warnings;
+
+my $field = shift @ARGV;
+local $/;
+my $json = <STDIN>;
+exit 0 if !defined($json) || $json eq "";
+
+my $obj = eval { JSON::PP::decode_json($json) };
+exit 0 if $@ || ref($obj) ne "HASH" || !exists $obj->{$field};
+
+my $value = $obj->{$field};
+if (!defined($value)) {
+    print "null";
+} elsif (ref($value)) {
+    print JSON::PP::encode_json($value);
+} else {
+    print $value;
+}
+' "$field"
 }

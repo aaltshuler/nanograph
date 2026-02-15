@@ -1,0 +1,73 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// Omni Context Graph — JSONL Seed Data
+// Complete trace: Intelligence → Enrichment & Screening → Execution
+// 14 nodes, 22 edges
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Actors (2) ────────────────────────────────────────────────
+{"type": "Actor", "data": {"slug": "act-andrew", "name": "Andrew", "actorType": "human", "defaultChannel": "slack", "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z"}}
+{"type": "Actor", "data": {"slug": "act-omnibot", "name": "Omni", "actorType": "agent", "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z"}}
+
+// ── Clients (2) ───────────────────────────────────────────────
+{"type": "Client", "data": {"slug": "cli-jamie-lee", "name": "Jamie Lee", "status": "healthy", "tags": ["connector"], "createdAt": "2026-01-15T00:00:00Z", "updatedAt": "2026-02-08T00:00:00Z"}}
+{"type": "Client", "data": {"slug": "cli-priya-shah", "name": "Priya Shah", "status": "focus", "tags": ["client"], "company": "Stripe", "email": "priya@stripe.com", "createdAt": "2026-02-08T16:00:00Z", "updatedAt": "2026-02-14T00:00:00Z"}}
+
+// ── Records (3) ───────────────────────────────────────────────
+{"type": "Record", "data": {"slug": "rec-coffee-chat", "platform": "internal", "recordType": "meeting", "title": "Coffee Chat with Jamie", "createdAt": "2026-02-08T15:00:00Z", "updatedAt": "2026-02-08T15:00:00Z"}}
+{"type": "Record", "data": {"slug": "rec-enrichment-stripe", "platform": "internal", "recordType": "enrichment", "title": "Stripe - Enrichment Profile", "createdAt": "2026-02-10T09:15:00Z", "updatedAt": "2026-02-10T09:15:00Z"}}
+{"type": "Record", "data": {"slug": "rec-proposal-stripe", "platform": "internal", "recordType": "document", "title": "Stripe Migration Proposal", "createdAt": "2026-02-12T14:00:00Z", "updatedAt": "2026-02-12T14:00:00Z"}}
+
+// ── Opportunities (1) ─────────────────────────────────────────
+{"type": "Opportunity", "data": {"slug": "opp-stripe-migration", "title": "Stripe Migration", "description": "Data platform migration for Stripe engineering team", "dealType": "net_new", "stage": "won", "priority": "high", "risk": "medium", "amount": 25000.0, "currency": "USD", "amountPaid": 15000.0, "closedAt": "2026-02-14T00:00:00Z", "isRecurring": false, "createdAt": "2026-02-08T16:30:00Z", "updatedAt": "2026-02-14T16:00:00Z"}}
+
+// ── Projects (1) ──────────────────────────────────────────────
+{"type": "Project", "data": {"slug": "prj-data-pipeline", "name": "Data Pipeline", "description": "Build and migrate Stripe data pipeline", "status": "active", "engagementType": "dev contract", "startDate": "2026-02-15T00:00:00Z", "createdAt": "2026-02-14T16:00:00Z", "updatedAt": "2026-02-14T16:00:00Z"}}
+
+// ── ActionItems (1) ───────────────────────────────────────────
+{"type": "ActionItem", "data": {"slug": "ai-draft-proposal", "title": "Draft Proposal", "description": "Generate and send proposal for Stripe migration", "status": "completed", "priority": "high", "dueDate": "2026-02-12T00:00:00Z", "createdAt": "2026-02-10T09:30:00Z", "updatedAt": "2026-02-12T14:00:00Z"}}
+
+// ── Signals (1) ───────────────────────────────────────────────
+{"type": "Signal", "data": {"slug": "sig-hates-vendor", "observedAt": "2026-02-08T15:30:00Z", "summary": "Priya hates her current data vendor — actively looking for alternatives", "sentiment": "negative", "urgency": "high", "sourceType": "meeting", "assertion": "fact", "createdAt": "2026-02-08T16:00:00Z"}}
+
+// ── Decisions (1) ─────────────────────────────────────────────
+{"type": "Decision", "data": {"slug": "dec-make-proposal", "decidedAt": "2026-02-10T09:00:00Z", "intent": "Make proposal for Stripe migration", "status": "approved", "domain": "sales", "assertion": "fact", "createdAt": "2026-02-10T09:00:00Z"}}
+
+// ── Policies (2) ──────────────────────────────────────────────
+{"type": "Policy", "data": {"slug": "pol-client-screen-v1", "policyKey": "client-screen", "name": "Screening Policy v1", "effectiveFrom": "2025-06-01T00:00:00Z", "effectiveTo": "2026-01-14T23:59:59Z", "description": "Original client screening criteria — basic revenue threshold only", "tags": ["sales", "screening"], "createdAt": "2025-06-01T00:00:00Z"}}
+{"type": "Policy", "data": {"slug": "pol-client-screen-v2", "policyKey": "client-screen", "name": "Screening Policy", "effectiveFrom": "2026-01-15T00:00:00Z", "description": "Evaluate client fit based on revenue potential, technical alignment, and capacity", "tags": ["sales", "screening"], "createdAt": "2026-01-15T00:00:00Z"}}
+
+// ── Actions (2) ───────────────────────────────────────────────
+{"type": "Action", "data": {"slug": "act-build-profile", "executedAt": "2026-02-10T09:15:00Z", "operation": "create", "success": true, "resultSummary": "Company data compiled, fit score calculated", "createdAt": "2026-02-10T09:15:00Z"}}
+{"type": "Action", "data": {"slug": "act-sent-proposal", "executedAt": "2026-02-12T14:00:00Z", "operation": "send", "success": true, "resultSummary": "Proposal delivered to Priya Shah, deal advanced to won", "createdAt": "2026-02-12T14:00:00Z"}}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EDGES (21 instances across 19 types)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Diagram 1: Intelligence ───────────────────────────────────
+{"edge": "ClientOwnsRecord", "from": "cli-jamie-lee", "to": "rec-coffee-chat"}
+{"edge": "SourcedFrom", "from": "sig-hates-vendor", "to": "rec-coffee-chat", "data": {"extractionMethod": "manual"}}
+{"edge": "SignalAffects", "from": "sig-hates-vendor", "to": "cli-priya-shah"}
+{"edge": "Surfaced", "from": "sig-hates-vendor", "to": "opp-stripe-migration", "data": {"confidence": "high"}}
+{"edge": "ClientOwnsOpportunity", "from": "cli-priya-shah", "to": "opp-stripe-migration"}
+{"edge": "ClientOwnsProject", "from": "cli-priya-shah", "to": "prj-data-pipeline"}
+
+// ── Diagram 2: Enrichment & Screening ─────────────────────────
+{"edge": "MadeBy", "from": "dec-make-proposal", "to": "act-andrew"}
+{"edge": "InformedBy", "from": "dec-make-proposal", "to": "sig-hates-vendor", "data": {"influence": "primary"}}
+{"edge": "DecisionAffects", "from": "dec-make-proposal", "to": "cli-priya-shah"}
+{"edge": "Targets", "from": "dec-make-proposal", "to": "opp-stripe-migration"}
+{"edge": "ScreenedBy", "from": "dec-make-proposal", "to": "pol-client-screen-v2", "data": {"outcome": "passed"}}
+{"edge": "Supersedes", "from": "pol-client-screen-v2", "to": "pol-client-screen-v1"}
+{"edge": "ResultedIn", "from": "dec-make-proposal", "to": "act-build-profile"}
+{"edge": "TouchedRecord", "from": "act-build-profile", "to": "rec-enrichment-stripe", "data": {"touchAction": "created"}}
+{"edge": "DerivedFrom", "from": "rec-enrichment-stripe", "to": "pol-client-screen-v2"}
+
+// ── Diagram 3: Execution ─────────────────────────────────────
+{"edge": "DecisionGenerates", "from": "dec-make-proposal", "to": "ai-draft-proposal"}
+{"edge": "AssignedTo", "from": "ai-draft-proposal", "to": "act-omnibot"}
+{"edge": "ResultedIn", "from": "dec-make-proposal", "to": "act-sent-proposal"}
+{"edge": "Resolves", "from": "act-sent-proposal", "to": "ai-draft-proposal"}
+{"edge": "TouchedRecord", "from": "act-sent-proposal", "to": "rec-proposal-stripe", "data": {"touchAction": "created"}}
+{"edge": "TouchedOpportunity", "from": "act-sent-proposal", "to": "opp-stripe-migration", "data": {"touchAction": "updated", "mutatedFields": ["stage"]}}
+{"edge": "Contains", "from": "opp-stripe-migration", "to": "prj-data-pipeline"}

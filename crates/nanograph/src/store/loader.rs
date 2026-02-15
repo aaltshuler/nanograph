@@ -10,7 +10,10 @@ mod constraints;
 mod jsonl;
 mod merge;
 
-pub(crate) use jsonl::{json_values_to_array, load_jsonl_data, load_jsonl_data_with_name_seed};
+pub(crate) use jsonl::{
+    json_values_to_array, load_jsonl_data, load_jsonl_data_with_name_seed, parse_date32_literal,
+    parse_date64_literal,
+};
 
 /// Build the next storage snapshot for a `Database::load` operation.
 ///
@@ -37,21 +40,25 @@ pub(crate) async fn build_next_storage_for_load(
     let mut incoming_storage = GraphStorage::new(existing.catalog.clone());
     match mode {
         LoadMode::Overwrite => {
-            load_jsonl_data(&mut incoming_storage, data_source)?;
+            load_jsonl_data(&mut incoming_storage, data_source, &key_props)?;
         }
         LoadMode::Merge => {
-            let incoming_node_types = constraints::collect_incoming_node_types(data_source)?;
-            let name_seed = constraints::build_name_seed_for_keyed_load(
-                existing,
-                schema_ir,
+            let key_seed = constraints::build_name_seed_for_keyed_load(existing, &key_props)?;
+            load_jsonl_data_with_name_seed(
+                &mut incoming_storage,
+                data_source,
                 &key_props,
-                &incoming_node_types,
+                Some(&key_seed),
             )?;
-            load_jsonl_data_with_name_seed(&mut incoming_storage, data_source, Some(&name_seed))?;
         }
         LoadMode::Append => {
-            let name_seed = constraints::build_name_seed_for_append(existing, schema_ir)?;
-            load_jsonl_data_with_name_seed(&mut incoming_storage, data_source, Some(&name_seed))?;
+            let key_seed = constraints::build_name_seed_for_append(existing, &key_props)?;
+            load_jsonl_data_with_name_seed(
+                &mut incoming_storage,
+                data_source,
+                &key_props,
+                Some(&key_seed),
+            )?;
         }
     }
 

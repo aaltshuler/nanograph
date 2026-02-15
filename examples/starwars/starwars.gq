@@ -1,8 +1,7 @@
-// Star Wars Knowledge Graph — NanoGraph Queries
+// Star Wars Knowledge Graph — Merged Query Suite
 
 // ── Faction queries ─────────────────────────────────────────────────────────
 
-// All Jedi: characters affiliated with the Jedi Order
 query jedi() {
     match {
         $c: Character
@@ -13,7 +12,6 @@ query jedi() {
     order { $c.name asc }
 }
 
-// All Sith
 query sith() {
     match {
         $c: Character
@@ -23,7 +21,6 @@ query sith() {
     return { $c.name, $c.rank }
 }
 
-// All Rebels
 query rebels() {
     match {
         $c: Character
@@ -34,7 +31,6 @@ query rebels() {
     order { $c.name asc }
 }
 
-// Members of a named faction
 query faction_members($faction: String) {
     match {
         $f: Faction { name: $faction }
@@ -46,7 +42,6 @@ query faction_members($faction: String) {
 
 // ── Mentor queries ──────────────────────────────────────────────────────────
 
-// Who trained a given character
 query mentors_of($name: String) {
     match {
         $c: Character { name: $name }
@@ -55,7 +50,6 @@ query mentors_of($name: String) {
     return { $m.name, $m.rank }
 }
 
-// Students of a given master
 query students_of($name: String) {
     match {
         $m: Character { name: $name }
@@ -65,7 +59,6 @@ query students_of($name: String) {
     order { $s.name asc }
 }
 
-// Jedi lineage: Yoda's students' students (2-hop)
 query yoda_grand_students() {
     match {
         $y: Character { name: "Yoda" }
@@ -78,7 +71,6 @@ query yoda_grand_students() {
 
 // ── Family queries ──────────────────────────────────────────────────────────
 
-// Children of a character
 query children_of($name: String) {
     match {
         $parent: Character { name: $name }
@@ -87,7 +79,6 @@ query children_of($name: String) {
     return { $child.name }
 }
 
-// Parents of a character
 query parents_of($name: String) {
     match {
         $child: Character { name: $name }
@@ -98,7 +89,6 @@ query parents_of($name: String) {
 
 // ── Combat queries ──────────────────────────────────────────────────────────
 
-// All duels
 query all_duels() {
     match {
         $a: Character
@@ -108,7 +98,6 @@ query all_duels() {
     order { $a.name asc }
 }
 
-// Who a specific character fought
 query opponents_of($name: String) {
     match {
         $c: Character { name: $name }
@@ -119,7 +108,6 @@ query opponents_of($name: String) {
 
 // ── Starship queries ────────────────────────────────────────────────────────
 
-// Who owns what starship
 query ship_owners() {
     match {
         $c: Character
@@ -131,7 +119,6 @@ query ship_owners() {
 
 // ── Weapon queries ──────────────────────────────────────────────────────────
 
-// Character and their weapons
 query wielders() {
     match {
         $c: Character
@@ -143,7 +130,6 @@ query wielders() {
 
 // ── Planet queries ──────────────────────────────────────────────────────────
 
-// Characters from a planet
 query from_planet($planet: String) {
     match {
         $p: Planet { name: $planet }
@@ -155,21 +141,19 @@ query from_planet($planet: String) {
 
 // ── Heroes vs Villains ──────────────────────────────────────────────────────
 
-// All heroes
 query heroes() {
     match {
         $c: Character
-        $c.alignment = "Hero"
+        $c.alignment = "hero"
     }
     return { $c.name, $c.species, $c.era }
     order { $c.name asc }
 }
 
-// All villains
 query villains() {
     match {
         $c: Character
-        $c.alignment = "Villain"
+        $c.alignment = "villain"
     }
     return { $c.name, $c.species, $c.rank }
     order { $c.name asc }
@@ -177,7 +161,6 @@ query villains() {
 
 // ── Aggregation queries ─────────────────────────────────────────────────────
 
-// Count members per faction
 query faction_sizes() {
     match {
         $c: Character
@@ -190,7 +173,6 @@ query faction_sizes() {
     order { members desc }
 }
 
-// Most-mentored characters (who has the most students)
 query top_mentors() {
     match {
         $s: Character
@@ -203,7 +185,6 @@ query top_mentors() {
     order { students desc }
 }
 
-// Most-battled characters (participated in most battles)
 query battle_veterans() {
     match {
         $c: Character
@@ -219,7 +200,6 @@ query battle_veterans() {
 
 // ── Cross-domain queries ────────────────────────────────────────────────────
 
-// Jedi who own starships
 query jedi_pilots() {
     match {
         $c: Character
@@ -230,7 +210,6 @@ query jedi_pilots() {
     return { $c.name, $s.name }
 }
 
-// Characters not affiliated with any faction
 query unaffiliated() {
     match {
         $c: Character
@@ -240,11 +219,82 @@ query unaffiliated() {
     order { $c.name asc }
 }
 
-// Locations on Tatooine
 query tatooine_locations() {
     match {
         $p: Planet { name: "Tatooine" }
         $loc locatedAt $p
     }
     return { $loc.name, $loc.location_type }
+}
+
+// ── Film/date queries ───────────────────────────────────────────────────────
+
+query film_timeline() {
+    match { $f: Film }
+    return { $f.episode, $f.name, $f.release_date }
+    order { $f.release_date asc }
+}
+
+query debut_film($slug: String) {
+    match {
+        $c: Character { slug: $slug }
+        $c debutsIn $f
+    }
+    return { $c.name, $f.name, $f.release_date }
+}
+
+query original_trilogy_cast() {
+    match {
+        $c: Character
+        $c debutsIn $f
+        $f.release_date < date("1984-01-01")
+    }
+    return { $c.name, $f.name, $f.release_date }
+    order { $f.release_date asc }
+}
+
+query prequel_battles() {
+    match {
+        $b: Battle
+        $b depictedIn $f
+        $f.episode <= 3
+    }
+    return { $b.name, $f.name, $f.release_date }
+    order { $f.release_date asc }
+}
+
+query cast_of($film_slug: String) {
+    match {
+        $f: Film { slug: $film_slug }
+        $c debutsIn $f
+    }
+    return { $c.name, $f.name }
+    order { $c.name asc }
+}
+
+// ── Mutations ───────────────────────────────────────────────────────────────
+
+query add_character() {
+    insert Character {
+        slug: "ezra-bridger"
+        name: "Ezra Bridger"
+        note: "Lothal rebel and Force-sensitive ally"
+        species: "Human"
+        gender: "Male"
+        rank: "Padawan"
+        era: "original"
+        alignment: "hero"
+        tags: ["jedi", "rebel"]
+    }
+}
+
+query update_character($slug: String) {
+    update Character set {
+        alignment: "neutral"
+        tags: ["updated"]
+    } where slug = $slug
+}
+
+query delete_character($slug: String) {
+    delete Character where slug = $slug
 }

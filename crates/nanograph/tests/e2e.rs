@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow::array::{Array, Int32Array, RecordBatch, StringArray};
+use arrow::array::{Array, Int32Array, Int64Array, RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use lance::Dataset;
 use lance_index::DatasetIndexExt;
@@ -22,11 +22,11 @@ use nanograph::{
 fn test_schema() -> &'static str {
     r#"
 node Person {
-    name: String
+    name: String @key
     age: I32?
 }
 node Company {
-    name: String
+    name: String @key
 }
 edge Knows: Person -> Person {
     since: Date?
@@ -227,6 +227,44 @@ fn extract_string_pairs(
                 result.push((left.value(i).to_string(), right.value(i).to_string()));
             }
         }
+    }
+    result
+}
+
+fn extract_u64_column(batches: &[RecordBatch], col_name: &str) -> Vec<u64> {
+    let mut result = Vec::new();
+    for batch in batches {
+        let col_idx = batch.schema().index_of(col_name).unwrap();
+        let col = batch.column(col_idx);
+
+        if let Some(arr) = col.as_any().downcast_ref::<UInt64Array>() {
+            for i in 0..arr.len() {
+                if !arr.is_null(i) {
+                    result.push(arr.value(i));
+                }
+            }
+            continue;
+        }
+
+        if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
+            for i in 0..arr.len() {
+                if !arr.is_null(i) {
+                    result.push(u64::try_from(arr.value(i)).unwrap());
+                }
+            }
+            continue;
+        }
+
+        if let Some(arr) = col.as_any().downcast_ref::<Int32Array>() {
+            for i in 0..arr.len() {
+                if !arr.is_null(i) {
+                    result.push(u64::try_from(arr.value(i)).unwrap());
+                }
+            }
+            continue;
+        }
+
+        panic!("unsupported numeric type for column {col_name}");
     }
     result
 }
@@ -608,11 +646,17 @@ query q() {
     )
     .await;
 
-    assert!(!results.is_empty());
+    let total_rows: usize = results.iter().map(RecordBatch::num_rows).sum();
+    assert_eq!(total_rows, 2);
+
     let names = extract_string_column(&results, "name");
-    // Alice has 2 friends, Bob has 1
-    assert!(names.contains(&"Alice".to_string()));
-    assert!(names.contains(&"Bob".to_string()));
+    let friends = extract_u64_column(&results, "friends");
+    assert_eq!(names.len(), 2);
+    assert_eq!(friends.len(), 2);
+
+    let mut pairs = names.into_iter().zip(friends).collect::<Vec<_>>();
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(pairs, vec![("Alice".to_string(), 2), ("Bob".to_string(), 1)]);
 }
 
 #[tokio::test]
@@ -649,6 +693,7 @@ query q() {
         $p: Person
     }
     return { $p.name }
+    order { $p.name asc }
     limit 2
 }
 "#,

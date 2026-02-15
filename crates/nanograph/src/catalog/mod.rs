@@ -79,7 +79,7 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
             for prop in &node.properties {
                 fields.push(Field::new(
                     &prop.name,
-                    prop.prop_type.scalar.to_arrow(),
+                    prop.prop_type.to_arrow(),
                     prop.prop_type.nullable,
                 ));
             }

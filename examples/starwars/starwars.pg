@@ -1,36 +1,51 @@
-// Star Wars Knowledge Graph — NanoGraph Schema
-// 8 node types, 23 edge types, 59 nodes, 120 edges
+// Star Wars Knowledge Graph — NanoGraph Schema (Merged)
+// 9 node types, 25 edge types
 
 // ── Nodes ───────────────────────────────────────────────────────────────────
 
+node Film {
+    slug: String @key
+    name: String
+    episode: I32
+    release_date: Date
+}
+
 node Character {
+    slug: String @key
     name: String
     note: String
     species: String
     gender: String
     rank: String?
-    era: String
-    alignment: String
+    era: enum(prequel, clone_wars, original)
+    alignment: enum(hero, villain, neutral)
+    tags: [String]?
 }
 
 node Droid {
+    slug: String @key
     name: String
     note: String
     model: String
 }
 
 node Faction {
+    slug: String @key
     name: String
     note: String
+    side: enum(light, dark, independent)
 }
 
 node Planet {
+    slug: String @key
     name: String
     note: String
     terrain: String
+    climate: enum(arid, temperate, swamp, forest, urban, volcanic)
 }
 
 node Starship {
+    slug: String @key
     name: String
     note: String
     model: String
@@ -39,6 +54,7 @@ node Starship {
 }
 
 node Weapon {
+    slug: String @key
     name: String
     note: String
     weapon_type: String
@@ -46,17 +62,24 @@ node Weapon {
 }
 
 node Battle {
+    slug: String @key
     name: String
     note: String
-    era: String
+    era: enum(prequel, clone_wars, original)
     outcome: String
 }
 
 node Location {
+    slug: String @key
     name: String
     note: String
     location_type: String
 }
+
+// ── Film connections ────────────────────────────────────────────────────────
+
+edge DebutsIn: Character -> Film
+edge DepictedIn: Battle -> Film
 
 // ── Family & Personal ───────────────────────────────────────────────────────
 
@@ -71,7 +94,9 @@ edge HasMentor: Character -> Character
 
 // ── Affiliation & Ownership ─────────────────────────────────────────────────
 
-edge AffiliatedWith: Character -> Faction
+edge AffiliatedWith: Character -> Faction {
+    role: String?
+}
 edge Owns: Character -> Starship
 edge FactionOwns: Faction -> Starship
 edge RulesFaction: Character -> Faction {

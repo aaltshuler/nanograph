@@ -4,7 +4,41 @@
 nanograph <command> [options]
 ```
 
+## Global options
+
+| Option | Description |
+|--------|-------------|
+| `--json` | Emit machine-readable JSON output for supported commands |
+| `--help` | Show help |
+| `--version` | Show CLI version |
+
 ## Commands
+
+### `version`
+
+Show CLI version and optional database manifest/dataset version info.
+
+```bash
+nanograph version [--db <db_path>]
+```
+
+With `--db`, includes current manifest `db_version` and per-dataset Lance versions.
+
+### `describe`
+
+Describe schema + manifest summary for a database.
+
+```bash
+nanograph describe --db <db_path> [--format table|json]
+```
+
+### `export`
+
+Export the full graph (nodes first, then edges) to stdout.
+
+```bash
+nanograph export --db <db_path> [--format jsonl|json]
+```
 
 ### `init`
 
@@ -14,7 +48,7 @@ Create a new database from a schema file.
 nanograph init <db_path> --schema <schema.pg>
 ```
 
-Creates the `<db_path>.nanograph/` directory with `schema.pg`, `schema.ir.json`, and an empty manifest.
+Creates the `<db_path>/` directory with `schema.pg`, `schema.ir.json`, and an empty manifest.
 
 ### `load`
 
@@ -50,7 +84,7 @@ nanograph run --db <db_path> --query <queries.gq> --name <query_name> [options]
 
 | Option | Description |
 |--------|-------------|
-| `--format table\|csv\|jsonl` | Output format (default: `table`) |
+| `--format table\|csv\|jsonl\|json` | Output format (default: `table`) |
 | `--param key=value` | Query parameter (repeatable) |
 
 Supports both read queries and mutation queries (`insert`, `update`, `delete`) in DB mode.
@@ -75,6 +109,18 @@ Read commit-gated CDC rows from the authoritative JSONL log.
 nanograph changes <db_path> [--since <db_version> | --from <db_version> --to <db_version>] [--format jsonl|json]
 ```
 
+## CDC semantics (time machine)
+
+- Source of truth: CDC is read from `_cdc_log.jsonl`, gated by `_tx_catalog.jsonl` and manifest `db_version`.
+- Commit visibility: only fully committed transactions at or below current manifest `db_version` are visible.
+- Ordering: rows are emitted in logical commit order by `(db_version, seq_in_tx)`.
+- Windowing:
+  - `--since X` returns rows with `db_version > X`
+  - `--from A --to B` returns rows in inclusive range `[A, B]`
+- Crash/recovery safety: trailing partial JSONL lines are truncated on open/read reconciliation; orphan tx/cdc tail rows beyond manifest visibility are ignored/truncated.
+- Retention impact: `nanograph cleanup --retain-tx-versions N` prunes old tx/cdc history, so time-machine replay is guaranteed only within retained versions.
+- Analytics materialization: `nanograph cdc-materialize` builds derived Lance dataset `__cdc_analytics` for analytics acceleration, but does not change CDC correctness semantics.
+
 ### `compact`
 
 Compact manifest-tracked Lance datasets and commit updated pinned versions.
@@ -98,6 +144,8 @@ Validate manifest/dataset/log consistency and graph integrity.
 ```bash
 nanograph doctor <db_path>
 ```
+
+Returns non-zero when issues are detected.
 
 ### `cdc-materialize`
 
@@ -152,10 +200,12 @@ Nodes:
 {"type": "Person", "data": {"name": "Alice", "age": 30}}
 ```
 
-Edges (matched by node name within source/destination types):
+Edges (matched by node `@key` value within source/destination types):
 ```json
 {"edge": "Knows", "from": "Alice", "to": "Bob"}
 ```
+
+For each edge endpoint type, `@key` is required so `from`/`to` can be resolved.
 
 Edges with properties:
 ```json

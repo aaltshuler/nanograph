@@ -1,8 +1,8 @@
 [package]
 name = "nanograph-cli"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
-description = "CLI for NanoGraph — embedded typed property graph database"
+description = "CLI for NanoGraph — the embedded property graph database. No server, schema-as-code."
 repository = "https://github.com/aaltshuler/nanograph"
 license = "MIT"
 

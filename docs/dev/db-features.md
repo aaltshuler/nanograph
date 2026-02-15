@@ -6,9 +6,7 @@ updated: 2026-02-14
 
 # NanoGraph — Database Features
 
-Current version: `v0.5.0`
-
-Detailed execution checklist: `docs/dev/execution-checklist.md`
+Current version: `v0.6.0`
 
 ---
 

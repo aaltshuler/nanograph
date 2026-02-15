@@ -1,12 +1,12 @@
 ---
 audience: dev
 status: active
-updated: 2026-02-11
+updated: 2026-02-15
 ---
 
 # NanoGraph Test Framework
 
-Status: active (updated 2026-02-11)
+Status: active (updated 2026-02-15)
 
 ## Overview
 
@@ -86,11 +86,23 @@ bash tests/cli/run-cli-e2e.sh
 - Keep scenario scripts focused on domain assertions only.
 - Use explicit load mode flags (`overwrite|append|merge`) in all CLI tests.
 - Use `--format jsonl` for stable script parsing when validating row content.
+- For feature E2E, anchor tests to canonical example schemas (`examples/starwars`, `examples/revops`) instead of adding ad-hoc test-only schemas.
+
+## CLI Scenario Ownership
+
+| Scenario | Fixture schema(s) | Primary coverage |
+|----------|-------------------|------------------|
+| `lifecycle.sh` | `examples/starwars/starwars.pg` | Merge upsert behavior, edge dedup, delete cascade, reopen/readback consistency |
+| `migration.sh` | `examples/starwars/starwars.pg` | Schema migration plan/apply flow, rename/add/drop semantics, post-migration query parity |
+| `query_mutations.sh` | `examples/starwars/starwars.pg` | Query mutation syntax (insert/update/delete for nodes/edges) and CLI `--json` response contract |
+| `revops_typed_cdc.sh` | `examples/revops/revops.pg` | Typed fields (enum/list/DateTime/Bool/F64), mutation events, CDC range/since windows, version/describe/export/doctor |
+| `maintenance.sh` | `examples/revops/revops.pg` | Compact/cleanup/cdc-materialize maintenance commands and replay window integrity |
 
 ## Fixtures Policy
 
-- Canonical fixture set is `crates/nanograph/tests/fixtures/`.
-- Do not duplicate fixture files under `/tests`.
+- Engine integration fixtures are `crates/nanograph/tests/fixtures/`.
+- CLI E2E fixtures come from `examples/starwars/` and `examples/revops/`.
+- Do not add standalone feature schemas under `tests/cli/scenarios`; extend one of the canonical examples instead.
 - If fixtures change, update references and tests in one place only.
 
 ## CI Guidance
@@ -122,3 +134,4 @@ cargo test -p nanograph --test index_perf -- --ignored --nocapture
 4. Validate with:
    - `bash -n tests/cli/scenarios/<name>.sh`
    - `bash tests/cli/run-cli-e2e.sh <name>`
+5. Update the CLI ownership table in this document.

@@ -4,7 +4,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, StructArray,
+    ArrayRef, BooleanArray, Date32Array, Date64Array, Float64Array, Int64Array, RecordBatch,
+    StringArray, StructArray,
 };
 use arrow::datatypes::{DataType, Field, SchemaRef};
 use datafusion::common::Result;
@@ -20,6 +21,7 @@ use tracing::debug;
 
 use crate::query::ast::{CompOp, Literal};
 use crate::store::graph::GraphStorage;
+use crate::store::loader::{parse_date32_literal, parse_date64_literal};
 
 #[derive(Debug, Clone)]
 pub(crate) struct NodeScanPredicate {
@@ -68,12 +70,51 @@ impl NodeScanExec {
         }
     }
 
-    fn literal_to_array(literal: &Literal, num_rows: usize) -> ArrayRef {
+    fn literal_to_array(literal: &Literal, num_rows: usize) -> Result<ArrayRef> {
         match literal {
-            Literal::String(s) => Arc::new(StringArray::from(vec![s.as_str(); num_rows])),
-            Literal::Integer(v) => Arc::new(Int64Array::from(vec![*v; num_rows])),
-            Literal::Float(v) => Arc::new(Float64Array::from(vec![*v; num_rows])),
-            Literal::Bool(v) => Arc::new(BooleanArray::from(vec![*v; num_rows])),
+            Literal::String(s) => Ok(Arc::new(StringArray::from(vec![s.as_str(); num_rows]))),
+            Literal::Integer(v) => Ok(Arc::new(Int64Array::from(vec![*v; num_rows]))),
+            Literal::Float(v) => Ok(Arc::new(Float64Array::from(vec![*v; num_rows]))),
+            Literal::Bool(v) => Ok(Arc::new(BooleanArray::from(vec![*v; num_rows]))),
+            Literal::Date(s) => {
+                let days = parse_date32_literal(s)
+                    .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                Ok(Arc::new(Date32Array::from(vec![days; num_rows])))
+            }
+            Literal::DateTime(s) => {
+                let ms = parse_date64_literal(s)
+                    .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                Ok(Arc::new(Date64Array::from(vec![ms; num_rows])))
+            }
+            Literal::List(items) => {
+                let rendered = serde_json::Value::Array(
+                    items
+                        .iter()
+                        .map(Self::literal_to_json_value_for_display)
+                        .collect::<Vec<_>>(),
+                )
+                .to_string();
+                Ok(Arc::new(StringArray::from(vec![rendered; num_rows])))
+            }
+        }
+    }
+
+    fn literal_to_json_value_for_display(lit: &Literal) -> serde_json::Value {
+        match lit {
+            Literal::String(v) => serde_json::Value::String(v.clone()),
+            Literal::Integer(v) => serde_json::Value::Number((*v).into()),
+            Literal::Float(v) => serde_json::Number::from_f64(*v)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null),
+            Literal::Bool(v) => serde_json::Value::Bool(*v),
+            Literal::Date(v) => serde_json::Value::String(v.clone()),
+            Literal::DateTime(v) => serde_json::Value::String(v.clone()),
+            Literal::List(values) => serde_json::Value::Array(
+                values
+                    .iter()
+                    .map(Self::literal_to_json_value_for_display)
+                    .collect(),
+            ),
         }
     }
 
@@ -108,7 +149,7 @@ impl NodeScanExec {
                 })?
                 .clone();
 
-            let right = Self::literal_to_array(&predicate.literal, current.num_rows());
+            let right = Self::literal_to_array(&predicate.literal, current.num_rows())?;
             let right = if left.data_type() != right.data_type() {
                 arrow::compute::cast(&right, left.data_type())
                     .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?
@@ -188,6 +229,21 @@ impl NodeScanExec {
                 }
             }
             Literal::Bool(v) => Some(if *v { "true" } else { "false" }.to_string()),
+            Literal::Date(s) => {
+                let days = parse_date32_literal(s).ok()?;
+                let iso = arrow::temporal_conversions::date32_to_datetime(days)?
+                    .format("%Y-%m-%d")
+                    .to_string();
+                Some(format!("CAST('{}' AS DATE)", iso))
+            }
+            Literal::DateTime(s) => {
+                let ms = parse_date64_literal(s).ok()?;
+                let ts = arrow::temporal_conversions::date64_to_datetime(ms)?
+                    .format("%Y-%m-%d %H:%M:%S%.3f")
+                    .to_string();
+                Some(format!("CAST('{}' AS TIMESTAMP(3))", ts))
+            }
+            Literal::List(_) => None,
         }
     }
 
@@ -402,5 +458,35 @@ impl NodeScanExec {
             self.output_schema.clone(),
             None,
         )?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NodeScanExec;
+    use crate::query::ast::Literal;
+
+    #[test]
+    fn literal_to_lance_sql_formats_temporal_literals_with_typed_casts() {
+        let date_sql = NodeScanExec::literal_to_lance_sql(&Literal::Date("2026-02-14".to_string()));
+        assert_eq!(date_sql.as_deref(), Some("CAST('2026-02-14' AS DATE)"));
+
+        let dt_sql = NodeScanExec::literal_to_lance_sql(&Literal::DateTime(
+            "2026-02-14T10:11:12Z".to_string(),
+        ));
+        assert_eq!(
+            dt_sql.as_deref(),
+            Some("CAST('2026-02-14 10:11:12.000' AS TIMESTAMP(3))")
+        );
+    }
+
+    #[test]
+    fn literal_to_lance_sql_returns_none_for_invalid_temporal_literals() {
+        let bad_date = NodeScanExec::literal_to_lance_sql(&Literal::Date("not-a-date".to_string()));
+        assert!(bad_date.is_none());
+
+        let bad_dt =
+            NodeScanExec::literal_to_lance_sql(&Literal::DateTime("not-a-datetime".to_string()));
+        assert!(bad_dt.is_none());
     }
 }

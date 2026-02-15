@@ -2,12 +2,12 @@
 
 ## CLI
 
-- [ ] `nanograph describe` — print schema definition for a type or all types
-- [ ] `--format json` output (array of objects, in addition to existing `table|csv|jsonl`)
-- [ ] `--json` on all commands (`check`, `migrate`, `load`, `init`, `delete`) — machine-readable output for agents
-- [ ] `nanograph export --format jsonl` — dump full graph to stdout for git-friendly snapshots
+- [x] `nanograph describe` — print schema definition for a type or all types
+- [x] `--format json` output (array of objects, in addition to existing `table|csv|jsonl`)
+- [x] `--json` on all commands (`check`, `migrate`, `load`, `init`, `delete`) — machine-readable output for agents
+- [x] `nanograph export --format jsonl` — dump full graph to stdout for git-friendly snapshots
 - [ ] Progress bars on `nanograph load` for large datasets (indicatif)
-- [ ] `nanograph version --db` — print current Lance version per dataset type
+- [x] `nanograph version --db` — print current Lance version per dataset type
 
 ## Query
 
@@ -16,14 +16,13 @@
 
 ## Storage
 
-- [ ] Single-file database format (like SQLite/DuckDB) — currently directory-based due to Lance
 - [ ] Content-addressed node IDs — derive from `@key` hash instead of auto-increment u64
 
 ## Schema / Types
 
-- [ ] Enum types (e.g. `status: enum(open, closed, blocked)`)
-- [ ] Array/list properties (e.g. `tags: [String]`)
-- [ ] Date/DateTime types (chrono — needed for date literals, filtering, ordering)
+- [x] Enum types (e.g. `status: enum(open, closed, blocked)`)
+- [x] Array/list properties (e.g. `tags: [String]`)
+- [x] Date/DateTime types (chrono — needed for date literals, filtering, ordering)
 
 ## Performance
 

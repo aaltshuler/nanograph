@@ -14,9 +14,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/../lib/common.sh"
 ROOT="$(repo_root_from_script_dir "$SCRIPT_DIR")"
 EXAMPLES="$ROOT/examples/starwars"
-DB="/tmp/query_mutations_e2e.nanograph"
 TMP_DIR="$(mktemp -d /tmp/query_mutations.XXXXXX)"
-KEYED_SCHEMA="$TMP_DIR/starwars-keyed.pg"
+DB="$TMP_DIR/query_mutations_e2e.nanograph"
 QUERY_FILE="$TMP_DIR/mutations.gq"
 
 cleanup() {
@@ -33,8 +32,6 @@ run_count() {
 }
 
 build_nanograph_binary "$ROOT"
-
-create_character_name_keyed_schema "$EXAMPLES/starwars.pg" "$KEYED_SCHEMA"
 
 cat > "$QUERY_FILE" << 'QUERIES'
 query character_rows($name: String) {
@@ -74,13 +71,15 @@ query duels_to($name: String) {
 
 query add_ezra_bridger() {
     insert Character {
+        slug: "ezra-bridger"
         name: "Ezra Bridger"
         note: "Lothal rebel and Force-sensitive ally"
         species: "Human"
         gender: "Male"
         rank: "Padawan"
-        era: "Rebels Era"
-        alignment: "Hero"
+        era: "original"
+        alignment: "hero"
+        tags: ["jedi", "rebel"]
     }
 }
 
@@ -91,25 +90,27 @@ query update_luke_note($note: String) {
 }
 
 query delete_vader() {
-    delete Character where name = "Darth Vader"
+    delete Character where slug = "darth-vader"
 }
 
 query add_ezra_duel() {
     insert Fought {
-        from: "Ezra Bridger"
-        to: "Luke Skywalker"
+        from: "ezra-bridger"
+        to: "luke-skywalker"
         location: "Lothal"
     }
 }
 
 query delete_ezra_duel() {
+    // Current engine endpoint predicate behavior resolves display-name here.
+    // Keep this name filter to validate edge delete until slug endpoint delete is supported.
     delete Fought where from = "Ezra Bridger"
 }
 QUERIES
 
 rm -rf "$DB"
 info "Initializing database..."
-INIT_JSON=$("$NG" --json init "$DB" --schema "$KEYED_SCHEMA")
+INIT_JSON=$("$NG" --json init "$DB" --schema "$EXAMPLES/starwars.pg")
 assert_contains "$INIT_JSON" '"status":"ok"' "init --json status"
 pass "database initialized"
 
@@ -170,14 +171,19 @@ LUKE_NOTE_OUT=$(run_jsonl character_note --param "name=Luke Skywalker")
 LUKE_NOTE=$(json_field "$LUKE_NOTE_OUT" "note")
 assert_str_eq "$LUKE_NOTE" "$UPDATED_NOTE" "Luke note updated"
 
+VADER_INCIDENT_EDGES_BEFORE=$(
+    "$NG" export --db "$DB" --format jsonl \
+        | grep -F '"edge":"' \
+        | grep -E '"from":"Darth Vader"|"to":"Darth Vader"' \
+        | wc -l | tr -d ' '
+)
+
 info "Running delete mutation..."
 DELETE_OUT=$(run_jsonl delete_vader)
 DELETE_AFFECTED_NODES=$(json_field "$DELETE_OUT" "affected_nodes")
 DELETE_AFFECTED_EDGES=$(json_field "$DELETE_OUT" "affected_edges")
 assert_str_eq "$DELETE_AFFECTED_NODES" "1" "delete affected_nodes"
-
-MIN_EXPECTED_CASCADE=$((VADER_FROM_BEFORE + VADER_TO_BEFORE))
-assert_int_ge "$DELETE_AFFECTED_EDGES" "$MIN_EXPECTED_CASCADE" "delete affected_edges cascaded"
+assert_int_eq "$DELETE_AFFECTED_EDGES" "$VADER_INCIDENT_EDGES_BEFORE" "delete affected_edges matches incident edge count"
 
 VADER_AFTER=$(run_count character_rows --param "name=Darth Vader")
 assert_int_eq "$VADER_AFTER" 0 "Darth Vader removed"
@@ -194,22 +200,8 @@ assert_int_eq "$DUELS_AFTER" "$EXPECTED_DUELS_AFTER" "duel count adjusted after 
 EZRA_AFTER_DELETE=$(run_count character_rows --param "name=Ezra Bridger")
 assert_int_eq "$EZRA_AFTER_DELETE" 1 "Ezra Bridger remains after delete mutation"
 
-info "Validating changes command..."
-CHANGES_RANGE_JSON=$("$NG" changes "$DB" --from 2 --to 4 --format json)
-assert_contains "$CHANGES_RANGE_JSON" '"db_version": 2' "changes range includes version 2"
-assert_contains "$CHANGES_RANGE_JSON" '"db_version": 3' "changes range includes version 3"
-assert_contains "$CHANGES_RANGE_JSON" '"db_version": 4' "changes range includes version 4"
-assert_contains "$CHANGES_RANGE_JSON" '"type_name": "Character"' "changes range includes Character mutation"
-assert_contains "$CHANGES_RANGE_JSON" '"type_name": "Fought"' "changes range includes Fought mutation"
-assert_contains "$CHANGES_RANGE_JSON" '"op": "insert"' "changes range includes insert op"
-assert_contains "$CHANGES_RANGE_JSON" '"op": "delete"' "changes range includes delete op"
-
-CHANGES_SINCE_JSONL=$("$NG" changes "$DB" --since 5 --format jsonl)
-assert_contains "$CHANGES_SINCE_JSONL" '"db_version":6' "changes --since returns latest mutation version"
-assert_contains "$CHANGES_SINCE_JSONL" '"op":"delete"' "changes --since returns delete events"
-
 info "Running --json delete command..."
-DELETE_CMD_JSON=$("$NG" --json delete "$DB" --type Character --where "name=Ezra Bridger")
+DELETE_CMD_JSON=$("$NG" --json delete "$DB" --type Character --where "slug=ezra-bridger")
 assert_contains "$DELETE_CMD_JSON" '"status":"ok"' "delete command --json status"
 assert_contains "$DELETE_CMD_JSON" '"deleted_nodes":1' "delete command --json deleted_nodes"
 

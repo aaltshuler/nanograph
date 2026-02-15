@@ -79,6 +79,72 @@ impl std::fmt::Display for ScalarType {
 pub struct PropType {
     pub scalar: ScalarType,
     pub nullable: bool,
+    pub list: bool,
+    pub enum_values: Option<Vec<String>>,
+}
+
+impl PropType {
+    pub fn scalar(scalar: ScalarType, nullable: bool) -> Self {
+        Self {
+            scalar,
+            nullable,
+            list: false,
+            enum_values: None,
+        }
+    }
+
+    pub fn list_of(scalar: ScalarType, nullable: bool) -> Self {
+        Self {
+            scalar,
+            nullable,
+            list: true,
+            enum_values: None,
+        }
+    }
+
+    pub fn enum_type(mut values: Vec<String>, nullable: bool) -> Self {
+        values.sort();
+        values.dedup();
+        Self {
+            scalar: ScalarType::String,
+            nullable,
+            list: false,
+            enum_values: Some(values),
+        }
+    }
+
+    pub fn is_enum(&self) -> bool {
+        self.enum_values.is_some()
+    }
+
+    pub fn to_arrow(&self) -> DataType {
+        let scalar_dt = self.scalar.to_arrow();
+        if self.list {
+            DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
+                "item", scalar_dt, true,
+            )))
+        } else {
+            scalar_dt
+        }
+    }
+
+    pub fn display_name(&self) -> String {
+        let base = if let Some(values) = &self.enum_values {
+            format!("enum({})", values.join(", "))
+        } else {
+            self.scalar.to_string()
+        };
+        let wrapped = if self.list {
+            format!("[{}]", base)
+        } else {
+            base
+        };
+        if self.nullable {
+            format!("{}?", wrapped)
+        } else {
+            wrapped
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -141,11 +141,60 @@ fn parse_type_ref(pair: pest::iterators::Pair<Rule>) -> Result<PropType> {
     let text = pair.as_str();
     let nullable = text.ends_with('?');
 
-    let inner = pair.into_inner().next().unwrap();
-    let scalar = ScalarType::from_str_name(inner.as_str())
-        .ok_or_else(|| NanoError::Parse(format!("unknown type: {}", inner.as_str())))?;
+    let mut inner = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| NanoError::Parse("type reference is missing core type".to_string()))?;
+    if inner.as_rule() == Rule::core_type {
+        inner = inner
+            .into_inner()
+            .next()
+            .ok_or_else(|| NanoError::Parse("type reference is missing core type".to_string()))?;
+    }
 
-    Ok(PropType { scalar, nullable })
+    match inner.as_rule() {
+        Rule::base_type => {
+            let scalar = ScalarType::from_str_name(inner.as_str())
+                .ok_or_else(|| NanoError::Parse(format!("unknown type: {}", inner.as_str())))?;
+            Ok(PropType::scalar(scalar, nullable))
+        }
+        Rule::list_type => {
+            let element = inner
+                .into_inner()
+                .next()
+                .ok_or_else(|| NanoError::Parse("list type missing element type".to_string()))?;
+            let scalar = ScalarType::from_str_name(element.as_str()).ok_or_else(|| {
+                NanoError::Parse(format!("unknown list element type: {}", element.as_str()))
+            })?;
+            Ok(PropType::list_of(scalar, nullable))
+        }
+        Rule::enum_type => {
+            let mut values = Vec::new();
+            for value in inner.into_inner() {
+                if value.as_rule() == Rule::enum_value {
+                    values.push(value.as_str().to_string());
+                }
+            }
+            if values.is_empty() {
+                return Err(NanoError::Parse(
+                    "enum type must include at least one value".to_string(),
+                ));
+            }
+            let mut dedup = values.clone();
+            dedup.sort();
+            dedup.dedup();
+            if dedup.len() != values.len() {
+                return Err(NanoError::Parse(
+                    "enum type cannot include duplicate values".to_string(),
+                ));
+            }
+            Ok(PropType::enum_type(values, nullable))
+        }
+        other => Err(NanoError::Parse(format!(
+            "unexpected type rule: {:?}",
+            other
+        ))),
+    }
 }
 
 fn parse_annotation(pair: pest::iterators::Pair<Rule>) -> Result<Annotation> {
@@ -182,6 +231,14 @@ fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
                     let mut unique_seen = false;
                     let mut index_seen = false;
                     for ann in &prop.annotations {
+                        if prop.prop_type.list
+                            && (ann.name == "key" || ann.name == "unique" || ann.name == "index")
+                        {
+                            return Err(NanoError::Parse(format!(
+                                "@{} is not supported on list property {}.{}",
+                                ann.name, node.name, prop.name
+                            )));
+                        }
                         if ann.name == "key" {
                             if ann.value.is_some() {
                                 return Err(NanoError::Parse(format!(
@@ -494,6 +551,60 @@ edge Knows: Person -> Person {
 "#;
         let err = parse_schema(input).unwrap_err();
         assert!(err.to_string().contains("edge properties"));
+    }
+
+    #[test]
+    fn test_parse_enum_and_list_types() {
+        let input = r#"
+node Ticket {
+    status: enum(open, closed, blocked)
+    tags: [String]
+}
+"#;
+        let schema = parse_schema(input).unwrap();
+        match &schema.declarations[0] {
+            SchemaDecl::Node(n) => {
+                let status = &n.properties[0].prop_type;
+                assert!(status.is_enum());
+                assert!(!status.list);
+                assert_eq!(
+                    status.enum_values.as_ref().unwrap(),
+                    &vec![
+                        "blocked".to_string(),
+                        "closed".to_string(),
+                        "open".to_string()
+                    ]
+                );
+
+                let tags = &n.properties[1].prop_type;
+                assert!(tags.list);
+                assert!(!tags.is_enum());
+                assert_eq!(tags.scalar, ScalarType::String);
+            }
+            _ => panic!("expected Node"),
+        }
+    }
+
+    #[test]
+    fn test_reject_duplicate_enum_values() {
+        let input = r#"
+node Ticket {
+    status: enum(open, closed, open)
+}
+"#;
+        let err = parse_schema(input).unwrap_err();
+        assert!(err.to_string().contains("duplicate values"));
+    }
+
+    #[test]
+    fn test_reject_key_on_list_property() {
+        let input = r#"
+node Ticket {
+    tags: [String] @key
+}
+"#;
+        let err = parse_schema(input).unwrap_err();
+        assert!(err.to_string().contains("list property"));
     }
 
     #[test]

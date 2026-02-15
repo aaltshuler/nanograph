@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array,
-    Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array, UInt64Array, UInt64Builder,
+    Int32Array, Int64Array, ListArray, RecordBatch, StringArray, UInt32Array, UInt64Array,
+    UInt64Builder,
 };
 use arrow::datatypes::DataType;
 
@@ -650,12 +651,34 @@ fn array_value_to_json(array: &ArrayRef, row: usize) -> serde_json::Value {
         DataType::Date32 => array
             .as_any()
             .downcast_ref::<Date32Array>()
-            .map(|a| serde_json::Value::Number((a.value(row) as i64).into()))
+            .map(|a| {
+                let days = a.value(row);
+                arrow::temporal_conversions::date32_to_datetime(days)
+                    .map(|dt| serde_json::Value::String(dt.format("%Y-%m-%d").to_string()))
+                    .unwrap_or_else(|| serde_json::Value::Number((days as i64).into()))
+            })
             .unwrap_or(serde_json::Value::Null),
         DataType::Date64 => array
             .as_any()
             .downcast_ref::<Date64Array>()
-            .map(|a| serde_json::Value::Number(a.value(row).into()))
+            .map(|a| {
+                let ms = a.value(row);
+                arrow::temporal_conversions::date64_to_datetime(ms)
+                    .map(|dt| serde_json::Value::String(dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()))
+                    .unwrap_or_else(|| serde_json::Value::Number(ms.into()))
+            })
+            .unwrap_or(serde_json::Value::Null),
+        DataType::List(_) => array
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .map(|a| {
+                let values = a.value(row);
+                serde_json::Value::Array(
+                    (0..values.len())
+                        .map(|idx| array_value_to_json(&values, idx))
+                        .collect(),
+                )
+            })
             .unwrap_or(serde_json::Value::Null),
         _ => serde_json::Value::Null,
     }

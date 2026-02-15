@@ -4,11 +4,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/../lib/common.sh"
 ROOT="$(repo_root_from_script_dir "$SCRIPT_DIR")"
+EXAMPLES="$ROOT/examples/revops"
 
-DB="/tmp/maintenance_e2e.nanograph"
 TMP_DIR="$(mktemp -d /tmp/maintenance_e2e.XXXXXX)"
-SCHEMA="$TMP_DIR/schema.pg"
-DATA_INIT="$TMP_DIR/init.jsonl"
+DB="$TMP_DIR/maintenance_e2e.nanograph"
 DATA_APPEND="$TMP_DIR/append.jsonl"
 
 cleanup() {
@@ -18,28 +17,15 @@ trap cleanup EXIT
 
 build_nanograph_binary "$ROOT"
 
-cat > "$SCHEMA" << 'SCHEMA'
-node Person {
-    name: String @key
-    age: I32?
-}
-SCHEMA
-
-cat > "$DATA_INIT" << 'DATA'
-{"type":"Person","data":{"name":"Alice","age":30}}
-DATA
-
 cat > "$DATA_APPEND" << 'DATA'
-{"type":"Person","data":{"name":"Bob","age":29}}
+{"type":"Signal","data":{"slug":"sig-maint-append","observedAt":"2026-02-16T00:00:00Z","summary":"Maintenance append event","urgency":"low","sourceType":"observation","assertion":"fact","createdAt":"2026-02-16T00:00:00Z"}}
 DATA
-
-rm -rf "$DB"
 
 info "Initializing and loading maintenance test database..."
-INIT_JSON=$("$NG" --json init "$DB" --schema "$SCHEMA")
+INIT_JSON=$("$NG" --json init "$DB" --schema "$EXAMPLES/revops.pg")
 assert_contains "$INIT_JSON" '"status":"ok"' "init --json status"
 
-LOAD1_JSON=$("$NG" --json load "$DB" --data "$DATA_INIT" --mode overwrite)
+LOAD1_JSON=$("$NG" --json load "$DB" --data "$EXAMPLES/revops.jsonl" --mode overwrite)
 assert_contains "$LOAD1_JSON" '"status":"ok"' "overwrite load --json status"
 
 LOAD2_JSON=$("$NG" --json load "$DB" --data "$DATA_APPEND" --mode append)
@@ -74,9 +60,14 @@ DOCTOR_AFTER_JSON=$("$NG" --json doctor "$DB")
 assert_contains "$DOCTOR_AFTER_JSON" '"status":"ok"' "doctor --json status after cleanup"
 assert_contains "$DOCTOR_AFTER_JSON" '"healthy":true' "doctor reports healthy after cleanup"
 
+info "Running describe command..."
+DESCRIBE_JSON=$("$NG" describe --db "$DB" --format json)
+assert_contains "$DESCRIBE_JSON" '"schema_ir_version"' "describe includes schema version"
+assert_contains "$DESCRIBE_JSON" '"name": "Opportunity"' "describe includes Opportunity node type"
+
 CHANGES_JSON=$("$NG" changes "$DB" --since 0 --format json)
 assert_contains "$CHANGES_JSON" '"db_version": 2' "changes keeps replay window events after cleanup"
-assert_contains "$CHANGES_JSON" '"name": "Bob"' "changes includes append payload after cleanup"
+assert_contains "$CHANGES_JSON" '"sig-maint-append"' "changes includes append payload after cleanup"
 
 echo ""
 pass "maintenance CLI e2e passed"

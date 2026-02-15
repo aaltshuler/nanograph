@@ -50,6 +50,10 @@ pub struct PropDef {
     pub prop_id: u32,
     #[serde(rename = "type")]
     pub scalar_type: String,
+    #[serde(default)]
+    pub list: bool,
+    #[serde(default)]
+    pub enum_values: Vec<String>,
     pub nullable: bool,
     #[serde(default)]
     pub key: bool,
@@ -125,6 +129,8 @@ pub fn build_schema_ir(schema: &SchemaFile) -> Result<SchemaIR> {
                             name: p.name.clone(),
                             prop_id,
                             scalar_type: p.prop_type.scalar.to_string(),
+                            list: p.prop_type.list,
+                            enum_values: p.prop_type.enum_values.clone().unwrap_or_default(),
                             nullable: p.prop_type.nullable,
                             key: p.annotations.iter().any(|a| a.name == "key"),
                             unique: p.annotations.iter().any(|a| a.name == "unique"),
@@ -179,6 +185,8 @@ pub fn build_schema_ir(schema: &SchemaFile) -> Result<SchemaIR> {
                             name: p.name.clone(),
                             prop_id,
                             scalar_type: p.prop_type.scalar.to_string(),
+                            list: p.prop_type.list,
+                            enum_values: p.prop_type.enum_values.clone().unwrap_or_default(),
                             nullable: p.prop_type.nullable,
                             key: false,
                             unique: false,
@@ -225,17 +233,21 @@ pub fn build_catalog_from_ir(ir: &SchemaIR) -> Result<Catalog> {
                     let scalar = ScalarType::from_str_name(&prop.scalar_type).ok_or_else(|| {
                         NanoError::Catalog(format!("unknown scalar type: {}", prop.scalar_type))
                     })?;
-                    properties.insert(
-                        prop.name.clone(),
-                        PropType {
-                            scalar,
-                            nullable: prop.nullable,
+                    let prop_type = PropType {
+                        scalar,
+                        nullable: prop.nullable,
+                        list: prop.list,
+                        enum_values: if prop.enum_values.is_empty() {
+                            None
+                        } else {
+                            Some(prop.enum_values.clone())
                         },
-                    );
+                    };
+                    properties.insert(prop.name.clone(), prop_type.clone());
                     if prop.index {
                         indexed_properties.insert(prop.name.clone());
                     }
-                    fields.push(Field::new(&prop.name, scalar.to_arrow(), prop.nullable));
+                    fields.push(Field::new(&prop.name, prop_type.to_arrow(), prop.nullable));
                 }
 
                 node_types.insert(
@@ -259,6 +271,12 @@ pub fn build_catalog_from_ir(ir: &SchemaIR) -> Result<Catalog> {
                         PropType {
                             scalar,
                             nullable: prop.nullable,
+                            list: prop.list,
+                            enum_values: if prop.enum_values.is_empty() {
+                                None
+                            } else {
+                                Some(prop.enum_values.clone())
+                            },
                         },
                     );
                 }

@@ -427,6 +427,8 @@ fn build_desired_schema_ir(
                 name: prop.name.clone(),
                 prop_id,
                 scalar_type: prop.prop_type.scalar.to_string(),
+                list: prop.prop_type.list,
+                enum_values: prop.prop_type.enum_values.clone().unwrap_or_default(),
                 nullable: prop.prop_type.nullable,
                 key: prop.annotations.iter().any(|a| a.name == "key"),
                 unique: prop.annotations.iter().any(|a| a.name == "unique"),
@@ -525,6 +527,8 @@ fn build_desired_schema_ir(
                 name: prop.name.clone(),
                 prop_id,
                 scalar_type: prop.prop_type.scalar.to_string(),
+                list: prop.prop_type.list,
+                enum_values: prop.prop_type.enum_values.clone().unwrap_or_default(),
                 nullable: prop.prop_type.nullable,
                 key: false,
                 unique: false,
@@ -1292,7 +1296,7 @@ fn transform_storage_for_new_schema(
                         old_prop.name, old_node.name
                     ))
                 })?;
-                cast_array_if_needed(old_col.clone(), &new_prop.scalar_type)?
+                cast_array_if_needed(old_col.clone(), new_prop)?
             } else {
                 if !new_prop.nullable {
                     return Err(NanoError::Manifest(format!(
@@ -1300,7 +1304,7 @@ fn transform_storage_for_new_schema(
                         new_prop.name, new_node.name
                     )));
                 }
-                let dt = scalar_to_arrow(&new_prop.scalar_type)?;
+                let dt = propdef_to_arrow(new_prop)?;
                 new_null_array(&dt, old_batch.num_rows())
             };
             if !new_prop.nullable && arr.null_count() > 0 {
@@ -1377,7 +1381,7 @@ fn transform_storage_for_new_schema(
                         old_prop.name, old_edge.name
                     ))
                 })?;
-                cast_array_if_needed(old_col.clone(), &new_prop.scalar_type)?
+                cast_array_if_needed(old_col.clone(), new_prop)?
             } else {
                 if !new_prop.nullable {
                     return Err(NanoError::Manifest(format!(
@@ -1385,7 +1389,7 @@ fn transform_storage_for_new_schema(
                         new_prop.name, new_edge.name
                     )));
                 }
-                let dt = scalar_to_arrow(&new_prop.scalar_type)?;
+                let dt = propdef_to_arrow(new_prop)?;
                 new_null_array(&dt, old_batch.num_rows())
             };
             if !new_prop.nullable && arr.null_count() > 0 {
@@ -1478,14 +1482,27 @@ fn collect_node_ids(storage: &GraphStorage, type_name: &str) -> Result<HashSet<u
     Ok(set)
 }
 
-fn scalar_to_arrow(name: &str) -> Result<arrow::datatypes::DataType> {
-    let scalar = ScalarType::from_str_name(name)
-        .ok_or_else(|| NanoError::Catalog(format!("unknown scalar type: {}", name)))?;
-    Ok(scalar.to_arrow())
+fn propdef_to_prop_type(prop: &PropDef) -> Result<crate::types::PropType> {
+    let scalar = ScalarType::from_str_name(&prop.scalar_type)
+        .ok_or_else(|| NanoError::Catalog(format!("unknown scalar type: {}", prop.scalar_type)))?;
+    Ok(crate::types::PropType {
+        scalar,
+        nullable: prop.nullable,
+        list: prop.list,
+        enum_values: if prop.enum_values.is_empty() {
+            None
+        } else {
+            Some(prop.enum_values.clone())
+        },
+    })
 }
 
-fn cast_array_if_needed(col: ArrayRef, target_scalar: &str) -> Result<ArrayRef> {
-    let target = scalar_to_arrow(target_scalar)?;
+fn propdef_to_arrow(prop: &PropDef) -> Result<arrow::datatypes::DataType> {
+    Ok(propdef_to_prop_type(prop)?.to_arrow())
+}
+
+fn cast_array_if_needed(col: ArrayRef, target_prop: &PropDef) -> Result<ArrayRef> {
+    let target = propdef_to_arrow(target_prop)?;
     if col.data_type() == &target {
         Ok(col)
     } else {

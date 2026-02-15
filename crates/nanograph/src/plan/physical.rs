@@ -6,7 +6,8 @@ use std::sync::Arc;
 use ahash::AHashMap;
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array,
-    Int32Array, Int64Array, RecordBatch, StringArray, StructArray, UInt32Array, UInt64Array,
+    Int32Array, Int64Array, ListArray, RecordBatch, StringArray, StructArray, UInt32Array,
+    UInt64Array,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::Result as DFResult;
@@ -787,6 +788,15 @@ fn literal_to_json(lit: &Literal) -> Result<serde_json::Value> {
             .map(serde_json::Value::Number)
             .ok_or_else(|| NanoError::Execution(format!("invalid float literal {}", f))),
         Literal::Bool(b) => Ok(serde_json::Value::Bool(*b)),
+        Literal::Date(s) => Ok(serde_json::Value::String(s.clone())),
+        Literal::DateTime(s) => Ok(serde_json::Value::String(s.clone())),
+        Literal::List(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(literal_to_json(item)?);
+            }
+            Ok(serde_json::Value::Array(out))
+        }
     }
 }
 
@@ -801,6 +811,11 @@ fn literal_to_predicate_string(lit: &Literal) -> Result<String> {
             Ok(f.to_string())
         }
         Literal::Bool(b) => Ok(b.to_string()),
+        Literal::Date(s) => Ok(s.clone()),
+        Literal::DateTime(s) => Ok(s.clone()),
+        Literal::List(_) => Err(NanoError::Execution(
+            "list literal is not supported in mutation predicates".to_string(),
+        )),
     }
 }
 
@@ -916,12 +931,34 @@ fn array_value_to_json(array: &ArrayRef, row: usize) -> serde_json::Value {
         DataType::Date32 => array
             .as_any()
             .downcast_ref::<Date32Array>()
-            .map(|a| serde_json::Value::Number((a.value(row) as i64).into()))
+            .map(|a| {
+                let days = a.value(row);
+                arrow::temporal_conversions::date32_to_datetime(days)
+                    .map(|dt| serde_json::Value::String(dt.format("%Y-%m-%d").to_string()))
+                    .unwrap_or_else(|| serde_json::Value::Number((days as i64).into()))
+            })
             .unwrap_or(serde_json::Value::Null),
         DataType::Date64 => array
             .as_any()
             .downcast_ref::<Date64Array>()
-            .map(|a| serde_json::Value::Number(a.value(row).into()))
+            .map(|a| {
+                let ms = a.value(row);
+                arrow::temporal_conversions::date64_to_datetime(ms)
+                    .map(|dt| serde_json::Value::String(dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()))
+                    .unwrap_or_else(|| serde_json::Value::Number(ms.into()))
+            })
+            .unwrap_or(serde_json::Value::Null),
+        DataType::List(_) => array
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .map(|a| {
+                let values = a.value(row);
+                serde_json::Value::Array(
+                    (0..values.len())
+                        .map(|idx| array_value_to_json(&values, idx))
+                        .collect(),
+                )
+            })
             .unwrap_or(serde_json::Value::Null),
         _ => serde_json::Value::Null,
     }

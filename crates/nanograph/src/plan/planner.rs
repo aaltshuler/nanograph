@@ -15,6 +15,7 @@ use crate::error::{NanoError, Result};
 use crate::ir::*;
 use crate::query::ast::{AggFunc, CompOp, Literal};
 use crate::store::graph::GraphStorage;
+use crate::store::loader::{parse_date32_literal, parse_date64_literal};
 use tracing::{debug, info, instrument};
 
 use super::node_scan::{NodeScanExec, NodeScanPredicate};
@@ -801,7 +802,7 @@ fn eval_ir_expr(
         }
         IRExpr::Literal(lit) => {
             let num_rows = batch.num_rows();
-            Ok(literal_to_array(lit, num_rows))
+            literal_to_array(lit, num_rows)
         }
         IRExpr::Variable(name) => {
             let col_idx = batch
@@ -814,7 +815,7 @@ fn eval_ir_expr(
             let lit = params
                 .get(name)
                 .ok_or_else(|| NanoError::Execution(format!("parameter ${} not provided", name)))?;
-            Ok(literal_to_array(lit, batch.num_rows()))
+            literal_to_array(lit, batch.num_rows())
         }
         _ => Err(NanoError::Execution(
             "unsupported expr in filter".to_string(),
@@ -822,12 +823,52 @@ fn eval_ir_expr(
     }
 }
 
-fn literal_to_array(lit: &Literal, num_rows: usize) -> arrow::array::ArrayRef {
+fn literal_to_array(lit: &Literal, num_rows: usize) -> Result<arrow::array::ArrayRef> {
     match lit {
-        Literal::String(s) => Arc::new(arrow::array::StringArray::from(vec![s.as_str(); num_rows])),
-        Literal::Integer(n) => Arc::new(arrow::array::Int64Array::from(vec![*n; num_rows])),
-        Literal::Float(f) => Arc::new(arrow::array::Float64Array::from(vec![*f; num_rows])),
-        Literal::Bool(b) => Arc::new(arrow::array::BooleanArray::from(vec![*b; num_rows])),
+        Literal::String(s) => Ok(Arc::new(arrow::array::StringArray::from(vec![
+            s.as_str();
+            num_rows
+        ]))),
+        Literal::Integer(n) => Ok(Arc::new(arrow::array::Int64Array::from(vec![*n; num_rows]))),
+        Literal::Float(f) => Ok(Arc::new(arrow::array::Float64Array::from(vec![*f; num_rows]))),
+        Literal::Bool(b) => Ok(Arc::new(arrow::array::BooleanArray::from(vec![*b; num_rows]))),
+        Literal::Date(s) => {
+            let days = parse_date32_literal(s).map_err(|e| NanoError::Execution(e.to_string()))?;
+            Ok(Arc::new(arrow::array::Date32Array::from(vec![days; num_rows])))
+        }
+        Literal::DateTime(s) => {
+            let ms = parse_date64_literal(s).map_err(|e| NanoError::Execution(e.to_string()))?;
+            Ok(Arc::new(arrow::array::Date64Array::from(vec![ms; num_rows])))
+        }
+        Literal::List(items) => {
+            let rendered = serde_json::Value::Array(
+                items
+                    .iter()
+                    .map(literal_to_json_value_for_display)
+                    .collect::<Vec<_>>(),
+            )
+            .to_string();
+            Ok(Arc::new(arrow::array::StringArray::from(vec![rendered; num_rows])))
+        }
+    }
+}
+
+fn literal_to_json_value_for_display(lit: &Literal) -> serde_json::Value {
+    match lit {
+        Literal::String(v) => serde_json::Value::String(v.clone()),
+        Literal::Integer(v) => serde_json::Value::Number((*v).into()),
+        Literal::Float(v) => serde_json::Number::from_f64(*v)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        Literal::Bool(v) => serde_json::Value::Bool(*v),
+        Literal::Date(v) => serde_json::Value::String(v.clone()),
+        Literal::DateTime(v) => serde_json::Value::String(v.clone()),
+        Literal::List(values) => serde_json::Value::Array(
+            values
+                .iter()
+                .map(literal_to_json_value_for_display)
+                .collect(),
+        ),
     }
 }
 
@@ -913,6 +954,9 @@ fn infer_projection_field(
                 Literal::Integer(_) => DataType::Int64,
                 Literal::Float(_) => DataType::Float64,
                 Literal::Bool(_) => DataType::Boolean,
+                Literal::Date(_) => DataType::Date32,
+                Literal::DateTime(_) => DataType::Date64,
+                Literal::List(_) => DataType::Utf8,
             };
             Ok((name, dt, false))
         }
@@ -1721,7 +1765,10 @@ impl ExecutionPlan for AntiJoinExec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{Date32Array, Date64Array, RecordBatch};
+    use arrow::datatypes::{DataType, Schema};
     use crate::query::ast::Literal;
+    use std::sync::Arc;
 
     #[test]
     fn pushdown_marks_index_eligible_for_indexed_property() {
@@ -1778,5 +1825,54 @@ mod tests {
             build_scan_pushdown_filters("p", &[filter], &ParamMap::new(), Some(&indexed_props));
         assert_eq!(predicates.len(), 1);
         assert!(!predicates[0].index_eligible);
+    }
+
+    #[test]
+    fn literal_to_array_builds_native_temporal_arrays() {
+        let date_arr = literal_to_array(&Literal::Date("2026-02-14".to_string()), 2).unwrap();
+        assert_eq!(date_arr.data_type(), &DataType::Date32);
+        let date_arr = date_arr.as_any().downcast_ref::<Date32Array>().unwrap();
+        assert_eq!(date_arr.len(), 2);
+        assert_eq!(date_arr.value(0), date_arr.value(1));
+
+        let dt_arr =
+            literal_to_array(&Literal::DateTime("2026-02-14T10:00:00Z".to_string()), 3).unwrap();
+        assert_eq!(dt_arr.data_type(), &DataType::Date64);
+        let dt_arr = dt_arr.as_any().downcast_ref::<Date64Array>().unwrap();
+        assert_eq!(dt_arr.len(), 3);
+        assert_eq!(dt_arr.value(0), dt_arr.value(2));
+    }
+
+    #[test]
+    fn literal_to_array_rejects_invalid_temporal_literals() {
+        let date_err = literal_to_array(&Literal::Date("not-a-date".to_string()), 1).unwrap_err();
+        assert!(date_err.to_string().contains("invalid Date literal"));
+
+        let dt_err =
+            literal_to_array(&Literal::DateTime("not-a-datetime".to_string()), 1).unwrap_err();
+        assert!(dt_err.to_string().contains("invalid DateTime literal"));
+    }
+
+    #[test]
+    fn infer_projection_field_uses_temporal_types_for_temporal_literals() {
+        let batch = RecordBatch::new_empty(Arc::new(Schema::new(
+            Vec::<arrow::datatypes::Field>::new(),
+        )));
+
+        let (_, date_ty, _) = infer_projection_field(
+            &IRExpr::Literal(Literal::Date("2026-02-14".to_string())),
+            Some("d"),
+            &batch,
+        )
+        .unwrap();
+        assert_eq!(date_ty, DataType::Date32);
+
+        let (_, dt_ty, _) = infer_projection_field(
+            &IRExpr::Literal(Literal::DateTime("2026-02-14T10:00:00Z".to_string())),
+            Some("ts"),
+            &batch,
+        )
+        .unwrap();
+        assert_eq!(dt_ty, DataType::Date64);
     }
 }

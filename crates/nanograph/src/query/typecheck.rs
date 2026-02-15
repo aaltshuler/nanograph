@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::catalog::Catalog;
 use crate::error::{NanoError, Result};
-use crate::types::{Direction, ScalarType};
+use crate::types::{Direction, PropType, ScalarType};
 
 use super::ast::*;
 
@@ -38,7 +38,7 @@ pub struct ResolvedTraversal {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResolvedType {
-    Scalar(ScalarType, bool),
+    Scalar(PropType),
     Node(String),
     Aggregate,
 }
@@ -79,10 +79,13 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeCont
         traversals: Vec::new(),
     };
 
-    let params: HashMap<String, ScalarType> = query
+    let params: HashMap<String, PropType> = query
         .params
         .iter()
-        .filter_map(|p| ScalarType::from_str_name(&p.type_name).map(|s| (p.name.clone(), s)))
+        .filter_map(|p| {
+            ScalarType::from_str_name(&p.type_name)
+                .map(|s| (p.name.clone(), PropType::scalar(s, p.nullable)))
+        })
         .collect();
 
     // Typecheck match clauses
@@ -105,9 +108,12 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeCont
 }
 
 fn typecheck_mutation(catalog: &Catalog, mutation: &Mutation, params: &[Param]) -> Result<String> {
-    let param_types: HashMap<String, ScalarType> = params
+    let param_types: HashMap<String, PropType> = params
         .iter()
-        .filter_map(|p| ScalarType::from_str_name(&p.type_name).map(|s| (p.name.clone(), s)))
+        .filter_map(|p| {
+            ScalarType::from_str_name(&p.type_name)
+                .map(|s| (p.name.clone(), PropType::scalar(s, p.nullable)))
+        })
         .collect();
 
     match mutation {
@@ -135,7 +141,7 @@ fn typecheck_mutation(catalog: &Catalog, mutation: &Mutation, params: &[Param]) 
                     check_match_value_type(
                         &assignment.value,
                         &param_types,
-                        &prop_type.scalar,
+                        prop_type,
                         &assignment.property,
                     )?;
                 }
@@ -165,7 +171,7 @@ fn typecheck_mutation(catalog: &Catalog, mutation: &Mutation, params: &[Param]) 
                             check_match_value_type(
                                 &assignment.value,
                                 &param_types,
-                                &ScalarType::String,
+                                &PropType::scalar(ScalarType::String, false),
                                 "from",
                             )?;
                         }
@@ -174,7 +180,7 @@ fn typecheck_mutation(catalog: &Catalog, mutation: &Mutation, params: &[Param]) 
                             check_match_value_type(
                                 &assignment.value,
                                 &param_types,
-                                &ScalarType::String,
+                                &PropType::scalar(ScalarType::String, false),
                                 "to",
                             )?;
                         }
@@ -191,7 +197,7 @@ fn typecheck_mutation(catalog: &Catalog, mutation: &Mutation, params: &[Param]) 
                             check_match_value_type(
                                 &assignment.value,
                                 &param_types,
-                                &prop_type.scalar,
+                                prop_type,
                                 &assignment.property,
                             )?;
                         }
@@ -266,7 +272,7 @@ fn typecheck_mutation(catalog: &Catalog, mutation: &Mutation, params: &[Param]) 
                 check_match_value_type(
                     &assignment.value,
                     &param_types,
-                    &prop_type.scalar,
+                    prop_type,
                     &assignment.property,
                 )?;
             }
@@ -323,7 +329,7 @@ fn typecheck_mutation_predicate(
     type_name: &str,
     predicate: &MutationPredicate,
     node_type: &crate::catalog::NodeType,
-    param_types: &HashMap<String, ScalarType>,
+    param_types: &HashMap<String, PropType>,
 ) -> Result<()> {
     let prop_type = node_type
         .properties
@@ -337,7 +343,7 @@ fn typecheck_mutation_predicate(
     check_match_value_type(
         &predicate.value,
         param_types,
-        &prop_type.scalar,
+        prop_type,
         &predicate.property,
     )?;
     Ok(())
@@ -347,13 +353,13 @@ fn typecheck_edge_mutation_predicate(
     type_name: &str,
     predicate: &MutationPredicate,
     edge_type: &crate::catalog::EdgeType,
-    param_types: &HashMap<String, ScalarType>,
+    param_types: &HashMap<String, PropType>,
 ) -> Result<()> {
     if predicate.property == "from" || predicate.property == "to" {
         return check_match_value_type(
             &predicate.value,
             param_types,
-            &ScalarType::String,
+            &PropType::scalar(ScalarType::String, false),
             &predicate.property,
         );
     }
@@ -370,7 +376,7 @@ fn typecheck_edge_mutation_predicate(
     check_match_value_type(
         &predicate.value,
         param_types,
-        &prop_type.scalar,
+        prop_type,
         &predicate.property,
     )?;
     Ok(())
@@ -378,8 +384,8 @@ fn typecheck_edge_mutation_predicate(
 
 fn check_match_value_type(
     value: &MatchValue,
-    params: &HashMap<String, ScalarType>,
-    expected: &ScalarType,
+    params: &HashMap<String, PropType>,
+    expected: &PropType,
     property: &str,
 ) -> Result<()> {
     match value {
@@ -394,7 +400,9 @@ fn check_match_value_type(
             if !types_compatible(actual, expected) {
                 return Err(NanoError::Type(format!(
                     "T7: cannot assign/compare {} with {} for property `{}`",
-                    actual, expected, property
+                    actual.display_name(),
+                    expected.display_name(),
+                    property
                 )));
             }
             Ok(())
@@ -406,7 +414,7 @@ fn typecheck_clauses(
     catalog: &Catalog,
     clauses: &[Clause],
     ctx: &mut TypeContext,
-    params: &HashMap<String, ScalarType>,
+    params: &HashMap<String, PropType>,
     _in_negation: bool,
 ) -> Result<()> {
     for clause in clauses {
@@ -481,7 +489,7 @@ fn typecheck_binding(catalog: &Catalog, binding: &Binding, ctx: &mut TypeContext
         // T3: check value type matches property type
         match &pm.value {
             MatchValue::Literal(lit) => {
-                check_literal_type(lit, &prop.scalar, &pm.prop_name)?;
+                check_literal_type(lit, prop, &pm.prop_name)?;
             }
             MatchValue::Variable(_) => {
                 // Variable match — will be unified, no static check needed here
@@ -629,18 +637,24 @@ fn typecheck_filter(
     catalog: &Catalog,
     filter: &Filter,
     ctx: &TypeContext,
-    params: &HashMap<String, ScalarType>,
+    params: &HashMap<String, PropType>,
 ) -> Result<()> {
     let left_type = resolve_expr_type(catalog, &filter.left, ctx, params)?;
     let right_type = resolve_expr_type(catalog, &filter.right, ctx, params)?;
 
     // T7: check type compatibility
     match (&left_type, &right_type) {
-        (ResolvedType::Scalar(l, _), ResolvedType::Scalar(r, _)) => {
+        (ResolvedType::Scalar(l), ResolvedType::Scalar(r)) => {
+            if l.list || r.list {
+                return Err(NanoError::Type(
+                    "T7: list comparisons in filters are not supported".to_string(),
+                ));
+            }
             if !types_compatible(l, r) {
                 return Err(NanoError::Type(format!(
                     "T7: cannot compare {} with {}",
-                    l, r
+                    l.display_name(),
+                    r.display_name()
                 )));
             }
         }
@@ -654,7 +668,7 @@ fn resolve_expr_type(
     catalog: &Catalog,
     expr: &Expr,
     ctx: &TypeContext,
-    params: &HashMap<String, ScalarType>,
+    params: &HashMap<String, PropType>,
 ) -> Result<ResolvedType> {
     match expr {
         Expr::PropAccess { variable, property } => {
@@ -674,12 +688,12 @@ fn resolve_expr_type(
                 ))
             })?;
 
-            Ok(ResolvedType::Scalar(prop.scalar, prop.nullable))
+            Ok(ResolvedType::Scalar(prop.clone()))
         }
         Expr::Variable(name) => {
             // Could be a query parameter or a bound variable
-            if let Some(scalar) = params.get(name) {
-                Ok(ResolvedType::Scalar(*scalar, false))
+            if let Some(prop_type) = params.get(name) {
+                Ok(ResolvedType::Scalar(prop_type.clone()))
             } else if let Some(bv) = ctx.bindings.get(name) {
                 Ok(ResolvedType::Node(bv.type_name.clone()))
             } else {
@@ -689,18 +703,19 @@ fn resolve_expr_type(
                 )))
             }
         }
-        Expr::Literal(lit) => Ok(ResolvedType::Scalar(literal_type(lit), false)),
+        Expr::Literal(lit) => Ok(ResolvedType::Scalar(literal_type(lit)?)),
         Expr::Aggregate { func, arg } => {
             let arg_type = resolve_expr_type(catalog, arg, ctx, params)?;
 
             // T8: sum/avg/min/max require numeric
             match func {
                 AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max => {
-                    if let ResolvedType::Scalar(s, _) = &arg_type {
-                        if !s.is_numeric() {
+                    if let ResolvedType::Scalar(s) = &arg_type {
+                        if s.list || !s.scalar.is_numeric() {
                             return Err(NanoError::Type(format!(
                                 "T8: {} requires numeric type, got {}",
-                                func, s
+                                func,
+                                s.display_name()
                             )));
                         }
                     }
@@ -722,32 +737,91 @@ fn resolve_expr_type(
     }
 }
 
-fn literal_type(lit: &Literal) -> ScalarType {
+fn literal_type(lit: &Literal) -> Result<PropType> {
     match lit {
-        Literal::String(_) => ScalarType::String,
-        Literal::Integer(_) => ScalarType::I64,
-        Literal::Float(_) => ScalarType::F64,
-        Literal::Bool(_) => ScalarType::Bool,
+        Literal::String(_) => Ok(PropType::scalar(ScalarType::String, false)),
+        Literal::Integer(_) => Ok(PropType::scalar(ScalarType::I64, false)),
+        Literal::Float(_) => Ok(PropType::scalar(ScalarType::F64, false)),
+        Literal::Bool(_) => Ok(PropType::scalar(ScalarType::Bool, false)),
+        Literal::Date(_) => Ok(PropType::scalar(ScalarType::Date, false)),
+        Literal::DateTime(_) => Ok(PropType::scalar(ScalarType::DateTime, false)),
+        Literal::List(items) => {
+            if items.is_empty() {
+                return Ok(PropType::list_of(ScalarType::String, false));
+            }
+            let first = literal_type(&items[0])?;
+            if first.list {
+                return Err(NanoError::Type(
+                    "nested list literals are not supported".to_string(),
+                ));
+            }
+            for item in items.iter().skip(1) {
+                let item_type = literal_type(item)?;
+                if item_type.list || !types_compatible(&first, &item_type) {
+                    return Err(NanoError::Type(
+                        "list literal elements must share a compatible scalar type".to_string(),
+                    ));
+                }
+            }
+            Ok(PropType::list_of(first.scalar, false))
+        }
     }
 }
 
-fn check_literal_type(lit: &Literal, expected: &ScalarType, prop_name: &str) -> Result<()> {
-    let lit_type = literal_type(lit);
+fn check_literal_type(lit: &Literal, expected: &PropType, prop_name: &str) -> Result<()> {
+    let lit_type = literal_type(lit)?;
     if !types_compatible(&lit_type, expected) {
         return Err(NanoError::Type(format!(
             "T3: property `{}` has type {} but got {}",
-            prop_name, expected, lit_type
+            prop_name,
+            expected.display_name(),
+            lit_type.display_name()
         )));
+    }
+    if expected.is_enum() {
+        let allowed = expected.enum_values.as_ref().cloned().unwrap_or_default();
+        match lit {
+            Literal::String(v) => {
+                if !allowed.contains(v) {
+                    return Err(NanoError::Type(format!(
+                        "T3: property `{}` expects one of [{}], got '{}'",
+                        prop_name,
+                        allowed.join(", "),
+                        v
+                    )));
+                }
+            }
+            Literal::List(items) if expected.list => {
+                for item in items {
+                    match item {
+                        Literal::String(v) if allowed.contains(v) => {}
+                        Literal::String(v) => {
+                            return Err(NanoError::Type(format!(
+                                "T3: property `{}` expects one of [{}], got '{}'",
+                                prop_name,
+                                allowed.join(", "),
+                                v
+                            )));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
     }
     Ok(())
 }
 
-fn types_compatible(a: &ScalarType, b: &ScalarType) -> bool {
-    if a == b {
+fn types_compatible(a: &PropType, b: &PropType) -> bool {
+    if a.list != b.list {
+        return false;
+    }
+    if a.scalar == b.scalar {
         return true;
     }
     // Numeric types are mutually compatible for comparison
-    if a.is_numeric() && b.is_numeric() {
+    if a.scalar.is_numeric() && b.scalar.is_numeric() {
         return true;
     }
     false

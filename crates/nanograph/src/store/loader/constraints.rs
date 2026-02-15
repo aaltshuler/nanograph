@@ -1,4 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::HashSet;
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array,
@@ -95,6 +97,7 @@ pub(crate) fn enforce_node_unique_constraints(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn collect_incoming_node_types(data_source: &str) -> Result<HashSet<String>> {
     let mut node_types = HashSet::new();
     for line in data_source.lines() {
@@ -114,28 +117,22 @@ pub(crate) fn collect_incoming_node_types(data_source: &str) -> Result<HashSet<S
 
 pub(crate) fn build_name_seed_for_keyed_load(
     storage: &GraphStorage,
-    schema_ir: &SchemaIR,
     key_props: &HashMap<String, String>,
-    incoming_node_types: &HashSet<String>,
 ) -> Result<HashMap<(String, String), u64>> {
     let mut seed = HashMap::new();
 
-    for node_def in schema_ir.node_types() {
-        let preserve_existing =
-            key_props.contains_key(&node_def.name) || !incoming_node_types.contains(&node_def.name);
-        if !preserve_existing {
+    for (type_name, key_prop) in key_props {
+        let Some(batch) = storage.get_all_nodes(type_name)? else {
             continue;
-        }
+        };
 
-        let Some(batch) = storage.get_all_nodes(&node_def.name)? else {
-            continue;
-        };
-        let Some(name_col) = batch.column_by_name("name") else {
-            continue;
-        };
-        let Some(name_arr) = name_col.as_any().downcast_ref::<StringArray>() else {
-            continue;
-        };
+        let key_idx = batch.schema().index_of(key_prop).map_err(|e| {
+            NanoError::Storage(format!(
+                "node type {} missing @key property {}: {}",
+                type_name, key_prop, e
+            ))
+        })?;
+        let key_arr = batch.column(key_idx).clone();
         let id_arr = batch
             .column(0)
             .as_any()
@@ -143,16 +140,14 @@ pub(crate) fn build_name_seed_for_keyed_load(
             .ok_or_else(|| {
                 NanoError::Storage(format!(
                     "node type {} has non-UInt64 id column",
-                    node_def.name
+                    type_name
                 ))
             })?;
 
         for row in 0..batch.num_rows() {
-            if name_arr.is_null(row) {
-                continue;
-            }
+            let key = key_value_string(&key_arr, row, key_prop)?;
             seed.insert(
-                (node_def.name.clone(), name_arr.value(row).to_string()),
+                (type_name.clone(), key),
                 id_arr.value(row),
             );
         }
@@ -163,43 +158,9 @@ pub(crate) fn build_name_seed_for_keyed_load(
 
 pub(crate) fn build_name_seed_for_append(
     storage: &GraphStorage,
-    schema_ir: &SchemaIR,
+    key_props: &HashMap<String, String>,
 ) -> Result<HashMap<(String, String), u64>> {
-    let mut seed = HashMap::new();
-
-    for node_def in schema_ir.node_types() {
-        let Some(batch) = storage.get_all_nodes(&node_def.name)? else {
-            continue;
-        };
-        let Some(name_col) = batch.column_by_name("name") else {
-            continue;
-        };
-        let Some(name_arr) = name_col.as_any().downcast_ref::<StringArray>() else {
-            continue;
-        };
-        let id_arr = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| {
-                NanoError::Storage(format!(
-                    "node type {} has non-UInt64 id column",
-                    node_def.name
-                ))
-            })?;
-
-        for row in 0..batch.num_rows() {
-            if name_arr.is_null(row) {
-                continue;
-            }
-            seed.insert(
-                (node_def.name.clone(), name_arr.value(row).to_string()),
-                id_arr.value(row),
-            );
-        }
-    }
-
-    Ok(seed)
+    build_name_seed_for_keyed_load(storage, key_props)
 }
 
 pub(crate) fn key_value_string(array: &ArrayRef, row: usize, prop_name: &str) -> Result<String> {
@@ -352,10 +313,12 @@ mod tests {
     email: String? @unique
 }"#;
         let (_, mut storage) = build_schema_ir_and_storage(schema);
+        let key_props = HashMap::new();
         load_jsonl_data(
             &mut storage,
             r#"{"type":"Person","data":{"name":"Alice","email":"dupe@example.com"}}
 {"type":"Person","data":{"name":"Bob","email":"dupe@example.com"}}"#,
+            &key_props,
         )
         .unwrap();
 
@@ -383,10 +346,12 @@ mod tests {
     nick: String? @unique
 }"#;
         let (_, mut storage) = build_schema_ir_and_storage(schema);
+        let key_props = HashMap::new();
         load_jsonl_data(
             &mut storage,
             r#"{"type":"Person","data":{"name":"Alice","nick":null}}
 {"type":"Person","data":{"name":"Bob","nick":null}}"#,
+            &key_props,
         )
         .unwrap();
 
@@ -395,48 +360,52 @@ mod tests {
     }
 
     #[test]
-    fn build_name_seed_for_keyed_load_keeps_keyed_and_absent_unkeyed_types() {
+    fn build_name_seed_for_keyed_load_uses_declared_key_property() {
         let schema = r#"node Person {
+    uid: String @key
     name: String
 }
 node Company {
     name: String
 }"#;
-        let (ir, mut storage) = build_schema_ir_and_storage(schema);
+        let (_, mut storage) = build_schema_ir_and_storage(schema);
+        let key_props = HashMap::from([("Person".to_string(), "uid".to_string())]);
         load_jsonl_data(
             &mut storage,
-            r#"{"type":"Person","data":{"name":"Alice"}}
+            r#"{"type":"Person","data":{"uid":"u1","name":"Alice"}}
 {"type":"Company","data":{"name":"Acme"}}"#,
+            &key_props,
         )
         .unwrap();
 
-        let key_props = HashMap::from([("Person".to_string(), "name".to_string())]);
-        let incoming = HashSet::from(["Person".to_string()]);
-        let seed = build_name_seed_for_keyed_load(&storage, &ir, &key_props, &incoming).unwrap();
+        let seed = build_name_seed_for_keyed_load(&storage, &key_props).unwrap();
 
-        assert!(seed.contains_key(&("Person".to_string(), "Alice".to_string())));
-        assert!(seed.contains_key(&("Company".to_string(), "Acme".to_string())));
+        assert!(seed.contains_key(&("Person".to_string(), "u1".to_string())));
+        assert!(!seed.contains_key(&("Company".to_string(), "Acme".to_string())));
     }
 
     #[test]
-    fn build_name_seed_for_append_keeps_all_existing_named_nodes() {
+    fn build_name_seed_for_append_keeps_all_existing_keyed_nodes() {
         let schema = r#"node Person {
+    uid: String @key
     name: String
 }
 node Company {
     name: String
 }"#;
-        let (ir, mut storage) = build_schema_ir_and_storage(schema);
+        let (_, mut storage) = build_schema_ir_and_storage(schema);
+        let key_props = HashMap::from([("Person".to_string(), "uid".to_string())]);
         load_jsonl_data(
             &mut storage,
-            r#"{"type":"Person","data":{"name":"Alice"}}
+            r#"{"type":"Person","data":{"uid":"u1","name":"Alice"}}
 {"type":"Company","data":{"name":"Acme"}}"#,
+            &key_props,
         )
         .unwrap();
 
-        let seed = build_name_seed_for_append(&storage, &ir).unwrap();
-        assert!(seed.contains_key(&("Person".to_string(), "Alice".to_string())));
-        assert!(seed.contains_key(&("Company".to_string(), "Acme".to_string())));
+        let seed = build_name_seed_for_append(&storage, &key_props).unwrap();
+        assert!(seed.contains_key(&("Person".to_string(), "u1".to_string())));
+        assert!(!seed.contains_key(&("Company".to_string(), "Acme".to_string())));
     }
 
     #[test]

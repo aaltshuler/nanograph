@@ -414,10 +414,7 @@ fn parse_comp_op(pair: pest::iterators::Pair<Rule>) -> Result<CompOp> {
 fn parse_literal(pair: pest::iterators::Pair<Rule>) -> Result<Literal> {
     let inner = pair.into_inner().next().unwrap();
     match inner.as_rule() {
-        Rule::string_lit => {
-            let s = inner.as_str();
-            Ok(Literal::String(s[1..s.len() - 1].to_string()))
-        }
+        Rule::string_lit => Ok(Literal::String(parse_string_lit(inner.as_str()))),
         Rule::integer => {
             let n: i64 = inner
                 .as_str()
@@ -436,10 +433,45 @@ fn parse_literal(pair: pest::iterators::Pair<Rule>) -> Result<Literal> {
             let b = inner.as_str() == "true";
             Ok(Literal::Bool(b))
         }
+        Rule::date_lit => {
+            let date_str = inner
+                .into_inner()
+                .next()
+                .map(|s| parse_string_lit(s.as_str()))
+                .ok_or_else(|| NanoError::Parse("date literal requires a string".to_string()))?;
+            Ok(Literal::Date(date_str))
+        }
+        Rule::datetime_lit => {
+            let dt_str = inner
+                .into_inner()
+                .next()
+                .map(|s| parse_string_lit(s.as_str()))
+                .ok_or_else(|| {
+                    NanoError::Parse("datetime literal requires a string".to_string())
+                })?;
+            Ok(Literal::DateTime(dt_str))
+        }
+        Rule::list_lit => {
+            let mut items = Vec::new();
+            for item in inner.into_inner() {
+                if item.as_rule() == Rule::literal {
+                    items.push(parse_literal(item)?);
+                }
+            }
+            Ok(Literal::List(items))
+        }
         _ => Err(NanoError::Parse(format!(
             "unexpected literal: {:?}",
             inner.as_rule()
         ))),
+    }
+}
+
+fn parse_string_lit(raw: &str) -> String {
+    if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
+        raw[1..raw.len() - 1].to_string()
+    } else {
+        raw.to_string()
     }
 }
 
@@ -832,6 +864,57 @@ query drop_person($name: String) {
                 assert_eq!(del.predicate.op, CompOp::Eq);
             }
             _ => panic!("expected Delete mutation"),
+        }
+    }
+
+    #[test]
+    fn test_parse_date_and_datetime_literals() {
+        let input = r#"
+query dated() {
+    match {
+        $e: Event
+        $e.on = date("2026-02-14")
+        $e.at >= datetime("2026-02-14T10:00:00Z")
+    }
+    return { $e.id }
+}
+"#;
+        let qf = parse_query(input).unwrap();
+        let q = &qf.queries[0];
+        match &q.match_clause[1] {
+            Clause::Filter(f) => match &f.right {
+                Expr::Literal(Literal::Date(v)) => assert_eq!(v, "2026-02-14"),
+                other => panic!("expected date literal, got {:?}", other),
+            },
+            _ => panic!("expected Filter"),
+        }
+        match &q.match_clause[2] {
+            Clause::Filter(f) => match &f.right {
+                Expr::Literal(Literal::DateTime(v)) => assert_eq!(v, "2026-02-14T10:00:00Z"),
+                other => panic!("expected datetime literal, got {:?}", other),
+            },
+            _ => panic!("expected Filter"),
+        }
+    }
+
+    #[test]
+    fn test_parse_list_literal() {
+        let input = r#"
+query listy() {
+    match { $p: Person { tags: ["rust", "db"] } }
+    return { $p.tags }
+}
+"#;
+        let qf = parse_query(input).unwrap();
+        let q = &qf.queries[0];
+        match &q.match_clause[0] {
+            Clause::Binding(b) => match &b.prop_matches[0].value {
+                MatchValue::Literal(Literal::List(items)) => {
+                    assert_eq!(items.len(), 2);
+                }
+                other => panic!("expected list literal, got {:?}", other),
+            },
+            _ => panic!("expected Binding"),
         }
     }
 

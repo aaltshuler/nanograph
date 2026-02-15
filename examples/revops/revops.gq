@@ -1,0 +1,275 @@
+// Omni Context Graph — NanoGraph Queries
+// Demonstrates: traversal, multi-hop, reverse, negation,
+//               aggregation, date/bool filtering, mutations
+
+// ═══════════════════════════════════════════════════════════════
+// LOOKUPS
+// ═══════════════════════════════════════════════════════════════
+
+// All clients
+query all_clients() {
+    match { $c: Client }
+    return { $c.slug, $c.name, $c.status, $c.company, $c.tags }
+}
+
+// Find a client by name
+query client_lookup($name: String) {
+    match { $c: Client { name: $name } }
+    return { $c.slug, $c.name, $c.status, $c.company, $c.tags }
+}
+
+// All opportunities in a given stage
+query pipeline_by_stage($stage: String) {
+    match {
+        $o: Opportunity { stage: $stage }
+    }
+    return { $o.title, $o.priority, $o.amount }
+    order { $o.amount desc }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// DECISION TRACE — "Why did this happen?"
+// ═══════════════════════════════════════════════════════════════
+
+// From an opportunity, trace who decided and what signal drove it
+query decision_trace($opp: String) {
+    match {
+        $o: Opportunity { slug: $opp }
+        $d targets $o
+        $d madeBy $a
+        $d informedBy $s
+    }
+    return { $o.title, $d.intent, $a.name, $s.summary, $s.urgency }
+}
+
+// From an opportunity, trace back through execution to the decision
+query execution_trace($opp: String) {
+    match {
+        $o: Opportunity { slug: $opp }
+        $act touchedOpportunity $o
+        $d resultedIn $act
+        $d madeBy $a
+    }
+    return { $o.title, $act.operation, $act.resultSummary, $d.intent, $a.name }
+}
+
+// Full trace: signal → decision → action → opportunity (cycle-closing join)
+query full_trace($sig: String) {
+    match {
+        $s: Signal { slug: $sig }
+        $s surfaced $o
+        $d targets $o
+        $d informedBy $s
+        $d madeBy $a
+        $d resultedIn $act
+        $act touchedOpportunity $o
+    }
+    return {
+        $s.summary
+        $a.name
+        $d.intent
+        $act.resultSummary
+        $o.title
+        $o.stage
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SIGNAL-TO-VALUE — "What value did this intelligence create?"
+// ═══════════════════════════════════════════════════════════════
+
+// Signal → Opportunity
+query signal_value($sig: String) {
+    match {
+        $s: Signal { slug: $sig }
+        $s surfaced $o
+        $s signalAffects $c
+    }
+    return { $s.summary, $o.title, $o.stage, $o.amount, $c.name }
+}
+
+// Signal → Opportunity → Project (multi-hop)
+query signal_to_project($sig: String) {
+    match {
+        $s: Signal { slug: $sig }
+        $s surfaced $o
+        $o contains $p
+    }
+    return { $s.summary, $o.title, $p.name, $p.status }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// REVERSE TRAVERSAL
+// ═══════════════════════════════════════════════════════════════
+
+// Who owns a given opportunity (client side)
+query opportunity_owner($opp: String) {
+    match {
+        $o: Opportunity { slug: $opp }
+        $c clientOwnsOpportunity $o
+    }
+    return { $c.name, $c.status, $c.company, $o.title, $o.stage }
+}
+
+// What records does a client own
+query client_records($client: String) {
+    match {
+        $c: Client { slug: $client }
+        $c clientOwnsRecord $r
+    }
+    return { $r.title, $r.platform, $r.recordType }
+}
+
+// What projects does a client own
+query client_projects($client: String) {
+    match {
+        $c: Client { slug: $client }
+        $c clientOwnsProject $p
+    }
+    return { $c.name, $p.name, $p.status, $p.engagementType }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ENRICHMENT & SCREENING
+// ═══════════════════════════════════════════════════════════════
+
+// Enrichment profiles derived from policies
+query enrichment_from_policy($pol: String) {
+    match {
+        $pol_node: Policy { slug: $pol }
+        $profile derivedFrom $pol_node
+        $profile: Record { recordType: "enrichment" }
+    }
+    return { $pol_node.name, $profile.title }
+}
+
+// Policy versioning chain
+query policy_versions($key: String) {
+    match {
+        $current: Policy { policyKey: $key }
+        $current supersedes $old
+    }
+    return { $current.name, $current.effectiveFrom, $old.name, $old.effectiveFrom }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// TASK MANAGEMENT
+// ═══════════════════════════════════════════════════════════════
+
+// Agent workload: tasks assigned to a specific actor
+query actor_tasks($actor: String) {
+    match {
+        $a: Actor { slug: $actor }
+        $ai assignedTo $a
+    }
+    return { $ai.title, $ai.status, $ai.priority, $ai.dueDate }
+}
+
+// Tasks that no action has resolved (negation)
+query unresolved_tasks() {
+    match {
+        $ai: ActionItem
+        not { $_ resolves $ai }
+    }
+    return { $ai.title, $ai.status, $ai.priority }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// AGGREGATION
+// ═══════════════════════════════════════════════════════════════
+
+// Pipeline summary: count and total value by stage
+query pipeline_summary() {
+    match {
+        $o: Opportunity
+    }
+    return {
+        $o.stage
+        count($o) as deals
+        sum($o.amount) as total_value
+    }
+    order { total_value desc }
+}
+
+// Decisions grouped by domain
+query decisions_by_domain() {
+    match { $d: Decision }
+    return {
+        $d.domain
+        count($d) as total
+    }
+    order { total desc }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// FILTERING — DateTime, Bool, Enum
+// ═══════════════════════════════════════════════════════════════
+
+// Recent signals after a given date
+query recent_signals($since: DateTime) {
+    match {
+        $s: Signal
+        $s.observedAt >= $since
+    }
+    return { $s.summary, $s.urgency, $s.sourceType, $s.observedAt }
+    order { $s.observedAt desc }
+}
+
+// Successful actions only
+query successful_actions() {
+    match {
+        $act: Action
+        $act.success = true
+    }
+    return { $act.operation, $act.resultSummary, $act.executedAt }
+    order { $act.executedAt desc }
+}
+
+// High-urgency signals
+query urgent_signals() {
+    match {
+        $s: Signal
+        $s.urgency = "high"
+    }
+    return { $s.summary, $s.sourceType, $s.observedAt }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// MUTATIONS
+// ═══════════════════════════════════════════════════════════════
+
+// Insert a new signal (append-only — never modify existing signals)
+query add_signal() {
+    insert Signal {
+        slug: "sig-vendor-renewal"
+        observedAt: datetime("2026-02-15T14:00:00Z")
+        summary: "Vendor renewal window opens in 30 days"
+        urgency: "medium"
+        sourceType: "email"
+        assertion: "fact"
+        createdAt: datetime("2026-02-15T14:00:00Z")
+    }
+}
+
+// Advance opportunity stage (pointer node — update in place)
+query advance_stage() {
+    update Opportunity set {
+        stage: "won"
+        closedAt: datetime("2026-02-14T00:00:00Z")
+        amountPaid: 15000.0
+        updatedAt: datetime("2026-02-14T16:00:00Z")
+    } where slug = "opp-stripe-migration"
+}
+
+// Complete an action item
+query complete_task() {
+    update ActionItem set {
+        status: "completed"
+        updatedAt: datetime("2026-02-12T14:00:00Z")
+    } where slug = "ai-draft-proposal"
+}
+
+// Delete a cancelled action item
+query remove_cancelled() {
+    delete ActionItem where slug = "ai-draft-proposal"
+}

@@ -6,7 +6,7 @@ set -euo pipefail
 #
 # Exercises:
 #   1. Init + baseline load (Star Wars fixture)
-#   2. Keyed upsert on Character.name (@key)
+#   2. Keyed upsert on Character.slug (@key)
 #   3. Edge dedup (no multigraph) on duplicate Fought edge input
 #   4. Delete API + edge cascade (delete Character "Darth Vader")
 #   5. Reopen/readback consistency after writes
@@ -16,9 +16,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/../lib/common.sh"
 ROOT="$(repo_root_from_script_dir "$SCRIPT_DIR")"
 EXAMPLES="$ROOT/examples/starwars"
-DB="/tmp/sw_lifecycle_test.nanograph"
 TMP_DIR="$(mktemp -d /tmp/sw_lifecycle.XXXXXX)"
-KEYED_SCHEMA="$TMP_DIR/starwars-keyed.pg"
+DB="$TMP_DIR/sw_lifecycle_test.nanograph"
 QUERY_FILE="$TMP_DIR/lifecycle.gq"
 UPSERT_DATA="$TMP_DIR/upsert.jsonl"
 
@@ -38,20 +37,17 @@ run_count() {
 # ── 0. Build ───────────────────────────────────────────────────────────────
 build_nanograph_binary "$ROOT"
 
-# ── 1. Prepare keyed Star Wars schema ──────────────────────────────────────
-create_character_name_keyed_schema "$EXAMPLES/starwars.pg" "$KEYED_SCHEMA"
-
-# ── 2. Init + baseline load ────────────────────────────────────────────────
+# ── 1. Init + baseline load ────────────────────────────────────────────────
 rm -rf "$DB"
 info "Initializing database..."
-"$NG" init "$DB" --schema "$KEYED_SCHEMA"
+"$NG" init "$DB" --schema "$EXAMPLES/starwars.pg"
 pass "Database initialized"
 
 info "Loading baseline Star Wars data..."
 "$NG" load "$DB" --data "$EXAMPLES/starwars.jsonl" --mode overwrite
 pass "Baseline data loaded"
 
-# ── 3. Write lifecycle query set ───────────────────────────────────────────
+# ── 2. Write lifecycle query set ───────────────────────────────────────────
 cat > "$QUERY_FILE" << 'QUERIES'
 query character_rows($name: String) {
     match { $c: Character { name: $name } }
@@ -109,7 +105,7 @@ query wielders_for($name: String) {
 QUERIES
 pass "Lifecycle query file written"
 
-# ── 4. Baseline capture ────────────────────────────────────────────────────
+# ── 3. Baseline capture ────────────────────────────────────────────────────
 info "Capturing baseline metrics..."
 DUELS_BEFORE=$(run_count all_duels)
 LUKE_DUELS_FROM_BEFORE=$(run_count duels_from --param "name=Luke Skywalker")
@@ -117,12 +113,12 @@ LUKE_DUELS_TO_BEFORE=$(run_count duels_to --param "name=Luke Skywalker")
 LUKE_WIELDS_BEFORE=$(run_count wielders_for --param "name=Luke Skywalker")
 pass "Captured baseline duel and Luke edge metrics"
 
-# ── 5. Keyed upsert + dedup scenario ───────────────────────────────────────
+# ── 4. Keyed upsert + dedup scenario ───────────────────────────────────────
 cat > "$UPSERT_DATA" << 'JSONL'
-{"type":"Character","data":{"name":"Luke Skywalker","note":"UPDATED_NOTE_LUKE_TEST","species":"Human","gender":"Male","rank":"Jedi Knight","era":"Galactic Civil War","alignment":"Hero"}}
-{"type":"Character","data":{"name":"Ahsoka Tano","note":"Former Jedi and rebel ally","species":"Togruta","gender":"Female","rank":"Jedi Padawan","era":"Galactic Civil War","alignment":"Hero"}}
-{"edge":"Fought","from":"Ahsoka Tano","to":"Darth Vader","data":{"location":"Malachor"}}
-{"edge":"Fought","from":"Ahsoka Tano","to":"Darth Vader","data":{"location":"Malachor (duplicate line should dedup)"}}
+{"type":"Character","data":{"slug":"luke-skywalker","name":"Luke Skywalker","note":"UPDATED_NOTE_LUKE_TEST","species":"Human","gender":"Male","rank":"Jedi Knight","era":"original","alignment":"hero","tags":["pilot","jedi"]}}
+{"type":"Character","data":{"slug":"ahsoka-tano","name":"Ahsoka Tano","note":"Former Jedi and rebel ally","species":"Togruta","gender":"Female","rank":"Jedi Padawan","era":"clone_wars","alignment":"hero","tags":["jedi","rebel"]}}
+{"edge":"Fought","from":"ahsoka-tano","to":"darth-vader","data":{"location":"Malachor"}}
+{"edge":"Fought","from":"ahsoka-tano","to":"darth-vader","data":{"location":"Malachor"}}
 JSONL
 
 info "Applying keyed upsert load..."
@@ -150,7 +146,7 @@ EXPECTED_DUELS_AFTER_UPSERT=$((DUELS_BEFORE + 1))
 assert_int_eq "$DUELS_AFTER_UPSERT" "$EXPECTED_DUELS_AFTER_UPSERT" \
     "Edge dedup applied (duplicate edge lines produce one duel)"
 
-# ── 6. Delete + cascade checks ─────────────────────────────────────────────
+# ── 5. Delete + cascade checks ─────────────────────────────────────────────
 info "Capturing pre-delete cascade metrics..."
 DUELS_PRE_DELETE=$(run_count all_duels)
 VADER_DUELS_FROM_PRE_DELETE=$(run_count duels_from --param "name=Darth Vader")
@@ -159,7 +155,7 @@ WIELDERS_PRE_DELETE=$(run_count wielders)
 VADER_WIELDS_PRE_DELETE=$(run_count wielders_for --param "name=Darth Vader")
 
 info "Deleting Darth Vader with cascade..."
-"$NG" delete "$DB" --type Character --where "name=Darth Vader"
+"$NG" delete "$DB" --type Character --where "slug=darth-vader"
 pass "Delete command executed"
 
 VADER_EXISTS_AFTER=$(run_count character_rows --param "name=Darth Vader")
@@ -180,7 +176,7 @@ EXPECTED_WIELDERS_AFTER_DELETE=$((WIELDERS_PRE_DELETE - VADER_WIELDS_PRE_DELETE)
 assert_int_eq "$WIELDERS_AFTER_DELETE" "$EXPECTED_WIELDERS_AFTER_DELETE" \
     "Non-duel incident edges (Wields) also cascaded"
 
-# ── 7. Reopen/readback sanity ──────────────────────────────────────────────
+# ── 6. Reopen/readback sanity ──────────────────────────────────────────────
 info "Verifying reopen/readback consistency..."
 DUELS_REOPEN_CHECK=$(run_count all_duels)
 assert_int_eq "$DUELS_REOPEN_CHECK" "$DUELS_AFTER_DELETE" \

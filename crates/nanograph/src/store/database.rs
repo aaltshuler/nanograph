@@ -7,7 +7,7 @@ use arrow::record_batch::{RecordBatch, RecordBatchIterator};
 use arrow::{
     array::{
         Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Date64Array, Float32Array,
-        Float64Array, Int32Array, Int64Array, StringArray, UInt32Array, UInt64Array,
+        Float64Array, Int32Array, Int64Array, ListArray, StringArray, UInt32Array, UInt64Array,
     },
     datatypes::DataType,
 };
@@ -1306,27 +1306,29 @@ fn parse_predicate_array(value: &str, dt: &DataType, num_rows: usize) -> Result<
             Arc::new(Float64Array::from(vec![parsed; num_rows]))
         }
         DataType::Date32 => {
-            let parsed = trim_quotes.parse::<i32>().map_err(|_| {
-                NanoError::Storage(format!(
-                    "invalid Date32 literal '{}' for delete predicate (expected days since epoch)",
-                    value
-                ))
-            })?;
-            let base: ArrayRef = Arc::new(Int32Array::from(vec![parsed; num_rows]));
+            let base: ArrayRef = if let Ok(parsed) = trim_quotes.parse::<i32>() {
+                Arc::new(Int32Array::from(vec![parsed; num_rows]))
+            } else {
+                Arc::new(StringArray::from(vec![trim_quotes; num_rows]))
+            };
             arrow::compute::cast(&base, &DataType::Date32).map_err(|e| {
-                NanoError::Storage(format!("date32 cast error for delete predicate: {}", e))
+                NanoError::Storage(format!(
+                    "invalid Date32 literal '{}' for delete predicate (expected ISO date string or days since epoch): {}",
+                    value, e
+                ))
             })?
         }
         DataType::Date64 => {
-            let parsed = trim_quotes.parse::<i64>().map_err(|_| {
-                NanoError::Storage(format!(
-                    "invalid Date64 literal '{}' for delete predicate (expected ms since epoch)",
-                    value
-                ))
-            })?;
-            let base: ArrayRef = Arc::new(Int64Array::from(vec![parsed; num_rows]));
+            let base: ArrayRef = if let Ok(parsed) = trim_quotes.parse::<i64>() {
+                Arc::new(Int64Array::from(vec![parsed; num_rows]))
+            } else {
+                Arc::new(StringArray::from(vec![trim_quotes; num_rows]))
+            };
             arrow::compute::cast(&base, &DataType::Date64).map_err(|e| {
-                NanoError::Storage(format!("date64 cast error for delete predicate: {}", e))
+                NanoError::Storage(format!(
+                    "invalid Date64 literal '{}' for delete predicate (expected ISO datetime string or ms since epoch): {}",
+                    value, e
+                ))
             })?
         }
         _ => {
@@ -1559,12 +1561,34 @@ fn cdc_array_value_to_json(array: &ArrayRef, row: usize) -> serde_json::Value {
         DataType::Date32 => array
             .as_any()
             .downcast_ref::<Date32Array>()
-            .map(|a| serde_json::Value::Number((a.value(row) as i64).into()))
+            .map(|a| {
+                let days = a.value(row);
+                arrow::temporal_conversions::date32_to_datetime(days)
+                    .map(|dt| serde_json::Value::String(dt.format("%Y-%m-%d").to_string()))
+                    .unwrap_or_else(|| serde_json::Value::Number((days as i64).into()))
+            })
             .unwrap_or(serde_json::Value::Null),
         DataType::Date64 => array
             .as_any()
             .downcast_ref::<Date64Array>()
-            .map(|a| serde_json::Value::Number(a.value(row).into()))
+            .map(|a| {
+                let ms = a.value(row);
+                arrow::temporal_conversions::date64_to_datetime(ms)
+                    .map(|dt| serde_json::Value::String(dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()))
+                    .unwrap_or_else(|| serde_json::Value::Number(ms.into()))
+            })
+            .unwrap_or(serde_json::Value::Null),
+        DataType::List(_) => array
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .map(|a| {
+                let values = a.value(row);
+                serde_json::Value::Array(
+                    (0..values.len())
+                        .map(|idx| cdc_array_value_to_json(&values, idx))
+                        .collect(),
+                )
+            })
             .unwrap_or(serde_json::Value::Null),
         _ => serde_json::Value::String(
             arrow::util::display::array_value_to_string(array, row).unwrap_or_default(),
@@ -2167,6 +2191,21 @@ mod tests {
 
     fn test_schema_src() -> &'static str {
         r#"node Person {
+    name: String @key
+    age: I32?
+}
+node Company {
+    name: String @key
+}
+edge Knows: Person -> Person {
+    since: Date?
+}
+edge WorksAt: Person -> Company
+"#
+    }
+
+    fn unkeyed_schema_src() -> &'static str {
+        r#"node Person {
     name: String
     age: I32?
 }
@@ -2450,7 +2489,7 @@ edge Knows: Person -> Person
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].db_version, 1);
         assert_eq!(rows[0].tx_id, "manifest-1");
-        assert_eq!(rows[0].op_summary, "load:overwrite");
+        assert_eq!(rows[0].op_summary, "load:merge");
         assert!(
             rows[0]
                 .dataset_versions
@@ -2692,7 +2731,7 @@ edge Knows: Person -> Person
         let dir = test_dir("mode_merge_requires_key");
         let path = dir.path();
 
-        let mut db = Database::init(path, test_schema_src()).await.unwrap();
+        let mut db = Database::init(path, unkeyed_schema_src()).await.unwrap();
         let err = db
             .load_with_mode(test_data_src(), LoadMode::Merge)
             .await
@@ -2779,8 +2818,8 @@ edge Knows: Person -> Person
             },
             Case {
                 name: "merge_requires_key",
-                schema: test_schema_src(),
-                initial: test_data_src(),
+                schema: unkeyed_schema_src(),
+                initial: r#"{"type": "Person", "data": {"name": "Alice", "age": 30}}"#,
                 next_data: r#"{"type": "Person", "data": {"name": "Eve", "age": 44}}"#,
                 mode: LoadMode::Merge,
                 expected_person_rows: None,

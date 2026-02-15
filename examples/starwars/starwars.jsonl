@@ -1,264 +1,212 @@
-// ═══════════════════════════════════════════════════════════════════════════
-// Star Wars Knowledge Graph — JSONL Data (59 nodes, 120 edges)
-// ═══════════════════════════════════════════════════════════════════════════
-
-// ── Factions (6) ────────────────────────────────────────────────────────────
-{"type": "Faction", "data": {"name": "Jedi Order", "note": "Ancient monastic order of Force-sensitive peacekeepers serving the Galactic Republic."}}
-{"type": "Faction", "data": {"name": "Sith Order", "note": "Dark side Force tradition following the Rule of Two: one master, one apprentice."}}
-{"type": "Faction", "data": {"name": "Rebel Alliance", "note": "Underground resistance formed to oppose the Galactic Empire and restore democracy."}}
-{"type": "Faction", "data": {"name": "Galactic Empire", "note": "Authoritarian regime that replaced the Republic after Palpatine seized power."}}
-{"type": "Faction", "data": {"name": "Bounty Hunters Guild", "note": "Loosely organized network of mercenaries and trackers operating across the galaxy."}}
-{"type": "Faction", "data": {"name": "Separatists", "note": "Confederacy of Independent Systems that seceded from the Republic under Count Dooku."}}
-
-// ── Planets (8) ─────────────────────────────────────────────────────────────
-{"type": "Planet", "data": {"name": "Tatooine", "note": "Remote Outer Rim world with twin suns, home to moisture farmers and the Hutt crime syndicate.", "terrain": "Desert"}}
-{"type": "Planet", "data": {"name": "Naboo", "note": "Lush Mid Rim world home to both humans and the amphibious Gungan species.", "terrain": "Grasslands"}}
-{"type": "Planet", "data": {"name": "Corellia", "note": "Major Core World renowned for its shipyards and skilled pilots.", "terrain": "Urban"}}
-{"type": "Planet", "data": {"name": "Kashyyyk", "note": "Forested Wookiee homeworld with massive wroshyr trees towering kilometers high.", "terrain": "Forest"}}
-{"type": "Planet", "data": {"name": "Dagobah", "note": "Remote swamp planet strong in the Force, virtually undetectable by the Empire.", "terrain": "Swamp"}}
-{"type": "Planet", "data": {"name": "Alderaan", "note": "Peaceful Core World destroyed by the Death Star as a demonstration of Imperial power.", "terrain": "Grasslands"}}
-{"type": "Planet", "data": {"name": "Coruscant", "note": "City-planet and galactic capital, seat of both the Republic Senate and the Jedi Temple.", "terrain": "Cityscape"}}
-{"type": "Planet", "data": {"name": "Mustafar", "note": "Volcanic world where Obi-Wan and Anakin dueled, sealing Anakin's fall to the dark side.", "terrain": "Volcanic"}}
-
-// ── Starships (6) ───────────────────────────────────────────────────────────
-{"type": "Starship", "data": {"name": "Millennium Falcon", "note": "Heavily modified light freighter famous for the Kessel Run.", "model": "YT-1300", "class": "Freighter", "manufacturer": "Corellian Engineering"}}
-{"type": "Starship", "data": {"name": "X-Wing", "note": "Primary Rebel starfighter with S-foil attack configuration.", "model": "T-65B", "class": "Starfighter", "manufacturer": "Incom Corporation"}}
-{"type": "Starship", "data": {"name": "TIE Fighter", "note": "Standard Imperial starfighter deployed in overwhelming numbers.", "model": "TIE/ln", "class": "Starfighter", "manufacturer": "Sienar Fleet Systems"}}
-{"type": "Starship", "data": {"name": "Slave I", "note": "Heavily armed patrol craft used by Jango and Boba Fett.", "model": "Firespray-31", "class": "Patrol Craft", "manufacturer": "Kuat Systems Engineering"}}
-{"type": "Starship", "data": {"name": "Jedi Starfighter", "note": "Compact interceptor requiring an external hyperdrive ring.", "model": "Delta-7", "class": "Starfighter", "manufacturer": "Kuat Systems Engineering"}}
-{"type": "Starship", "data": {"name": "Naboo Royal Starship", "note": "Elegant chromium-plated yacht serving as transport for Naboo royalty.", "model": "J-type 327", "class": "Yacht", "manufacturer": "Theed Palace Space Vessel Engineering"}}
-
-// ── Weapons (6) ─────────────────────────────────────────────────────────────
-{"type": "Weapon", "data": {"name": "Anakin's Lightsaber", "note": "Built by Anakin during the Clone Wars, later passed to Luke by Obi-Wan.", "weapon_type": "Lightsaber", "color": "Blue"}}
-{"type": "Weapon", "data": {"name": "Luke's Green Lightsaber", "note": "Constructed by Luke after losing his father's weapon on Cloud City.", "weapon_type": "Lightsaber", "color": "Green"}}
-{"type": "Weapon", "data": {"name": "Mace Windu's Lightsaber", "note": "Purple blade reflecting Windu's mastery of Vaapad.", "weapon_type": "Lightsaber", "color": "Purple"}}
-{"type": "Weapon", "data": {"name": "Darth Maul's Lightsaber", "note": "Double-bladed weapon embodying Maul's role as a Sith instrument.", "weapon_type": "Lightsaber", "color": "Red"}}
-{"type": "Weapon", "data": {"name": "Yoda's Lightsaber", "note": "Compact blade wielded with extraordinary speed and precision.", "weapon_type": "Lightsaber", "color": "Green"}}
-{"type": "Weapon", "data": {"name": "Darth Vader's Lightsaber", "note": "Built after Anakin's fall, powered by a bled kyber crystal.", "weapon_type": "Lightsaber", "color": "Red"}}
-
-// ── Battles (6) ─────────────────────────────────────────────────────────────
-{"type": "Battle", "data": {"name": "Battle of Naboo", "note": "Trade Federation invasion ended by the Gungan diversion and Anakin's starfighter run.", "era": "Prequel", "outcome": "Naboo liberated"}}
-{"type": "Battle", "data": {"name": "Battle of Yavin", "note": "The Rebellion's first major victory when Luke destroyed the Death Star.", "era": "Original Trilogy", "outcome": "Death Star destroyed"}}
-{"type": "Battle", "data": {"name": "Battle of Hoth", "note": "Imperial assault on the Rebel base using AT-AT walkers.", "era": "Original Trilogy", "outcome": "Empire victory"}}
-{"type": "Battle", "data": {"name": "Battle of Endor", "note": "Decisive engagement where Rebels destroyed the second Death Star.", "era": "Original Trilogy", "outcome": "Rebel victory"}}
-{"type": "Battle", "data": {"name": "Battle of Geonosis", "note": "First battle of the Clone Wars with Jedi and clones vs Separatist droids.", "era": "Prequel", "outcome": "Republic victory"}}
-{"type": "Battle", "data": {"name": "Order 66", "note": "Secret protocol triggering clone troopers to execute their Jedi commanders.", "era": "Prequel", "outcome": "Jedi Order destroyed"}}
-
-// ── Locations (5) ───────────────────────────────────────────────────────────
-{"type": "Location", "data": {"name": "Death Star", "note": "Moon-sized Imperial battle station with a planet-destroying superlaser.", "location_type": "Space Station"}}
-{"type": "Location", "data": {"name": "Cloud City", "note": "Tibanna gas mining colony floating in Bespin's atmosphere.", "location_type": "City"}}
-{"type": "Location", "data": {"name": "Jedi Temple", "note": "Ancient seat of the Jedi Order on Coruscant.", "location_type": "Temple"}}
-{"type": "Location", "data": {"name": "Mos Eisley Cantina", "note": "Notorious spaceport bar on Tatooine frequented by smugglers.", "location_type": "Cantina"}}
-{"type": "Location", "data": {"name": "Jabba's Palace", "note": "Hutt crime lord's fortress in the Tatooine desert.", "location_type": "Palace"}}
-
-// ── Droids (2) ──────────────────────────────────────────────────────────────
-{"type": "Droid", "data": {"name": "C-3PO", "note": "Protocol droid fluent in over six million forms of communication, built by Anakin.", "model": "Protocol Droid"}}
-{"type": "Droid", "data": {"name": "R2-D2", "note": "Resourceful astromech who served Amidala, Anakin, and Luke across decades.", "model": "Astromech Droid"}}
-
-// ── Heroes — Prequel Era (6) ────────────────────────────────────────────────
-{"type": "Character", "data": {"name": "Qui-Gon Jinn", "note": "Maverick Jedi Master who discovered Anakin on Tatooine.", "species": "Human", "gender": "Male", "rank": "Jedi Master", "era": "Prequel", "alignment": "Hero"}}
-{"type": "Character", "data": {"name": "Obi-Wan Kenobi", "note": "Devoted Jedi Master who trained both Anakin and Luke Skywalker.", "species": "Human", "gender": "Male", "rank": "Jedi Master", "era": "Prequel", "alignment": "Hero"}}
-{"type": "Character", "data": {"name": "Anakin Skywalker", "note": "The Chosen One, born a slave on Tatooine with unmatched Force potential.", "species": "Human", "gender": "Male", "rank": "Jedi Knight", "era": "Prequel", "alignment": "Hero"}}
-{"type": "Character", "data": {"name": "Padme Amidala", "note": "Elected Queen of Naboo at fourteen, later a Senator opposing authoritarianism.", "species": "Human", "gender": "Female", "rank": "Senator", "era": "Prequel", "alignment": "Hero"}}
-{"type": "Character", "data": {"name": "Mace Windu", "note": "Senior Jedi Council member and one of the Order's greatest lightsaber combatants.", "species": "Human", "gender": "Male", "rank": "Jedi Master", "era": "Prequel", "alignment": "Hero"}}
-{"type": "Character", "data": {"name": "Yoda", "note": "Legendary Jedi Grand Master who trained Jedi for over 800 years.", "species": "Unknown", "gender": "Male", "rank": "Jedi Grand Master", "era": "Prequel", "alignment": "Hero"}}
-
-// ── Heroes — Clone Wars Era (1) ────────────────────────────────────────────
-{"type": "Character", "data": {"name": "Ahsoka Tano", "note": "Togruta Padawan assigned to Anakin, later a key figure in the early rebellion.", "species": "Togruta", "gender": "Female", "rank": "Jedi Padawan", "era": "Clone Wars", "alignment": "Hero"}}
-
-// ── Heroes — Original Trilogy Era (4) ───────────────────────────────────────
-{"type": "Character", "data": {"name": "Luke Skywalker", "note": "Son of Anakin, destroyed the Death Star and redeemed his father.", "species": "Human", "gender": "Male", "rank": "Jedi Knight", "era": "Original Trilogy", "alignment": "Hero"}}
-{"type": "Character", "data": {"name": "Leia Organa", "note": "Daughter of Anakin and Padme, fearless Rebel leader and diplomat.", "species": "Human", "gender": "Female", "rank": "Princess", "era": "Original Trilogy", "alignment": "Hero"}}
-{"type": "Character", "data": {"name": "Han Solo", "note": "Corellian smuggler turned Rebel hero who co-piloted the Millennium Falcon.", "species": "Human", "gender": "Male", "rank": "General", "era": "Original Trilogy", "alignment": "Hero"}}
-{"type": "Character", "data": {"name": "Chewbacca", "note": "Wookiee warrior from Kashyyyk and Han Solo's lifelong co-pilot.", "species": "Wookiee", "gender": "Male", "era": "Original Trilogy", "alignment": "Hero"}}
-
-// ── Villains (9) ────────────────────────────────────────────────────────────
-{"type": "Character", "data": {"name": "Emperor Palpatine", "note": "Sith Lord who orchestrated the Republic's fall and ruled as Emperor.", "species": "Human", "gender": "Male", "rank": "Emperor", "era": "Original Trilogy", "alignment": "Villain"}}
-{"type": "Character", "data": {"name": "Darth Vader", "note": "The fallen Anakin Skywalker, encased in a life-support suit.", "species": "Human", "gender": "Male", "rank": "Sith Lord", "era": "Original Trilogy", "alignment": "Villain"}}
-{"type": "Character", "data": {"name": "Count Dooku", "note": "Former Jedi Master who led the Separatists as Darth Tyranus.", "species": "Human", "gender": "Male", "rank": "Sith Lord", "era": "Prequel", "alignment": "Villain"}}
-{"type": "Character", "data": {"name": "Darth Maul", "note": "Zabrak Sith apprentice who wielded a double-bladed red lightsaber.", "species": "Zabrak", "gender": "Male", "rank": "Sith Apprentice", "era": "Prequel", "alignment": "Villain"}}
-{"type": "Character", "data": {"name": "Jango Fett", "note": "Mandalorian bounty hunter chosen as the genetic template for the clone army.", "species": "Human", "gender": "Male", "rank": "Bounty Hunter", "era": "Prequel", "alignment": "Villain"}}
-{"type": "Character", "data": {"name": "Boba Fett", "note": "Unaltered clone of Jango Fett, the galaxy's most feared bounty hunter.", "species": "Human", "gender": "Male", "rank": "Bounty Hunter", "era": "Empire", "alignment": "Villain"}}
-{"type": "Character", "data": {"name": "Grand Moff Tarkin", "note": "Imperial governor who commanded the Death Star and ordered Alderaan's destruction.", "species": "Human", "gender": "Male", "rank": "Grand Moff", "era": "Original Trilogy", "alignment": "Villain"}}
-{"type": "Character", "data": {"name": "Jabba the Hutt", "note": "Powerful crime lord controlling a vast criminal empire from Tatooine.", "species": "Hutt", "gender": "Male", "rank": "Crime Lord", "era": "Original Trilogy", "alignment": "Villain"}}
-{"type": "Character", "data": {"name": "General Grievous", "note": "Cybernetically enhanced warlord and Supreme Commander of the Separatist droid army.", "species": "Kaleesh", "gender": "Male", "rank": "General", "era": "Prequel", "alignment": "Villain"}}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// EDGES (120)
-// ═══════════════════════════════════════════════════════════════════════════
-
-// ── ORIGINATES_FROM (5 characters) ──────────────────────────────────────────
-{"edge": "OriginatesFrom", "from": "Luke Skywalker", "to": "Tatooine"}
-{"edge": "OriginatesFrom", "from": "Anakin Skywalker", "to": "Tatooine"}
-{"edge": "OriginatesFrom", "from": "Han Solo", "to": "Corellia"}
-{"edge": "OriginatesFrom", "from": "Chewbacca", "to": "Kashyyyk"}
-{"edge": "OriginatesFrom", "from": "Padme Amidala", "to": "Naboo"}
-
-// ── DROID_ORIGINATES_FROM (2 droids) ────────────────────────────────────────
-{"edge": "DroidOriginatesFrom", "from": "C-3PO", "to": "Tatooine"}
-{"edge": "DroidOriginatesFrom", "from": "R2-D2", "to": "Naboo"}
-
-// ── LOCATED_IN (2) ──────────────────────────────────────────────────────────
-{"edge": "LocatedIn", "from": "Yoda", "to": "Dagobah", "data": {"status": "Exile"}}
-{"edge": "LocatedIn", "from": "Jabba the Hutt", "to": "Tatooine", "data": {"status": "Resident"}}
-
-// ── LOCATED_AT (3) ──────────────────────────────────────────────────────────
-{"edge": "LocatedAt", "from": "Jedi Temple", "to": "Coruscant"}
-{"edge": "LocatedAt", "from": "Mos Eisley Cantina", "to": "Tatooine"}
-{"edge": "LocatedAt", "from": "Jabba's Palace", "to": "Tatooine"}
-
-// ── HAS_PARENT (5) ─────────────────────────────────────────────────────────
-{"edge": "HasParent", "from": "Luke Skywalker", "to": "Anakin Skywalker"}
-{"edge": "HasParent", "from": "Luke Skywalker", "to": "Padme Amidala"}
-{"edge": "HasParent", "from": "Leia Organa", "to": "Anakin Skywalker"}
-{"edge": "HasParent", "from": "Leia Organa", "to": "Padme Amidala"}
-{"edge": "HasParent", "from": "Boba Fett", "to": "Jango Fett"}
-
-// ── SIBLING_OF (1) ──────────────────────────────────────────────────────────
-{"edge": "SiblingOf", "from": "Luke Skywalker", "to": "Leia Organa"}
-
-// ── MARRIED_TO (2) ──────────────────────────────────────────────────────────
-{"edge": "MarriedTo", "from": "Anakin Skywalker", "to": "Padme Amidala"}
-{"edge": "MarriedTo", "from": "Han Solo", "to": "Leia Organa"}
-
-// ── CLONED_FROM (1) ─────────────────────────────────────────────────────────
-{"edge": "ClonedFrom", "from": "Boba Fett", "to": "Jango Fett"}
-
-// ── BUILT_BY (1) ────────────────────────────────────────────────────────────
-{"edge": "BuiltBy", "from": "C-3PO", "to": "Anakin Skywalker"}
-
-// ── HAS_COMPANION (1) ───────────────────────────────────────────────────────
-{"edge": "HasCompanion", "from": "C-3PO", "to": "R2-D2"}
-
-// ── HAS_CO_PILOT (1) ────────────────────────────────────────────────────────
-{"edge": "HasCoPilot", "from": "Han Solo", "to": "Chewbacca"}
-
-// ── HAS_MENTOR (11) ─────────────────────────────────────────────────────────
-{"edge": "HasMentor", "from": "Count Dooku", "to": "Yoda"}
-{"edge": "HasMentor", "from": "Qui-Gon Jinn", "to": "Count Dooku"}
-{"edge": "HasMentor", "from": "Obi-Wan Kenobi", "to": "Qui-Gon Jinn"}
-{"edge": "HasMentor", "from": "Anakin Skywalker", "to": "Obi-Wan Kenobi"}
-{"edge": "HasMentor", "from": "Ahsoka Tano", "to": "Anakin Skywalker"}
-{"edge": "HasMentor", "from": "Ahsoka Tano", "to": "Obi-Wan Kenobi"}
-{"edge": "HasMentor", "from": "Luke Skywalker", "to": "Obi-Wan Kenobi"}
-{"edge": "HasMentor", "from": "Luke Skywalker", "to": "Yoda"}
-{"edge": "HasMentor", "from": "Darth Maul", "to": "Emperor Palpatine"}
-{"edge": "HasMentor", "from": "Darth Vader", "to": "Emperor Palpatine"}
-{"edge": "HasMentor", "from": "General Grievous", "to": "Count Dooku"}
-
-// ── AFFILIATED_WITH (22) ────────────────────────────────────────────────────
-// Jedi Order
-{"edge": "AffiliatedWith", "from": "Qui-Gon Jinn", "to": "Jedi Order"}
-{"edge": "AffiliatedWith", "from": "Obi-Wan Kenobi", "to": "Jedi Order"}
-{"edge": "AffiliatedWith", "from": "Anakin Skywalker", "to": "Jedi Order"}
-{"edge": "AffiliatedWith", "from": "Mace Windu", "to": "Jedi Order"}
-{"edge": "AffiliatedWith", "from": "Yoda", "to": "Jedi Order"}
-{"edge": "AffiliatedWith", "from": "Ahsoka Tano", "to": "Jedi Order"}
-{"edge": "AffiliatedWith", "from": "Luke Skywalker", "to": "Jedi Order"}
-// Rebel Alliance
-{"edge": "AffiliatedWith", "from": "Luke Skywalker", "to": "Rebel Alliance"}
-{"edge": "AffiliatedWith", "from": "Han Solo", "to": "Rebel Alliance"}
-{"edge": "AffiliatedWith", "from": "Chewbacca", "to": "Rebel Alliance"}
-{"edge": "AffiliatedWith", "from": "Leia Organa", "to": "Rebel Alliance"}
-// Sith Order
-{"edge": "AffiliatedWith", "from": "Emperor Palpatine", "to": "Sith Order"}
-{"edge": "AffiliatedWith", "from": "Darth Vader", "to": "Sith Order"}
-{"edge": "AffiliatedWith", "from": "Count Dooku", "to": "Sith Order"}
-{"edge": "AffiliatedWith", "from": "Darth Maul", "to": "Sith Order"}
-// Galactic Empire
-{"edge": "AffiliatedWith", "from": "Emperor Palpatine", "to": "Galactic Empire"}
-{"edge": "AffiliatedWith", "from": "Darth Vader", "to": "Galactic Empire"}
-{"edge": "AffiliatedWith", "from": "Grand Moff Tarkin", "to": "Galactic Empire"}
-// Separatists
-{"edge": "AffiliatedWith", "from": "Count Dooku", "to": "Separatists"}
-{"edge": "AffiliatedWith", "from": "General Grievous", "to": "Separatists"}
-// Bounty Hunters Guild
-{"edge": "AffiliatedWith", "from": "Jango Fett", "to": "Bounty Hunters Guild"}
-{"edge": "AffiliatedWith", "from": "Boba Fett", "to": "Bounty Hunters Guild"}
-
-// ── OWNS (6 character + 1 faction = 7) ──────────────────────────────────────
-{"edge": "Owns", "from": "Han Solo", "to": "Millennium Falcon"}
-{"edge": "Owns", "from": "Luke Skywalker", "to": "X-Wing"}
-{"edge": "Owns", "from": "Obi-Wan Kenobi", "to": "Jedi Starfighter"}
-{"edge": "Owns", "from": "Padme Amidala", "to": "Naboo Royal Starship"}
-{"edge": "Owns", "from": "Jango Fett", "to": "Slave I"}
-{"edge": "Owns", "from": "Boba Fett", "to": "Slave I"}
-{"edge": "FactionOwns", "from": "Galactic Empire", "to": "TIE Fighter"}
-
-// ── RULES (2) ───────────────────────────────────────────────────────────────
-{"edge": "RulesFaction", "from": "Emperor Palpatine", "to": "Galactic Empire", "data": {"title": "Emperor"}}
-{"edge": "RulesPlanet", "from": "Padme Amidala", "to": "Naboo", "data": {"title": "Queen"}}
-
-// ── BECOMES (1) ─────────────────────────────────────────────────────────────
-{"edge": "Becomes", "from": "Anakin Skywalker", "to": "Darth Vader", "data": {"event": "Fall to the Dark Side"}}
-
-// ── FOUGHT (10) ─────────────────────────────────────────────────────────────
-{"edge": "Fought", "from": "Obi-Wan Kenobi", "to": "Anakin Skywalker", "data": {"location": "Mustafar"}}
-{"edge": "Fought", "from": "Obi-Wan Kenobi", "to": "Darth Maul", "data": {"location": "Naboo"}}
-{"edge": "Fought", "from": "Luke Skywalker", "to": "Darth Vader", "data": {"location": "Cloud City"}}
-{"edge": "Fought", "from": "Yoda", "to": "Count Dooku", "data": {"location": "Geonosis"}}
-{"edge": "Fought", "from": "Yoda", "to": "Emperor Palpatine", "data": {"location": "Coruscant"}}
-{"edge": "Fought", "from": "Mace Windu", "to": "Emperor Palpatine", "data": {"location": "Coruscant"}}
-{"edge": "Fought", "from": "Mace Windu", "to": "Jango Fett", "data": {"location": "Geonosis"}}
-{"edge": "Fought", "from": "Anakin Skywalker", "to": "Count Dooku", "data": {"location": "Coruscant"}}
-{"edge": "Fought", "from": "Jango Fett", "to": "Obi-Wan Kenobi", "data": {"location": "Kamino"}}
-{"edge": "Fought", "from": "General Grievous", "to": "Obi-Wan Kenobi", "data": {"location": "Utapau"}}
-
-// ── HIRED_BY (3) ────────────────────────────────────────────────────────────
-{"edge": "HiredBy", "from": "Jango Fett", "to": "Count Dooku", "data": {"purpose": "Clone template"}}
-{"edge": "HiredBy", "from": "Boba Fett", "to": "Darth Vader", "data": {"purpose": "Capture Han Solo"}}
-{"edge": "HiredBy", "from": "Boba Fett", "to": "Jabba the Hutt", "data": {"purpose": "Bounty on Han Solo"}}
-
-// ── CAPTURED (1) ────────────────────────────────────────────────────────────
-{"edge": "Captured", "from": "Boba Fett", "to": "Han Solo"}
-
-// ── WIELDS (7) ──────────────────────────────────────────────────────────────
-{"edge": "Wields", "from": "Anakin Skywalker", "to": "Anakin's Lightsaber"}
-{"edge": "Wields", "from": "Luke Skywalker", "to": "Anakin's Lightsaber"}
-{"edge": "Wields", "from": "Luke Skywalker", "to": "Luke's Green Lightsaber"}
-{"edge": "Wields", "from": "Mace Windu", "to": "Mace Windu's Lightsaber"}
-{"edge": "Wields", "from": "Darth Maul", "to": "Darth Maul's Lightsaber"}
-{"edge": "Wields", "from": "Yoda", "to": "Yoda's Lightsaber"}
-{"edge": "Wields", "from": "Darth Vader", "to": "Darth Vader's Lightsaber"}
-
-// ── PARTICIPATED_IN (31) ────────────────────────────────────────────────────
-// Battle of Naboo (5)
-{"edge": "ParticipatedIn", "from": "Qui-Gon Jinn", "to": "Battle of Naboo", "data": {"role": "Jedi combatant"}}
-{"edge": "ParticipatedIn", "from": "Obi-Wan Kenobi", "to": "Battle of Naboo", "data": {"role": "Jedi combatant"}}
-{"edge": "ParticipatedIn", "from": "Darth Maul", "to": "Battle of Naboo", "data": {"role": "Sith combatant"}}
-{"edge": "ParticipatedIn", "from": "Padme Amidala", "to": "Battle of Naboo", "data": {"role": "Palace assault leader"}}
-{"edge": "ParticipatedIn", "from": "Anakin Skywalker", "to": "Battle of Naboo", "data": {"role": "Starfighter pilot"}}
-// Battle of Yavin (4)
-{"edge": "ParticipatedIn", "from": "Luke Skywalker", "to": "Battle of Yavin", "data": {"role": "X-Wing pilot"}}
-{"edge": "ParticipatedIn", "from": "Han Solo", "to": "Battle of Yavin", "data": {"role": "Millennium Falcon pilot"}}
-{"edge": "ParticipatedIn", "from": "Darth Vader", "to": "Battle of Yavin", "data": {"role": "TIE fighter pilot"}}
-{"edge": "ParticipatedIn", "from": "Grand Moff Tarkin", "to": "Battle of Yavin", "data": {"role": "Death Star commander"}}
-// Battle of Hoth (5)
-{"edge": "ParticipatedIn", "from": "Luke Skywalker", "to": "Battle of Hoth", "data": {"role": "Snowspeeder pilot"}}
-{"edge": "ParticipatedIn", "from": "Han Solo", "to": "Battle of Hoth", "data": {"role": "Evacuation leader"}}
-{"edge": "ParticipatedIn", "from": "Leia Organa", "to": "Battle of Hoth", "data": {"role": "Base commander"}}
-{"edge": "ParticipatedIn", "from": "Chewbacca", "to": "Battle of Hoth", "data": {"role": "Evacuation support"}}
-{"edge": "ParticipatedIn", "from": "Darth Vader", "to": "Battle of Hoth", "data": {"role": "Assault commander"}}
-// Battle of Endor (6)
-{"edge": "ParticipatedIn", "from": "Luke Skywalker", "to": "Battle of Endor", "data": {"role": "Jedi combatant"}}
-{"edge": "ParticipatedIn", "from": "Han Solo", "to": "Battle of Endor", "data": {"role": "Ground assault leader"}}
-{"edge": "ParticipatedIn", "from": "Leia Organa", "to": "Battle of Endor", "data": {"role": "Ground assault team"}}
-{"edge": "ParticipatedIn", "from": "Chewbacca", "to": "Battle of Endor", "data": {"role": "Ground assault team"}}
-{"edge": "ParticipatedIn", "from": "Darth Vader", "to": "Battle of Endor", "data": {"role": "Imperial enforcer"}}
-{"edge": "ParticipatedIn", "from": "Emperor Palpatine", "to": "Battle of Endor", "data": {"role": "Emperor"}}
-// Battle of Geonosis (7)
-{"edge": "ParticipatedIn", "from": "Obi-Wan Kenobi", "to": "Battle of Geonosis", "data": {"role": "Captured, then combatant"}}
-{"edge": "ParticipatedIn", "from": "Anakin Skywalker", "to": "Battle of Geonosis", "data": {"role": "Rescue team, then combatant"}}
-{"edge": "ParticipatedIn", "from": "Padme Amidala", "to": "Battle of Geonosis", "data": {"role": "Rescue team"}}
-{"edge": "ParticipatedIn", "from": "Mace Windu", "to": "Battle of Geonosis", "data": {"role": "Jedi strike team leader"}}
-{"edge": "ParticipatedIn", "from": "Yoda", "to": "Battle of Geonosis", "data": {"role": "Clone army commander"}}
-{"edge": "ParticipatedIn", "from": "Count Dooku", "to": "Battle of Geonosis", "data": {"role": "Separatist leader"}}
-{"edge": "ParticipatedIn", "from": "Jango Fett", "to": "Battle of Geonosis", "data": {"role": "Separatist combatant"}}
-// Order 66 (4)
-{"edge": "ParticipatedIn", "from": "Emperor Palpatine", "to": "Order 66", "data": {"role": "Issued the order"}}
-{"edge": "ParticipatedIn", "from": "Yoda", "to": "Order 66", "data": {"role": "Survivor"}}
-{"edge": "ParticipatedIn", "from": "Obi-Wan Kenobi", "to": "Order 66", "data": {"role": "Survivor"}}
-{"edge": "ParticipatedIn", "from": "Ahsoka Tano", "to": "Order 66", "data": {"role": "Survivor"}}
-
-// ── TOOK_PLACE_ON (1) ───────────────────────────────────────────────────────
-{"edge": "TookPlaceOn", "from": "Battle of Naboo", "to": "Naboo"}
+{"type":"Faction","data":{"name":"Jedi Order","note":"Ancient monastic order of Force-sensitive peacekeepers serving the Galactic Republic.","slug":"jedi-order","side":"light"}}
+{"type":"Faction","data":{"name":"Sith Order","note":"Dark side Force tradition following the Rule of Two: one master, one apprentice.","slug":"sith-order","side":"dark"}}
+{"type":"Faction","data":{"name":"Rebel Alliance","note":"Underground resistance formed to oppose the Galactic Empire and restore democracy.","slug":"rebel-alliance","side":"light"}}
+{"type":"Faction","data":{"name":"Galactic Empire","note":"Authoritarian regime that replaced the Republic after Palpatine seized power.","slug":"galactic-empire","side":"dark"}}
+{"type":"Faction","data":{"name":"Bounty Hunters Guild","note":"Loosely organized network of mercenaries and trackers operating across the galaxy.","slug":"bounty-hunters-guild","side":"independent"}}
+{"type":"Faction","data":{"name":"Separatists","note":"Confederacy of Independent Systems that seceded from the Republic under Count Dooku.","slug":"separatists","side":"dark"}}
+{"type":"Planet","data":{"name":"Tatooine","note":"Remote Outer Rim world with twin suns, home to moisture farmers and the Hutt crime syndicate.","terrain":"Desert","slug":"tatooine","climate":"arid"}}
+{"type":"Planet","data":{"name":"Naboo","note":"Lush Mid Rim world home to both humans and the amphibious Gungan species.","terrain":"Grasslands","slug":"naboo","climate":"temperate"}}
+{"type":"Planet","data":{"name":"Corellia","note":"Major Core World renowned for its shipyards and skilled pilots.","terrain":"Urban","slug":"corellia","climate":"urban"}}
+{"type":"Planet","data":{"name":"Kashyyyk","note":"Forested Wookiee homeworld with massive wroshyr trees towering kilometers high.","terrain":"Forest","slug":"kashyyyk","climate":"forest"}}
+{"type":"Planet","data":{"name":"Dagobah","note":"Remote swamp planet strong in the Force, virtually undetectable by the Empire.","terrain":"Swamp","slug":"dagobah","climate":"swamp"}}
+{"type":"Planet","data":{"name":"Alderaan","note":"Peaceful Core World destroyed by the Death Star as a demonstration of Imperial power.","terrain":"Grasslands","slug":"alderaan","climate":"temperate"}}
+{"type":"Planet","data":{"name":"Coruscant","note":"City-planet and galactic capital, seat of both the Republic Senate and the Jedi Temple.","terrain":"Cityscape","slug":"coruscant","climate":"urban"}}
+{"type":"Planet","data":{"name":"Mustafar","note":"Volcanic world where Obi-Wan and Anakin dueled, sealing Anakin's fall to the dark side.","terrain":"Volcanic","slug":"mustafar","climate":"volcanic"}}
+{"type":"Starship","data":{"name":"Millennium Falcon","note":"Heavily modified light freighter famous for the Kessel Run.","model":"YT-1300","class":"Freighter","manufacturer":"Corellian Engineering","slug":"millennium-falcon"}}
+{"type":"Starship","data":{"name":"X-Wing","note":"Primary Rebel starfighter with S-foil attack configuration.","model":"T-65B","class":"Starfighter","manufacturer":"Incom Corporation","slug":"x-wing"}}
+{"type":"Starship","data":{"name":"TIE Fighter","note":"Standard Imperial starfighter deployed in overwhelming numbers.","model":"TIE/ln","class":"Starfighter","manufacturer":"Sienar Fleet Systems","slug":"tie-fighter"}}
+{"type":"Starship","data":{"name":"Slave I","note":"Heavily armed patrol craft used by Jango and Boba Fett.","model":"Firespray-31","class":"Patrol Craft","manufacturer":"Kuat Systems Engineering","slug":"slave-i"}}
+{"type":"Starship","data":{"name":"Jedi Starfighter","note":"Compact interceptor requiring an external hyperdrive ring.","model":"Delta-7","class":"Starfighter","manufacturer":"Kuat Systems Engineering","slug":"jedi-starfighter"}}
+{"type":"Starship","data":{"name":"Naboo Royal Starship","note":"Elegant chromium-plated yacht serving as transport for Naboo royalty.","model":"J-type 327","class":"Yacht","manufacturer":"Theed Palace Space Vessel Engineering","slug":"naboo-royal-starship"}}
+{"type":"Weapon","data":{"name":"Anakin's Lightsaber","note":"Built by Anakin during the Clone Wars, later passed to Luke by Obi-Wan.","weapon_type":"Lightsaber","color":"Blue","slug":"anakin-lightsaber"}}
+{"type":"Weapon","data":{"name":"Luke's Green Lightsaber","note":"Constructed by Luke after losing his father's weapon on Cloud City.","weapon_type":"Lightsaber","color":"Green","slug":"luke-green-lightsaber"}}
+{"type":"Weapon","data":{"name":"Mace Windu's Lightsaber","note":"Purple blade reflecting Windu's mastery of Vaapad.","weapon_type":"Lightsaber","color":"Purple","slug":"mace-windu-lightsaber"}}
+{"type":"Weapon","data":{"name":"Darth Maul's Lightsaber","note":"Double-bladed weapon embodying Maul's role as a Sith instrument.","weapon_type":"Lightsaber","color":"Red","slug":"darth-maul-lightsaber"}}
+{"type":"Weapon","data":{"name":"Yoda's Lightsaber","note":"Compact blade wielded with extraordinary speed and precision.","weapon_type":"Lightsaber","color":"Green","slug":"yoda-lightsaber"}}
+{"type":"Weapon","data":{"name":"Darth Vader's Lightsaber","note":"Built after Anakin's fall, powered by a bled kyber crystal.","weapon_type":"Lightsaber","color":"Red","slug":"darth-vader-lightsaber"}}
+{"type":"Battle","data":{"name":"Battle of Naboo","note":"Trade Federation invasion ended by the Gungan diversion and Anakin's starfighter run.","era":"prequel","outcome":"Naboo liberated","slug":"battle-of-naboo"}}
+{"type":"Battle","data":{"name":"Battle of Yavin","note":"The Rebellion's first major victory when Luke destroyed the Death Star.","era":"original","outcome":"Death Star destroyed","slug":"battle-of-yavin"}}
+{"type":"Battle","data":{"name":"Battle of Hoth","note":"Imperial assault on the Rebel base using AT-AT walkers.","era":"original","outcome":"Empire victory","slug":"battle-of-hoth"}}
+{"type":"Battle","data":{"name":"Battle of Endor","note":"Decisive engagement where Rebels destroyed the second Death Star.","era":"original","outcome":"Rebel victory","slug":"battle-of-endor"}}
+{"type":"Battle","data":{"name":"Battle of Geonosis","note":"First battle of the Clone Wars with Jedi and clones vs Separatist droids.","era":"prequel","outcome":"Republic victory","slug":"battle-of-geonosis"}}
+{"type":"Battle","data":{"name":"Order 66","note":"Secret protocol triggering clone troopers to execute their Jedi commanders.","era":"prequel","outcome":"Jedi Order destroyed","slug":"order-66"}}
+{"type":"Location","data":{"name":"Death Star","note":"Moon-sized Imperial battle station with a planet-destroying superlaser.","location_type":"Space Station","slug":"death-star"}}
+{"type":"Location","data":{"name":"Cloud City","note":"Tibanna gas mining colony floating in Bespin's atmosphere.","location_type":"City","slug":"cloud-city"}}
+{"type":"Location","data":{"name":"Jedi Temple","note":"Ancient seat of the Jedi Order on Coruscant.","location_type":"Temple","slug":"jedi-temple"}}
+{"type":"Location","data":{"name":"Mos Eisley Cantina","note":"Notorious spaceport bar on Tatooine frequented by smugglers.","location_type":"Cantina","slug":"mos-eisley-cantina"}}
+{"type":"Location","data":{"name":"Jabba's Palace","note":"Hutt crime lord's fortress in the Tatooine desert.","location_type":"Palace","slug":"jabba-palace"}}
+{"type":"Droid","data":{"name":"C-3PO","note":"Protocol droid fluent in over six million forms of communication, built by Anakin.","model":"Protocol Droid","slug":"c-3po"}}
+{"type":"Droid","data":{"name":"R2-D2","note":"Resourceful astromech who served Amidala, Anakin, and Luke across decades.","model":"Astromech Droid","slug":"r2-d2"}}
+{"type":"Character","data":{"name":"Qui-Gon Jinn","note":"Maverick Jedi Master who discovered Anakin on Tatooine.","species":"Human","gender":"Male","rank":"Jedi Master","era":"prequel","alignment":"hero","slug":"qui-gon-jinn","tags":["jedi"]}}
+{"type":"Character","data":{"name":"Obi-Wan Kenobi","note":"Devoted Jedi Master who trained both Anakin and Luke Skywalker.","species":"Human","gender":"Male","rank":"Jedi Master","era":"prequel","alignment":"hero","slug":"obi-wan-kenobi","tags":["jedi","mentor"]}}
+{"type":"Character","data":{"name":"Anakin Skywalker","note":"The Chosen One, born a slave on Tatooine with unmatched Force potential.","species":"Human","gender":"Male","rank":"Jedi Knight","era":"prequel","alignment":"hero","slug":"anakin-skywalker","tags":["jedi","pilot"]}}
+{"type":"Character","data":{"name":"Padme Amidala","note":"Elected Queen of Naboo at fourteen, later a Senator opposing authoritarianism.","species":"Human","gender":"Female","rank":"Senator","era":"prequel","alignment":"hero","slug":"padme-amidala","tags":["leader"]}}
+{"type":"Character","data":{"name":"Mace Windu","note":"Senior Jedi Council member and one of the Order's greatest lightsaber combatants.","species":"Human","gender":"Male","rank":"Jedi Master","era":"prequel","alignment":"hero","slug":"mace-windu","tags":["jedi"]}}
+{"type":"Character","data":{"name":"Yoda","note":"Legendary Jedi Grand Master who trained Jedi for over 800 years.","species":"Unknown","gender":"Male","rank":"Jedi Grand Master","era":"prequel","alignment":"hero","slug":"yoda","tags":["jedi","mentor"]}}
+{"type":"Character","data":{"name":"Ahsoka Tano","note":"Togruta Padawan assigned to Anakin, later a key figure in the early rebellion.","species":"Togruta","gender":"Female","rank":"Jedi Padawan","era":"clone_wars","alignment":"hero","slug":"ahsoka-tano","tags":["jedi","rebel"]}}
+{"type":"Character","data":{"name":"Luke Skywalker","note":"Son of Anakin, destroyed the Death Star and redeemed his father.","species":"Human","gender":"Male","rank":"Jedi Knight","era":"original","alignment":"hero","slug":"luke-skywalker","tags":["jedi","pilot"]}}
+{"type":"Character","data":{"name":"Leia Organa","note":"Daughter of Anakin and Padme, fearless Rebel leader and diplomat.","species":"Human","gender":"Female","rank":"Princess","era":"original","alignment":"hero","slug":"leia-organa","tags":["leader","rebel"]}}
+{"type":"Character","data":{"name":"Han Solo","note":"Corellian smuggler turned Rebel hero who co-piloted the Millennium Falcon.","species":"Human","gender":"Male","rank":"General","era":"original","alignment":"hero","slug":"han-solo","tags":["pilot","smuggler"]}}
+{"type":"Character","data":{"name":"Chewbacca","note":"Wookiee warrior from Kashyyyk and Han Solo's lifelong co-pilot.","species":"Wookiee","gender":"Male","era":"original","alignment":"hero","slug":"chewbacca","tags":["pilot"]}}
+{"type":"Character","data":{"name":"Emperor Palpatine","note":"Sith Lord who orchestrated the Republic's fall and ruled as Emperor.","species":"Human","gender":"Male","rank":"Emperor","era":"original","alignment":"villain","slug":"emperor-palpatine","tags":["sith","ruler"]}}
+{"type":"Character","data":{"name":"Darth Vader","note":"The fallen Anakin Skywalker, encased in a life-support suit.","species":"Human","gender":"Male","rank":"Sith Lord","era":"original","alignment":"villain","slug":"darth-vader","tags":["sith","enforcer"]}}
+{"type":"Character","data":{"name":"Count Dooku","note":"Former Jedi Master who led the Separatists as Darth Tyranus.","species":"Human","gender":"Male","rank":"Sith Lord","era":"prequel","alignment":"villain","slug":"count-dooku","tags":["sith"]}}
+{"type":"Character","data":{"name":"Darth Maul","note":"Zabrak Sith apprentice who wielded a double-bladed red lightsaber.","species":"Zabrak","gender":"Male","rank":"Sith Apprentice","era":"prequel","alignment":"villain","slug":"darth-maul","tags":["sith"]}}
+{"type":"Character","data":{"name":"Jango Fett","note":"Mandalorian bounty hunter chosen as the genetic template for the clone army.","species":"Human","gender":"Male","rank":"Bounty Hunter","era":"prequel","alignment":"villain","slug":"jango-fett","tags":["hunter"]}}
+{"type":"Character","data":{"name":"Boba Fett","note":"Unaltered clone of Jango Fett, the galaxy's most feared bounty hunter.","species":"Human","gender":"Male","rank":"Bounty Hunter","era":"original","alignment":"villain","slug":"boba-fett","tags":["hunter"]}}
+{"type":"Character","data":{"name":"Grand Moff Tarkin","note":"Imperial governor who commanded the Death Star and ordered Alderaan's destruction.","species":"Human","gender":"Male","rank":"Grand Moff","era":"original","alignment":"villain","slug":"grand-moff-tarkin","tags":["imperial"]}}
+{"type":"Character","data":{"name":"Jabba the Hutt","note":"Powerful crime lord controlling a vast criminal empire from Tatooine.","species":"Hutt","gender":"Male","rank":"Crime Lord","era":"original","alignment":"villain","slug":"jabba-the-hutt","tags":["crime-lord"]}}
+{"type":"Character","data":{"name":"General Grievous","note":"Cybernetically enhanced warlord and Supreme Commander of the Separatist droid army.","species":"Kaleesh","gender":"Male","rank":"General","era":"prequel","alignment":"villain","slug":"general-grievous","tags":["separatist"]}}
+{"edge":"OriginatesFrom","from":"luke-skywalker","to":"tatooine"}
+{"edge":"OriginatesFrom","from":"anakin-skywalker","to":"tatooine"}
+{"edge":"OriginatesFrom","from":"han-solo","to":"corellia"}
+{"edge":"OriginatesFrom","from":"chewbacca","to":"kashyyyk"}
+{"edge":"OriginatesFrom","from":"padme-amidala","to":"naboo"}
+{"edge":"DroidOriginatesFrom","from":"c-3po","to":"tatooine"}
+{"edge":"DroidOriginatesFrom","from":"r2-d2","to":"naboo"}
+{"edge":"LocatedIn","from":"yoda","to":"dagobah","data":{"status":"Exile"}}
+{"edge":"LocatedIn","from":"jabba-the-hutt","to":"tatooine","data":{"status":"Resident"}}
+{"edge":"LocatedAt","from":"jedi-temple","to":"coruscant"}
+{"edge":"LocatedAt","from":"mos-eisley-cantina","to":"tatooine"}
+{"edge":"LocatedAt","from":"jabba-palace","to":"tatooine"}
+{"edge":"HasParent","from":"luke-skywalker","to":"anakin-skywalker"}
+{"edge":"HasParent","from":"luke-skywalker","to":"padme-amidala"}
+{"edge":"HasParent","from":"leia-organa","to":"anakin-skywalker"}
+{"edge":"HasParent","from":"leia-organa","to":"padme-amidala"}
+{"edge":"HasParent","from":"boba-fett","to":"jango-fett"}
+{"edge":"SiblingOf","from":"luke-skywalker","to":"leia-organa"}
+{"edge":"MarriedTo","from":"anakin-skywalker","to":"padme-amidala"}
+{"edge":"MarriedTo","from":"han-solo","to":"leia-organa"}
+{"edge":"ClonedFrom","from":"boba-fett","to":"jango-fett"}
+{"edge":"BuiltBy","from":"c-3po","to":"anakin-skywalker"}
+{"edge":"HasCompanion","from":"c-3po","to":"r2-d2"}
+{"edge":"HasCoPilot","from":"han-solo","to":"chewbacca"}
+{"edge":"HasMentor","from":"count-dooku","to":"yoda"}
+{"edge":"HasMentor","from":"qui-gon-jinn","to":"count-dooku"}
+{"edge":"HasMentor","from":"obi-wan-kenobi","to":"qui-gon-jinn"}
+{"edge":"HasMentor","from":"anakin-skywalker","to":"obi-wan-kenobi"}
+{"edge":"HasMentor","from":"ahsoka-tano","to":"anakin-skywalker"}
+{"edge":"HasMentor","from":"ahsoka-tano","to":"obi-wan-kenobi"}
+{"edge":"HasMentor","from":"luke-skywalker","to":"obi-wan-kenobi"}
+{"edge":"HasMentor","from":"luke-skywalker","to":"yoda"}
+{"edge":"HasMentor","from":"darth-maul","to":"emperor-palpatine"}
+{"edge":"HasMentor","from":"darth-vader","to":"emperor-palpatine"}
+{"edge":"HasMentor","from":"general-grievous","to":"count-dooku"}
+{"edge":"AffiliatedWith","from":"qui-gon-jinn","to":"jedi-order","data":{"role":"Jedi"}}
+{"edge":"AffiliatedWith","from":"obi-wan-kenobi","to":"jedi-order","data":{"role":"Jedi"}}
+{"edge":"AffiliatedWith","from":"anakin-skywalker","to":"jedi-order","data":{"role":"Jedi"}}
+{"edge":"AffiliatedWith","from":"mace-windu","to":"jedi-order","data":{"role":"Jedi"}}
+{"edge":"AffiliatedWith","from":"yoda","to":"jedi-order","data":{"role":"Jedi"}}
+{"edge":"AffiliatedWith","from":"ahsoka-tano","to":"jedi-order","data":{"role":"Jedi"}}
+{"edge":"AffiliatedWith","from":"luke-skywalker","to":"jedi-order","data":{"role":"Jedi"}}
+{"edge":"AffiliatedWith","from":"luke-skywalker","to":"rebel-alliance","data":{"role":"Rebel"}}
+{"edge":"AffiliatedWith","from":"han-solo","to":"rebel-alliance","data":{"role":"Rebel"}}
+{"edge":"AffiliatedWith","from":"chewbacca","to":"rebel-alliance","data":{"role":"Rebel"}}
+{"edge":"AffiliatedWith","from":"leia-organa","to":"rebel-alliance","data":{"role":"Rebel"}}
+{"edge":"AffiliatedWith","from":"emperor-palpatine","to":"sith-order","data":{"role":"Sith"}}
+{"edge":"AffiliatedWith","from":"darth-vader","to":"sith-order","data":{"role":"Sith"}}
+{"edge":"AffiliatedWith","from":"count-dooku","to":"sith-order","data":{"role":"Sith"}}
+{"edge":"AffiliatedWith","from":"darth-maul","to":"sith-order","data":{"role":"Sith"}}
+{"edge":"AffiliatedWith","from":"emperor-palpatine","to":"galactic-empire","data":{"role":"Imperial"}}
+{"edge":"AffiliatedWith","from":"darth-vader","to":"galactic-empire","data":{"role":"Imperial"}}
+{"edge":"AffiliatedWith","from":"grand-moff-tarkin","to":"galactic-empire","data":{"role":"Imperial"}}
+{"edge":"AffiliatedWith","from":"count-dooku","to":"separatists","data":{"role":"Separatist"}}
+{"edge":"AffiliatedWith","from":"general-grievous","to":"separatists","data":{"role":"Separatist"}}
+{"edge":"AffiliatedWith","from":"jango-fett","to":"bounty-hunters-guild","data":{"role":"Hunter"}}
+{"edge":"AffiliatedWith","from":"boba-fett","to":"bounty-hunters-guild","data":{"role":"Hunter"}}
+{"edge":"Owns","from":"han-solo","to":"millennium-falcon"}
+{"edge":"Owns","from":"luke-skywalker","to":"x-wing"}
+{"edge":"Owns","from":"obi-wan-kenobi","to":"jedi-starfighter"}
+{"edge":"Owns","from":"padme-amidala","to":"naboo-royal-starship"}
+{"edge":"Owns","from":"jango-fett","to":"slave-i"}
+{"edge":"Owns","from":"boba-fett","to":"slave-i"}
+{"edge":"FactionOwns","from":"galactic-empire","to":"tie-fighter"}
+{"edge":"RulesFaction","from":"emperor-palpatine","to":"galactic-empire","data":{"title":"Emperor"}}
+{"edge":"RulesPlanet","from":"padme-amidala","to":"naboo","data":{"title":"Queen"}}
+{"edge":"Becomes","from":"anakin-skywalker","to":"darth-vader","data":{"event":"Fall to the Dark Side"}}
+{"edge":"Fought","from":"obi-wan-kenobi","to":"anakin-skywalker","data":{"location":"Mustafar"}}
+{"edge":"Fought","from":"obi-wan-kenobi","to":"darth-maul","data":{"location":"Naboo"}}
+{"edge":"Fought","from":"luke-skywalker","to":"darth-vader","data":{"location":"Cloud City"}}
+{"edge":"Fought","from":"yoda","to":"count-dooku","data":{"location":"Geonosis"}}
+{"edge":"Fought","from":"yoda","to":"emperor-palpatine","data":{"location":"Coruscant"}}
+{"edge":"Fought","from":"mace-windu","to":"emperor-palpatine","data":{"location":"Coruscant"}}
+{"edge":"Fought","from":"mace-windu","to":"jango-fett","data":{"location":"Geonosis"}}
+{"edge":"Fought","from":"anakin-skywalker","to":"count-dooku","data":{"location":"Coruscant"}}
+{"edge":"Fought","from":"jango-fett","to":"obi-wan-kenobi","data":{"location":"Kamino"}}
+{"edge":"Fought","from":"general-grievous","to":"obi-wan-kenobi","data":{"location":"Utapau"}}
+{"edge":"HiredBy","from":"jango-fett","to":"count-dooku","data":{"purpose":"Clone template"}}
+{"edge":"HiredBy","from":"boba-fett","to":"darth-vader","data":{"purpose":"Capture Han Solo"}}
+{"edge":"HiredBy","from":"boba-fett","to":"jabba-the-hutt","data":{"purpose":"Bounty on Han Solo"}}
+{"edge":"Captured","from":"boba-fett","to":"han-solo"}
+{"edge":"Wields","from":"anakin-skywalker","to":"anakin-lightsaber"}
+{"edge":"Wields","from":"luke-skywalker","to":"anakin-lightsaber"}
+{"edge":"Wields","from":"luke-skywalker","to":"luke-green-lightsaber"}
+{"edge":"Wields","from":"mace-windu","to":"mace-windu-lightsaber"}
+{"edge":"Wields","from":"darth-maul","to":"darth-maul-lightsaber"}
+{"edge":"Wields","from":"yoda","to":"yoda-lightsaber"}
+{"edge":"Wields","from":"darth-vader","to":"darth-vader-lightsaber"}
+{"edge":"ParticipatedIn","from":"qui-gon-jinn","to":"battle-of-naboo","data":{"role":"Jedi combatant"}}
+{"edge":"ParticipatedIn","from":"obi-wan-kenobi","to":"battle-of-naboo","data":{"role":"Jedi combatant"}}
+{"edge":"ParticipatedIn","from":"darth-maul","to":"battle-of-naboo","data":{"role":"Sith combatant"}}
+{"edge":"ParticipatedIn","from":"padme-amidala","to":"battle-of-naboo","data":{"role":"Palace assault leader"}}
+{"edge":"ParticipatedIn","from":"anakin-skywalker","to":"battle-of-naboo","data":{"role":"Starfighter pilot"}}
+{"edge":"ParticipatedIn","from":"luke-skywalker","to":"battle-of-yavin","data":{"role":"X-Wing pilot"}}
+{"edge":"ParticipatedIn","from":"han-solo","to":"battle-of-yavin","data":{"role":"Millennium Falcon pilot"}}
+{"edge":"ParticipatedIn","from":"darth-vader","to":"battle-of-yavin","data":{"role":"TIE fighter pilot"}}
+{"edge":"ParticipatedIn","from":"grand-moff-tarkin","to":"battle-of-yavin","data":{"role":"Death Star commander"}}
+{"edge":"ParticipatedIn","from":"luke-skywalker","to":"battle-of-hoth","data":{"role":"Snowspeeder pilot"}}
+{"edge":"ParticipatedIn","from":"han-solo","to":"battle-of-hoth","data":{"role":"Evacuation leader"}}
+{"edge":"ParticipatedIn","from":"leia-organa","to":"battle-of-hoth","data":{"role":"Base commander"}}
+{"edge":"ParticipatedIn","from":"chewbacca","to":"battle-of-hoth","data":{"role":"Evacuation support"}}
+{"edge":"ParticipatedIn","from":"darth-vader","to":"battle-of-hoth","data":{"role":"Assault commander"}}
+{"edge":"ParticipatedIn","from":"luke-skywalker","to":"battle-of-endor","data":{"role":"Jedi combatant"}}
+{"edge":"ParticipatedIn","from":"han-solo","to":"battle-of-endor","data":{"role":"Ground assault leader"}}
+{"edge":"ParticipatedIn","from":"leia-organa","to":"battle-of-endor","data":{"role":"Ground assault team"}}
+{"edge":"ParticipatedIn","from":"chewbacca","to":"battle-of-endor","data":{"role":"Ground assault team"}}
+{"edge":"ParticipatedIn","from":"darth-vader","to":"battle-of-endor","data":{"role":"Imperial enforcer"}}
+{"edge":"ParticipatedIn","from":"emperor-palpatine","to":"battle-of-endor","data":{"role":"Emperor"}}
+{"edge":"ParticipatedIn","from":"obi-wan-kenobi","to":"battle-of-geonosis","data":{"role":"Captured, then combatant"}}
+{"edge":"ParticipatedIn","from":"anakin-skywalker","to":"battle-of-geonosis","data":{"role":"Rescue team, then combatant"}}
+{"edge":"ParticipatedIn","from":"padme-amidala","to":"battle-of-geonosis","data":{"role":"Rescue team"}}
+{"edge":"ParticipatedIn","from":"mace-windu","to":"battle-of-geonosis","data":{"role":"Jedi strike team leader"}}
+{"edge":"ParticipatedIn","from":"yoda","to":"battle-of-geonosis","data":{"role":"Clone army commander"}}
+{"edge":"ParticipatedIn","from":"count-dooku","to":"battle-of-geonosis","data":{"role":"Separatist leader"}}
+{"edge":"ParticipatedIn","from":"jango-fett","to":"battle-of-geonosis","data":{"role":"Separatist combatant"}}
+{"edge":"ParticipatedIn","from":"emperor-palpatine","to":"order-66","data":{"role":"Issued the order"}}
+{"edge":"ParticipatedIn","from":"yoda","to":"order-66","data":{"role":"Survivor"}}
+{"edge":"ParticipatedIn","from":"obi-wan-kenobi","to":"order-66","data":{"role":"Survivor"}}
+{"edge":"ParticipatedIn","from":"ahsoka-tano","to":"order-66","data":{"role":"Survivor"}}
+{"edge":"TookPlaceOn","from":"battle-of-naboo","to":"naboo"}
+{"type":"Film","data":{"slug":"the-phantom-menace","name":"The Phantom Menace","episode":1,"release_date":"1999-05-19"}}
+{"type":"Film","data":{"slug":"attack-of-the-clones","name":"Attack of the Clones","episode":2,"release_date":"2002-05-16"}}
+{"type":"Film","data":{"slug":"revenge-of-the-sith","name":"Revenge of the Sith","episode":3,"release_date":"2005-05-19"}}
+{"type":"Film","data":{"slug":"a-new-hope","name":"A New Hope","episode":4,"release_date":"1977-05-25"}}
+{"type":"Film","data":{"slug":"the-empire-strikes-back","name":"The Empire Strikes Back","episode":5,"release_date":"1980-05-21"}}
+{"type":"Film","data":{"slug":"return-of-the-jedi","name":"Return of the Jedi","episode":6,"release_date":"1983-05-25"}}
+{"type":"Film","data":{"slug":"the-clone-wars","name":"The Clone Wars","episode":0,"release_date":"2008-08-15"}}
+{"edge":"DebutsIn","from":"qui-gon-jinn","to":"the-phantom-menace"}
+{"edge":"DebutsIn","from":"obi-wan-kenobi","to":"the-phantom-menace"}
+{"edge":"DebutsIn","from":"anakin-skywalker","to":"the-phantom-menace"}
+{"edge":"DebutsIn","from":"padme-amidala","to":"the-phantom-menace"}
+{"edge":"DebutsIn","from":"darth-maul","to":"the-phantom-menace"}
+{"edge":"DebutsIn","from":"mace-windu","to":"the-phantom-menace"}
+{"edge":"DebutsIn","from":"yoda","to":"the-phantom-menace"}
+{"edge":"DebutsIn","from":"count-dooku","to":"attack-of-the-clones"}
+{"edge":"DebutsIn","from":"jango-fett","to":"attack-of-the-clones"}
+{"edge":"DebutsIn","from":"boba-fett","to":"attack-of-the-clones"}
+{"edge":"DebutsIn","from":"general-grievous","to":"revenge-of-the-sith"}
+{"edge":"DebutsIn","from":"emperor-palpatine","to":"revenge-of-the-sith"}
+{"edge":"DebutsIn","from":"luke-skywalker","to":"a-new-hope"}
+{"edge":"DebutsIn","from":"leia-organa","to":"a-new-hope"}
+{"edge":"DebutsIn","from":"han-solo","to":"a-new-hope"}
+{"edge":"DebutsIn","from":"chewbacca","to":"a-new-hope"}
+{"edge":"DebutsIn","from":"darth-vader","to":"a-new-hope"}
+{"edge":"DebutsIn","from":"grand-moff-tarkin","to":"a-new-hope"}
+{"edge":"DebutsIn","from":"jabba-the-hutt","to":"a-new-hope"}
+{"edge":"DebutsIn","from":"ahsoka-tano","to":"the-clone-wars"}
+{"edge":"DepictedIn","from":"battle-of-naboo","to":"the-phantom-menace"}
+{"edge":"DepictedIn","from":"battle-of-geonosis","to":"attack-of-the-clones"}
+{"edge":"DepictedIn","from":"order-66","to":"revenge-of-the-sith"}
+{"edge":"DepictedIn","from":"battle-of-yavin","to":"a-new-hope"}
+{"edge":"DepictedIn","from":"battle-of-hoth","to":"the-empire-strikes-back"}
+{"edge":"DepictedIn","from":"battle-of-endor","to":"return-of-the-jedi"}
