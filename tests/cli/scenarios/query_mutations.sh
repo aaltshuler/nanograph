@@ -15,7 +15,7 @@ source "$SCRIPT_DIR/../lib/common.sh"
 ROOT="$(repo_root_from_script_dir "$SCRIPT_DIR")"
 EXAMPLES="$ROOT/examples/starwars"
 TMP_DIR="$(mktemp -d /tmp/query_mutations.XXXXXX)"
-DB="$TMP_DIR/query_mutations_e2e.nanograph"
+DB="$TMP_DIR/query_mutations_e2e.nano"
 QUERY_FILE="$TMP_DIR/mutations.gq"
 
 cleanup() {

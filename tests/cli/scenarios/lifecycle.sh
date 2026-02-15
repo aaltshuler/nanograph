@@ -17,7 +17,7 @@ source "$SCRIPT_DIR/../lib/common.sh"
 ROOT="$(repo_root_from_script_dir "$SCRIPT_DIR")"
 EXAMPLES="$ROOT/examples/starwars"
 TMP_DIR="$(mktemp -d /tmp/sw_lifecycle.XXXXXX)"
-DB="$TMP_DIR/sw_lifecycle_test.nanograph"
+DB="$TMP_DIR/sw_lifecycle_test.nano"
 QUERY_FILE="$TMP_DIR/lifecycle.gq"
 UPSERT_DATA="$TMP_DIR/upsert.jsonl"
 

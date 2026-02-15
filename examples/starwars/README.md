@@ -22,30 +22,30 @@ Typed property graph of the Star Wars universe with a rich relationship model an
 ## Quick Start
 
 ```bash
-nanograph init sw.nanograph --schema examples/starwars/starwars.pg
-nanograph load sw.nanograph --data examples/starwars/starwars.jsonl --mode overwrite
-nanograph check --db sw.nanograph --query examples/starwars/starwars.gq
-nanograph run --db sw.nanograph --query examples/starwars/starwars.gq --name jedi
-nanograph run --db sw.nanograph --query examples/starwars/starwars.gq --name film_timeline
+nanograph init sw.nano --schema examples/starwars/starwars.pg
+nanograph load sw.nano --data examples/starwars/starwars.jsonl --mode overwrite
+nanograph check --db sw.nano --query examples/starwars/starwars.gq
+nanograph run --db sw.nano --query examples/starwars/starwars.gq --name jedi
+nanograph run --db sw.nano --query examples/starwars/starwars.gq --name film_timeline
 ```
 
 ## Mutation + CDC Walkthrough
 
 ```bash
 # mutations
-nanograph run --db sw.nanograph --query examples/starwars/starwars.gq --name add_character
-nanograph run --db sw.nanograph --query examples/starwars/starwars.gq --name update_character --param slug=ezra-bridger
-nanograph run --db sw.nanograph --query examples/starwars/starwars.gq --name delete_character --param slug=ezra-bridger
+nanograph run --db sw.nano --query examples/starwars/starwars.gq --name add_character
+nanograph run --db sw.nano --query examples/starwars/starwars.gq --name update_character --param slug=ezra-bridger
+nanograph run --db sw.nano --query examples/starwars/starwars.gq --name delete_character --param slug=ezra-bridger
 
 # inspect changes
-nanograph changes sw.nanograph --from 2 --to 4 --format json
-nanograph changes sw.nanograph --since 3 --format jsonl
+nanograph changes sw.nano --from 2 --to 4 --format json
+nanograph changes sw.nano --since 3 --format jsonl
 ```
 
 ## Introspection
 
 ```bash
-nanograph version --db sw.nanograph
-nanograph describe --db sw.nanograph --format table
-nanograph export --db sw.nanograph --format jsonl
+nanograph version --db sw.nano
+nanograph describe --db sw.nano --format table
+nanograph export --db sw.nano --format jsonl
 ```

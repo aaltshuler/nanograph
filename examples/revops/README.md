@@ -19,20 +19,20 @@ Personal CRM and decision trace system. Demonstrates the complete physics of exe
 cargo build -p nanograph-cli
 
 # Create database
-nanograph init --schema examples/revops/revops.pg /path/to/omni.nanograph
+nanograph init --schema examples/revops/revops.pg /path/to/omni.nano
 
 # Load seed data
-nanograph load --data examples/revops/revops.jsonl --mode overwrite /path/to/omni.nanograph
+nanograph load --data examples/revops/revops.jsonl --mode overwrite /path/to/omni.nano
 
 # Typecheck queries
-nanograph check --db /path/to/omni.nanograph --query examples/revops/revops.gq
+nanograph check --db /path/to/omni.nano --query examples/revops/revops.gq
 
 # Run a query (RUST_LOG=off suppresses tracing)
-RUST_LOG=off nanograph run --db /path/to/omni.nanograph \
+RUST_LOG=off nanograph run --db /path/to/omni.nano \
   --query examples/revops/revops.gq --name pipeline_summary --format table
 
 # Run with parameters
-RUST_LOG=off nanograph run --db /path/to/omni.nanograph \
+RUST_LOG=off nanograph run --db /path/to/omni.nano \
   --query examples/revops/revops.gq --name decision_trace \
   --param opp=opp-stripe-migration --format table
 ```
@@ -157,7 +157,7 @@ The seed data implements the complete three-phase trace from the [use case doc](
 Load additional data with merge mode (upserts by `@key`):
 
 ```bash
-nanograph load --data your-data.jsonl --mode merge /path/to/omni.nanograph
+nanograph load --data your-data.jsonl --mode merge /path/to/omni.nano
 ```
 
 To evolve the schema, edit `<db>/schema.pg` then run `nanograph migrate <db>`.

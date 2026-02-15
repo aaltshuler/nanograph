@@ -7,7 +7,7 @@ ROOT="$(repo_root_from_script_dir "$SCRIPT_DIR")"
 EXAMPLES="$ROOT/examples/revops"
 
 TMP_DIR="$(mktemp -d /tmp/maintenance_e2e.XXXXXX)"
-DB="$TMP_DIR/maintenance_e2e.nanograph"
+DB="$TMP_DIR/maintenance_e2e.nano"
 DATA_APPEND="$TMP_DIR/append.jsonl"
 
 cleanup() {

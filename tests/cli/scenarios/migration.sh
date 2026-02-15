@@ -18,7 +18,7 @@ source "$SCRIPT_DIR/../lib/common.sh"
 ROOT="$(repo_root_from_script_dir "$SCRIPT_DIR")"
 EXAMPLES="$ROOT/examples/starwars"
 TMP_DIR="$(mktemp -d /tmp/sw_migration_test.XXXXXX)"
-DB="$TMP_DIR/sw_migration_test.nanograph"
+DB="$TMP_DIR/sw_migration_test.nano"
 MIGRATED_QUERY_FILE="$TMP_DIR/sw_migrated.gq"
 
 cleanup() {

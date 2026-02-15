@@ -57,8 +57,8 @@ Create `starwars.jsonl`:
 ## 3. Initialize and load
 
 ```bash
-nanograph init starwars.nanograph --schema starwars.pg
-nanograph load starwars.nanograph --data starwars.jsonl --mode overwrite
+nanograph init starwars.nano --schema starwars.pg
+nanograph load starwars.nano --data starwars.jsonl --mode overwrite
 ```
 
 ## 4. Write queries
@@ -111,16 +111,16 @@ query faction_sizes() {
 
 ```bash
 # Validate first
-nanograph check --db starwars.nanograph --query starwars.gq
+nanograph check --db starwars.nano --query starwars.gq
 
 # Run a query
-nanograph run --db starwars.nanograph --query starwars.gq --name jedi
+nanograph run --db starwars.nano --query starwars.gq --name jedi
 
 # With parameters
-nanograph run --db starwars.nanograph --query starwars.gq --name students_of --param name="Yoda"
+nanograph run --db starwars.nano --query starwars.gq --name students_of --param name="Yoda"
 
 # Different output formats
-nanograph run --db starwars.nanograph --query starwars.gq --name faction_sizes --format csv
+nanograph run --db starwars.nano --query starwars.gq --name faction_sizes --format csv
 ```
 
 ## 6. Mutate data
@@ -134,7 +134,7 @@ query add_character($name: String, $species: String, $alignment: String) {
 ```
 
 ```bash
-nanograph run --db starwars.nanograph --query starwars.gq --name add_character \
+nanograph run --db starwars.nano --query starwars.gq --name add_character \
     --param name="Ahsoka Tano" --param species="Togruta" --param alignment="Hero"
 ```
 

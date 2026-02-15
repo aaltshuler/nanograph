@@ -30,16 +30,16 @@ Schema-as-code, compile-time validated, Arrow-native.
 cargo build
 
 # Initialize a database from a schema
-nanograph init my.nanograph --schema schema.pg
+nanograph init my.nano --schema schema.pg
 
 # Load data
-nanograph load my.nanograph --data data.jsonl --mode overwrite
+nanograph load my.nano --data data.jsonl --mode overwrite
 
 # Typecheck queries
-nanograph check --db my.nanograph --query queries.gq
+nanograph check --db my.nano --query queries.gq
 
 # Run a query
-nanograph run --db my.nanograph --query queries.gq --name my_query
+nanograph run --db my.nano --query queries.gq --name my_query
 ```
 
 See `examples/starwars/` for a ready-to-run demo (66 nodes, 146 edges, 27 queries).
@@ -101,8 +101,8 @@ query remove_person($name: String) {
 Every mutation is logged to a commit-gated CDC journal. Replay changes since any version:
 
 ```bash
-nanograph changes my.nanograph --since 3 --format jsonl
-nanograph changes my.nanograph --from 1 --to 5 --format json
+nanograph changes my.nano --since 3 --format jsonl
+nanograph changes my.nano --from 1 --to 5 --format json
 ```
 
 ## Testing

@@ -17,7 +17,7 @@ ROOT="$(repo_root_from_script_dir "$SCRIPT_DIR")"
 EXAMPLES="$ROOT/examples/revops"
 
 TMP_DIR="$(mktemp -d /tmp/revops_typed_cdc_e2e.XXXXXX)"
-DB="$TMP_DIR/revops_typed_cdc_e2e.nanograph"
+DB="$TMP_DIR/revops_typed_cdc_e2e.nano"
 MUTATION_QUERY_FILE="$TMP_DIR/revops_mutations.gq"
 BAD_QUERY_FILE="$TMP_DIR/invalid_enum.gq"
 

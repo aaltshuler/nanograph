@@ -5,13 +5,14 @@ edition = "2024"
 description = "CLI for NanoGraph — the embedded property graph database. No server, schema-as-code."
 repository = "https://github.com/aaltshuler/nanograph"
 license = "MIT"
+readme = "../../README.md"
 
 [[bin]]
 name = "nanograph"
 path = "src/main.rs"
 
 [dependencies]
-nanograph = { path = "../nanograph" }
+nanograph = { path = "../nanograph", version = "0.6.0" }
 clap = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }

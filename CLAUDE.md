@@ -36,7 +36,7 @@ Two crates: `nanograph` (library) and `nanograph-cli` (binary named `nanograph`)
 ### Dual-Mode Execution
 
 The system supports two execution modes that affect many code paths:
-- **DB mode** (`--db path.nanograph`): Lance-backed persistence, supports mutations, CDC, migration, maintenance commands.
+- **DB mode** (`--db path.nano`): Lance-backed persistence, supports mutations, CDC, migration, maintenance commands.
 - **Legacy mode** (`--schema`/`--data` flags): In-memory GraphStorage, read-only queries. Useful for quick checks without a DB.
 
 ### Query Execution Pipeline
@@ -87,7 +87,7 @@ All library errors go through `NanoError` (in `error.rs`). Source-span diagnosti
 ### Persistence Layout
 
 ```
-<name>.nanograph/
+<name>.nano/
 ├── schema.pg              # source schema
 ├── schema.ir.json         # compiled schema IR
 ├── graph.manifest.json    # dataset inventory

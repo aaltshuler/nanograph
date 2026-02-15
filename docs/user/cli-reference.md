@@ -215,5 +215,5 @@ Edges with properties:
 ## Debug logging
 
 ```bash
-RUST_LOG=debug nanograph run --db mydb.nanograph --query q.gq --name my_query
+RUST_LOG=debug nanograph run --db mydb.nano --query q.gq --name my_query
 ```
