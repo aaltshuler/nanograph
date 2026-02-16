@@ -1,16 +1,16 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use arrow::array::builder::{
+use arrow_array::builder::{
     ArrayBuilder, BooleanBuilder, Date32Builder, Date64Builder, Float32Builder, Float64Builder,
     Int32Builder, Int64Builder, ListBuilder, StringBuilder, UInt32Builder, UInt64Builder,
     make_builder,
 };
-use arrow::array::{
+use arrow_array::{
     Array, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int32Array,
     Int64Array, RecordBatch, StringArray, UInt32Array, UInt64Array,
 };
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema};
 
 use crate::error::{NanoError, Result};
 
@@ -687,7 +687,7 @@ fn parse_edge_endpoint_key_token(token: &str, dt: &DataType) -> Result<String> {
 
 pub(crate) fn parse_date32_literal(s: &str) -> Result<i32> {
     let raw: Arc<dyn Array> = Arc::new(StringArray::from(vec![Some(s)]));
-    let casted = arrow::compute::cast(raw.as_ref(), &DataType::Date32)
+    let casted = arrow_cast::cast(raw.as_ref(), &DataType::Date32)
         .map_err(|e| NanoError::Storage(format!("invalid Date literal '{}': {}", s, e)))?;
     let out = casted
         .as_any()
@@ -701,7 +701,7 @@ pub(crate) fn parse_date32_literal(s: &str) -> Result<i32> {
 
 pub(crate) fn parse_date64_literal(s: &str) -> Result<i64> {
     let raw: Arc<dyn Array> = Arc::new(StringArray::from(vec![Some(s)]));
-    let casted = arrow::compute::cast(raw.as_ref(), &DataType::Date64)
+    let casted = arrow_cast::cast(raw.as_ref(), &DataType::Date64)
         .map_err(|e| NanoError::Storage(format!("invalid DateTime literal '{}': {}", s, e)))?;
     let out = casted
         .as_any()
@@ -799,7 +799,7 @@ edge Knows: Person -> Person
         let arr = json_values_to_array(&values, &dt, true).unwrap();
         let list = arr
             .as_any()
-            .downcast_ref::<arrow::array::ListArray>()
+            .downcast_ref::<arrow_array::ListArray>()
             .unwrap();
         assert_eq!(list.len(), 3);
         assert!(!list.is_null(0));

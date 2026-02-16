@@ -3,18 +3,18 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use arrow::array::{
+use arrow_array::{
     ArrayRef, BooleanArray, Date32Array, Date64Array, Float64Array, Int64Array, RecordBatch,
     StringArray, StructArray,
 };
-use arrow::datatypes::{DataType, Field, SchemaRef};
-use datafusion::common::Result;
-use datafusion::error::DataFusionError;
-use datafusion::execution::context::TaskContext;
-use datafusion::physical_plan::memory::MemoryStream;
-use datafusion::physical_plan::{
+use arrow_schema::{DataType, Field, SchemaRef};
+use datafusion_common::{Result, DataFusionError};
+use datafusion_execution::TaskContext;
+use datafusion_physical_expr::EquivalenceProperties;
+use datafusion_physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
+use datafusion_physical_plan::memory::MemoryStream;
 use futures::StreamExt;
 use lance::Dataset;
 use tracing::debug;
@@ -53,10 +53,10 @@ impl NodeScanExec {
         storage: Arc<GraphStorage>,
     ) -> Self {
         let properties = PlanProperties::new(
-            datafusion::physical_expr::EquivalenceProperties::new(output_schema.clone()),
-            datafusion::physical_plan::Partitioning::UnknownPartitioning(1),
-            datafusion::physical_plan::execution_plan::EmissionType::Incremental,
-            datafusion::physical_plan::execution_plan::Boundedness::Bounded,
+            EquivalenceProperties::new(output_schema.clone()),
+            datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
+            datafusion_physical_plan::execution_plan::EmissionType::Incremental,
+            datafusion_physical_plan::execution_plan::Boundedness::Bounded,
         );
 
         Self {
@@ -119,7 +119,7 @@ impl NodeScanExec {
     }
 
     fn compare_arrays(left: &ArrayRef, right: &ArrayRef, op: CompOp) -> Result<BooleanArray> {
-        use arrow::compute::kernels::cmp;
+        use arrow_ord::cmp;
 
         match op {
             CompOp::Eq => cmp::eq(left, right),
@@ -129,7 +129,7 @@ impl NodeScanExec {
             CompOp::Ge => cmp::gt_eq(left, right),
             CompOp::Le => cmp::lt_eq(left, right),
         }
-        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))
+        .map_err(|e| datafusion_common::DataFusionError::Execution(e.to_string()))
     }
 
     fn apply_pushdown_filters(&self, input: &RecordBatch) -> Result<RecordBatch> {
@@ -142,7 +142,7 @@ impl NodeScanExec {
             let left = current
                 .column_by_name(&predicate.property)
                 .ok_or_else(|| {
-                    datafusion::error::DataFusionError::Execution(format!(
+                    datafusion_common::DataFusionError::Execution(format!(
                         "column {} not found during node scan pushdown",
                         predicate.property
                     ))
@@ -151,15 +151,15 @@ impl NodeScanExec {
 
             let right = Self::literal_to_array(&predicate.literal, current.num_rows())?;
             let right = if left.data_type() != right.data_type() {
-                arrow::compute::cast(&right, left.data_type())
-                    .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?
+                arrow_cast::cast(&right, left.data_type())
+                    .map_err(|e| datafusion_common::DataFusionError::Execution(e.to_string()))?
             } else {
                 right
             };
 
             let mask = Self::compare_arrays(&left, &right, predicate.op)?;
-            current = arrow::compute::filter_record_batch(&current, &mask)
-                .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+            current = arrow_select::filter::filter_record_batch(&current, &mask)
+                .map_err(|e| datafusion_common::DataFusionError::Execution(e.to_string()))?;
 
             if current.num_rows() == 0 {
                 break;
@@ -231,14 +231,14 @@ impl NodeScanExec {
             Literal::Bool(v) => Some(if *v { "true" } else { "false" }.to_string()),
             Literal::Date(s) => {
                 let days = parse_date32_literal(s).ok()?;
-                let iso = arrow::temporal_conversions::date32_to_datetime(days)?
+                let iso = arrow_array::temporal_conversions::date32_to_datetime(days)?
                     .format("%Y-%m-%d")
                     .to_string();
                 Some(format!("CAST('{}' AS DATE)", iso))
             }
             Literal::DateTime(s) => {
                 let ms = parse_date64_literal(s).ok()?;
-                let ts = arrow::temporal_conversions::date64_to_datetime(ms)?
+                let ts = arrow_array::temporal_conversions::date64_to_datetime(ms)?
                     .format("%Y-%m-%d %H:%M:%S%.3f")
                     .to_string();
                 Some(format!("CAST('{}' AS TIMESTAMP(3))", ts))
@@ -386,7 +386,7 @@ impl ExecutionPlan for NodeScanExec {
                     batches.remove(0)
                 } else {
                     let projected_schema = batches[0].schema();
-                    arrow::compute::concat_batches(&projected_schema, &batches).map_err(|e| {
+                    arrow_select::concat::concat_batches(&projected_schema, &batches).map_err(|e| {
                         DataFusionError::Execution(format!(
                             "concat Lance scan batches error: {}",
                             e
@@ -406,7 +406,7 @@ impl ExecutionPlan for NodeScanExec {
             );
 
             return Ok(Box::pin(
-                datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                datafusion_physical_plan::stream::RecordBatchStreamAdapter::new(
                     self.output_schema.clone(),
                     stream,
                 ),

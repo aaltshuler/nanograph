@@ -3,9 +3,9 @@ use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use arrow::array::{ArrayRef, AsArray, RecordBatch, UInt64Array, new_null_array};
-use arrow::datatypes::UInt64Type;
-use arrow::record_batch::RecordBatchIterator;
+use arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator, UInt64Array, new_null_array};
+use arrow_array::cast::AsArray;
+use arrow_array::types::UInt64Type;
 use lance::Dataset;
 use lance::dataset::{WriteMode, WriteParams};
 use serde::{Deserialize, Serialize};
@@ -930,7 +930,7 @@ where
             "type change requires data cast".to_string(),
         )),
         Some(col) => {
-            if arrow::compute::cast(col.as_ref(), &target).is_ok() {
+            if arrow_cast::cast(col.as_ref(), &target).is_ok() {
                 Ok((
                     MigrationSafety::Confirm,
                     "type change requires data cast".to_string(),
@@ -1427,8 +1427,8 @@ fn validate_edge_endpoints_during_apply(
     ir: &SchemaIR,
     src_type_id: u32,
     dst_type_id: u32,
-    src_col: &dyn arrow::array::Array,
-    dst_col: &dyn arrow::array::Array,
+    src_col: &dyn arrow_array::Array,
+    dst_col: &dyn arrow_array::Array,
     edge_name: &str,
 ) -> Result<()> {
     let src_name = ir.type_name(src_type_id).ok_or_else(|| {
@@ -1497,7 +1497,7 @@ fn propdef_to_prop_type(prop: &PropDef) -> Result<crate::types::PropType> {
     })
 }
 
-fn propdef_to_arrow(prop: &PropDef) -> Result<arrow::datatypes::DataType> {
+fn propdef_to_arrow(prop: &PropDef) -> Result<arrow_schema::DataType> {
     Ok(propdef_to_prop_type(prop)?.to_arrow())
 }
 
@@ -1506,7 +1506,7 @@ fn cast_array_if_needed(col: ArrayRef, target_prop: &PropDef) -> Result<ArrayRef
     if col.data_type() == &target {
         Ok(col)
     } else {
-        arrow::compute::cast(col.as_ref(), &target)
+        arrow_cast::cast(col.as_ref(), &target)
             .map_err(|e| NanoError::Execution(format!("cast error: {}", e)))
     }
 }

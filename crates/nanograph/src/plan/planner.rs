@@ -2,12 +2,12 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use ahash::{AHashMap, AHashSet};
-use arrow::array::{Array, RecordBatch, StructArray};
-use arrow::compute;
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use datafusion::common::Result as DFResult;
-use datafusion::execution::context::SessionContext;
-use datafusion::physical_plan::{
+use arrow_array::{Array, RecordBatch, StructArray};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use datafusion_common::Result as DFResult;
+use datafusion_execution::TaskContext;
+use datafusion_physical_expr::EquivalenceProperties;
+use datafusion_physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 
@@ -57,8 +57,7 @@ pub async fn execute_query(
     )?;
 
     // Execute the plan to get intermediate results
-    let ctx = SessionContext::new();
-    let task_ctx = ctx.task_ctx();
+    let task_ctx = Arc::new(TaskContext::default());
     let stream = plan
         .execute(0, task_ctx)
         .map_err(|e| NanoError::Execution(e.to_string()))?;
@@ -764,7 +763,7 @@ fn apply_single_filter(
 
         // Cast right to match left's data type if they differ
         let right = if left.data_type() != right.data_type() {
-            arrow::compute::cast(&right, left.data_type())
+            arrow_cast::cast(&right, left.data_type())
                 .map_err(|e| NanoError::Execution(format!("cast error: {}", e)))?
         } else {
             right
@@ -772,7 +771,7 @@ fn apply_single_filter(
 
         let mask = compare_arrays(&left, &right, filter.op)?;
 
-        let filtered = arrow::compute::filter_record_batch(batch, &mask)
+        let filtered = arrow_select::filter::filter_record_batch(batch, &mask)
             .map_err(|e| NanoError::Execution(e.to_string()))?;
         if filtered.num_rows() > 0 {
             result.push(filtered);
@@ -785,7 +784,7 @@ fn eval_ir_expr(
     expr: &IRExpr,
     batch: &RecordBatch,
     params: &ParamMap,
-) -> Result<arrow::array::ArrayRef> {
+) -> Result<arrow_array::ArrayRef> {
     match expr {
         IRExpr::PropAccess { variable, property } => {
             let col_idx = batch.schema().index_of(variable).map_err(|e| {
@@ -823,22 +822,23 @@ fn eval_ir_expr(
     }
 }
 
-fn literal_to_array(lit: &Literal, num_rows: usize) -> Result<arrow::array::ArrayRef> {
+fn literal_to_array(lit: &Literal, num_rows: usize) -> Result<arrow_array::ArrayRef> {
+    use arrow_array::{StringArray, Int64Array, Float64Array, BooleanArray, Date32Array, Date64Array};
     match lit {
-        Literal::String(s) => Ok(Arc::new(arrow::array::StringArray::from(vec![
+        Literal::String(s) => Ok(Arc::new(StringArray::from(vec![
             s.as_str();
             num_rows
         ]))),
-        Literal::Integer(n) => Ok(Arc::new(arrow::array::Int64Array::from(vec![*n; num_rows]))),
-        Literal::Float(f) => Ok(Arc::new(arrow::array::Float64Array::from(vec![*f; num_rows]))),
-        Literal::Bool(b) => Ok(Arc::new(arrow::array::BooleanArray::from(vec![*b; num_rows]))),
+        Literal::Integer(n) => Ok(Arc::new(Int64Array::from(vec![*n; num_rows]))),
+        Literal::Float(f) => Ok(Arc::new(Float64Array::from(vec![*f; num_rows]))),
+        Literal::Bool(b) => Ok(Arc::new(BooleanArray::from(vec![*b; num_rows]))),
         Literal::Date(s) => {
             let days = parse_date32_literal(s).map_err(|e| NanoError::Execution(e.to_string()))?;
-            Ok(Arc::new(arrow::array::Date32Array::from(vec![days; num_rows])))
+            Ok(Arc::new(Date32Array::from(vec![days; num_rows])))
         }
         Literal::DateTime(s) => {
             let ms = parse_date64_literal(s).map_err(|e| NanoError::Execution(e.to_string()))?;
-            Ok(Arc::new(arrow::array::Date64Array::from(vec![ms; num_rows])))
+            Ok(Arc::new(Date64Array::from(vec![ms; num_rows])))
         }
         Literal::List(items) => {
             let rendered = serde_json::Value::Array(
@@ -848,7 +848,7 @@ fn literal_to_array(lit: &Literal, num_rows: usize) -> Result<arrow::array::Arra
                     .collect::<Vec<_>>(),
             )
             .to_string();
-            Ok(Arc::new(arrow::array::StringArray::from(vec![rendered; num_rows])))
+            Ok(Arc::new(StringArray::from(vec![rendered; num_rows])))
         }
     }
 }
@@ -873,11 +873,11 @@ fn literal_to_json_value_for_display(lit: &Literal) -> serde_json::Value {
 }
 
 fn compare_arrays(
-    left: &arrow::array::ArrayRef,
-    right: &arrow::array::ArrayRef,
+    left: &arrow_array::ArrayRef,
+    right: &arrow_array::ArrayRef,
     op: CompOp,
-) -> Result<arrow::array::BooleanArray> {
-    use arrow::compute::kernels::cmp;
+) -> Result<arrow_array::BooleanArray> {
+    use arrow_ord::cmp;
     let result = match op {
         CompOp::Eq => cmp::eq(left, right),
         CompOp::Ne => cmp::neq(left, right),
@@ -1002,7 +1002,7 @@ fn apply_aggregation(
     let combined = if batches.len() == 1 {
         batches[0].clone()
     } else {
-        compute::concat_batches(&schema, batches)
+        arrow_select::concat::concat_batches(&schema, batches)
             .map_err(|e| NanoError::Execution(e.to_string()))?
     };
 
@@ -1018,7 +1018,7 @@ fn apply_aggregation(
     }
 
     // Evaluate group keys
-    let mut group_columns: Vec<arrow::array::ArrayRef> = Vec::new();
+    let mut group_columns: Vec<arrow_array::ArrayRef> = Vec::new();
     for (_, proj) in &group_exprs {
         let col = eval_ir_expr(&proj.expr, &combined, params)?;
         group_columns.push(col);
@@ -1079,7 +1079,7 @@ fn apply_aggregation(
 
     // Convert to RecordBatch
     let out_schema = Arc::new(Schema::new(output_fields.clone()));
-    let mut arrays: Vec<arrow::array::ArrayRef> = Vec::new();
+    let mut arrays: Vec<arrow_array::ArrayRef> = Vec::new();
 
     for (col_idx, (_, proj)) in group_exprs.iter().enumerate() {
         let (_, dt, _) = infer_projection_field(&proj.expr, proj.alias.as_deref(), &combined)?;
@@ -1090,21 +1090,21 @@ fn apply_aggregation(
     for (agg_idx, (_, proj)) in agg_exprs.iter().enumerate() {
         let (_, dt, _) = infer_projection_field(&proj.expr, proj.alias.as_deref(), &combined)?;
         let arr = match dt {
-            DataType::Int64 => Arc::new(arrow::array::Int64Array::from(
+            DataType::Int64 => Arc::new(arrow_array::Int64Array::from(
                 output_agg_columns[agg_idx]
                     .iter()
                     .map(|v| *v as i64)
                     .collect::<Vec<_>>(),
-            )) as arrow::array::ArrayRef,
-            DataType::Float64 => Arc::new(arrow::array::Float64Array::from(
+            )) as arrow_array::ArrayRef,
+            DataType::Float64 => Arc::new(arrow_array::Float64Array::from(
                 output_agg_columns[agg_idx].clone(),
-            )) as arrow::array::ArrayRef,
-            _ => Arc::new(arrow::array::Int64Array::from(
+            )) as arrow_array::ArrayRef,
+            _ => Arc::new(arrow_array::Int64Array::from(
                 output_agg_columns[agg_idx]
                     .iter()
                     .map(|v| *v as i64)
                     .collect::<Vec<_>>(),
-            )) as arrow::array::ArrayRef,
+            )) as arrow_array::ArrayRef,
         };
         arrays.push(arr);
     }
@@ -1115,7 +1115,7 @@ fn apply_aggregation(
     Ok(vec![out_batch])
 }
 
-fn compute_aggregate(func: &AggFunc, col: &arrow::array::ArrayRef, rows: &[usize]) -> Result<f64> {
+fn compute_aggregate(func: &AggFunc, col: &arrow_array::ArrayRef, rows: &[usize]) -> Result<f64> {
     match func {
         AggFunc::Count => Ok(rows.len() as f64),
         AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max => {
@@ -1142,8 +1142,8 @@ fn compute_aggregate(func: &AggFunc, col: &arrow::array::ArrayRef, rows: &[usize
     }
 }
 
-fn array_value_to_string(arr: &arrow::array::ArrayRef, row: usize) -> String {
-    use arrow::array::*;
+fn array_value_to_string(arr: &arrow_array::ArrayRef, row: usize) -> String {
+    use arrow_array::*;
     if arr.is_null(row) {
         return "NULL".to_string();
     }
@@ -1168,8 +1168,8 @@ fn array_value_to_string(arr: &arrow::array::ArrayRef, row: usize) -> String {
     format!("?")
 }
 
-fn array_value_to_f64(arr: &arrow::array::ArrayRef, row: usize) -> Option<f64> {
-    use arrow::array::*;
+fn array_value_to_f64(arr: &arrow_array::ArrayRef, row: usize) -> Option<f64> {
+    use arrow_array::*;
     if arr.is_null(row) {
         return None;
     }
@@ -1191,30 +1191,31 @@ fn array_value_to_f64(arr: &arrow::array::ArrayRef, row: usize) -> Option<f64> {
     None
 }
 
-fn strings_to_array(values: &[String], dt: &DataType) -> arrow::array::ArrayRef {
+fn strings_to_array(values: &[String], dt: &DataType) -> arrow_array::ArrayRef {
+    use arrow_array::{StringArray, Int32Array, Int64Array, UInt64Array};
     match dt {
-        DataType::Utf8 => Arc::new(arrow::array::StringArray::from(
+        DataType::Utf8 => Arc::new(StringArray::from(
             values.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
         )),
-        DataType::Int32 => Arc::new(arrow::array::Int32Array::from(
+        DataType::Int32 => Arc::new(Int32Array::from(
             values
                 .iter()
                 .map(|s| s.parse::<i32>().unwrap_or(0))
                 .collect::<Vec<_>>(),
         )),
-        DataType::Int64 => Arc::new(arrow::array::Int64Array::from(
+        DataType::Int64 => Arc::new(Int64Array::from(
             values
                 .iter()
                 .map(|s| s.parse::<i64>().unwrap_or(0))
                 .collect::<Vec<_>>(),
         )),
-        DataType::UInt64 => Arc::new(arrow::array::UInt64Array::from(
+        DataType::UInt64 => Arc::new(UInt64Array::from(
             values
                 .iter()
                 .map(|s| s.parse::<u64>().unwrap_or(0))
                 .collect::<Vec<_>>(),
         )),
-        _ => Arc::new(arrow::array::StringArray::from(
+        _ => Arc::new(StringArray::from(
             values.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
         )),
     }
@@ -1234,7 +1235,7 @@ fn apply_order_and_limit(
     let combined = if batches.len() == 1 {
         batches[0].clone()
     } else {
-        compute::concat_batches(&schema, batches)
+        arrow_select::concat::concat_batches(&schema, batches)
             .map_err(|e| NanoError::Execution(e.to_string()))?
     };
 
@@ -1273,9 +1274,9 @@ fn apply_order_and_limit(
             };
 
             if let Some(c) = col {
-                sort_columns.push(arrow::compute::SortColumn {
+                sort_columns.push(arrow_ord::sort::SortColumn {
                     values: c,
-                    options: Some(arrow::compute::SortOptions {
+                    options: Some(arrow_ord::sort::SortOptions {
                         descending: ord.descending,
                         nulls_first: false,
                     }),
@@ -1284,12 +1285,12 @@ fn apply_order_and_limit(
         }
 
         if !sort_columns.is_empty() {
-            let indices = arrow::compute::lexsort_to_indices(&sort_columns, None)
+            let indices = arrow_ord::sort::lexsort_to_indices(&sort_columns, None)
                 .map_err(|e| NanoError::Execution(e.to_string()))?;
 
             let mut new_columns = Vec::new();
             for col in result.columns() {
-                let taken = arrow::compute::take(col.as_ref(), &indices, None)
+                let taken = arrow_select::take::take(col.as_ref(), &indices, None)
                     .map_err(|e| NanoError::Execution(e.to_string()))?;
                 new_columns.push(taken);
             }
@@ -1325,10 +1326,10 @@ impl CrossJoinExec {
         output_schema: SchemaRef,
     ) -> Self {
         let properties = PlanProperties::new(
-            datafusion::physical_expr::EquivalenceProperties::new(output_schema.clone()),
-            datafusion::physical_plan::Partitioning::UnknownPartitioning(1),
-            datafusion::physical_plan::execution_plan::EmissionType::Incremental,
-            datafusion::physical_plan::execution_plan::Boundedness::Bounded,
+            EquivalenceProperties::new(output_schema.clone()),
+            datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
+            datafusion_physical_plan::execution_plan::EmissionType::Incremental,
+            datafusion_physical_plan::execution_plan::Boundedness::Bounded,
         );
         Self {
             left,
@@ -1339,7 +1340,7 @@ impl CrossJoinExec {
     }
 }
 
-impl datafusion::physical_plan::DisplayAs for CrossJoinExec {
+impl datafusion_physical_plan::DisplayAs for CrossJoinExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "CrossJoinExec")
     }
@@ -1380,7 +1381,7 @@ impl ExecutionPlan for CrossJoinExec {
     fn execute(
         &self,
         partition: usize,
-        context: Arc<datafusion::execution::context::TaskContext>,
+        context: Arc<datafusion_execution::TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         enum CrossJoinState {
             Init {
@@ -1481,7 +1482,7 @@ impl ExecutionPlan for CrossJoinExec {
         });
 
         Ok(Box::pin(
-            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+            datafusion_physical_plan::stream::RecordBatchStreamAdapter::new(
                 self.output_schema.clone(),
                 stream,
             ),
@@ -1502,7 +1503,7 @@ fn cross_join_batches(
         return Ok(RecordBatch::new_empty(schema.clone()));
     }
 
-    let mut columns: Vec<arrow::array::ArrayRef> = Vec::new();
+    let mut columns: Vec<arrow_array::ArrayRef> = Vec::new();
 
     // Replicate left columns
     for col in left.columns() {
@@ -1512,8 +1513,8 @@ fn cross_join_batches(
                 indices.push(i as u64);
             }
         }
-        let idx = arrow::array::UInt64Array::from(indices);
-        let taken = arrow::compute::take(col.as_ref(), &idx, None)?;
+        let idx = arrow_array::UInt64Array::from(indices);
+        let taken = arrow_select::take::take(col.as_ref(), &idx, None)?;
         columns.push(taken);
     }
 
@@ -1525,13 +1526,13 @@ fn cross_join_batches(
                 indices.push(j as u64);
             }
         }
-        let idx = arrow::array::UInt64Array::from(indices);
-        let taken = arrow::compute::take(col.as_ref(), &idx, None)?;
+        let idx = arrow_array::UInt64Array::from(indices);
+        let taken = arrow_select::take::take(col.as_ref(), &idx, None)?;
         columns.push(taken);
     }
 
     RecordBatch::try_new(schema.clone(), columns)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+        .map_err(|e| datafusion_common::DataFusionError::ArrowError(Box::new(e), None))
 }
 
 /// Anti-join exec: returns rows from left where no matching rows exist in right
@@ -1558,10 +1559,10 @@ impl AntiJoinExec {
     ) -> Self {
         let output_schema = outer.schema();
         let properties = PlanProperties::new(
-            datafusion::physical_expr::EquivalenceProperties::new(output_schema.clone()),
-            datafusion::physical_plan::Partitioning::UnknownPartitioning(1),
-            datafusion::physical_plan::execution_plan::EmissionType::Incremental,
-            datafusion::physical_plan::execution_plan::Boundedness::Bounded,
+            EquivalenceProperties::new(output_schema.clone()),
+            datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
+            datafusion_physical_plan::execution_plan::EmissionType::Incremental,
+            datafusion_physical_plan::execution_plan::Boundedness::Bounded,
         );
         Self {
             outer,
@@ -1620,7 +1621,7 @@ impl ExecutionPlan for AntiJoinExec {
     fn execute(
         &self,
         partition: usize,
-        context: Arc<datafusion::execution::context::TaskContext>,
+        context: Arc<datafusion_execution::TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         enum AntiJoinState {
             Init {
@@ -1668,7 +1669,7 @@ impl ExecutionPlan for AntiJoinExec {
                             let filtered_batches =
                                 apply_ir_filters(&inner_pipeline, &[batch], &params).map_err(
                                     |e| {
-                                        datafusion::error::DataFusionError::Execution(e.to_string())
+                                        datafusion_common::DataFusionError::Execution(e.to_string())
                                     },
                                 )?;
 
@@ -1681,7 +1682,7 @@ impl ExecutionPlan for AntiJoinExec {
                                         if let Some(id_col) = struct_arr.column_by_name("id") {
                                             if let Some(id_arr) = id_col
                                                 .as_any()
-                                                .downcast_ref::<arrow::array::UInt64Array>(
+                                                .downcast_ref::<arrow_array::UInt64Array>(
                                             ) {
                                                 for i in 0..id_arr.len() {
                                                     inner_ids.insert(id_arr.value(i));
@@ -1710,33 +1711,33 @@ impl ExecutionPlan for AntiJoinExec {
                             let col = batch.column(col_idx);
                             let struct_arr =
                                 col.as_any().downcast_ref::<StructArray>().ok_or_else(|| {
-                                    datafusion::error::DataFusionError::Execution(format!(
+                                    datafusion_common::DataFusionError::Execution(format!(
                                         "column {} is not a struct",
                                         join_var
                                     ))
                                 })?;
                             let id_col = struct_arr.column_by_name("id").ok_or_else(|| {
-                                datafusion::error::DataFusionError::Execution(format!(
+                                datafusion_common::DataFusionError::Execution(format!(
                                     "struct {} has no id field",
                                     join_var
                                 ))
                             })?;
                             let id_arr = id_col
                                 .as_any()
-                                .downcast_ref::<arrow::array::UInt64Array>()
+                                .downcast_ref::<arrow_array::UInt64Array>()
                                 .ok_or_else(|| {
-                                    datafusion::error::DataFusionError::Execution(format!(
+                                    datafusion_common::DataFusionError::Execution(format!(
                                         "struct {} id field is not UInt64",
                                         join_var
                                     ))
                                 })?;
 
-                            let mask = arrow::array::BooleanArray::from(
+                            let mask = arrow_array::BooleanArray::from(
                                 (0..id_arr.len())
                                     .map(|i| !inner_ids.contains(&id_arr.value(i)))
                                     .collect::<Vec<_>>(),
                             );
-                            let filtered = arrow::compute::filter_record_batch(&batch, &mask)?;
+                            let filtered = arrow_select::filter::filter_record_batch(&batch, &mask)?;
                             if filtered.num_rows() > 0 {
                                 let next_state = AntiJoinState::Running {
                                     outer_stream,
@@ -1754,7 +1755,7 @@ impl ExecutionPlan for AntiJoinExec {
         });
 
         Ok(Box::pin(
-            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+            datafusion_physical_plan::stream::RecordBatchStreamAdapter::new(
                 self.output_schema.clone(),
                 stream,
             ),
@@ -1765,8 +1766,8 @@ impl ExecutionPlan for AntiJoinExec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Date32Array, Date64Array, RecordBatch};
-    use arrow::datatypes::{DataType, Schema};
+    use arrow_array::{Date32Array, Date64Array, RecordBatch};
+    use arrow_schema::{DataType, Schema};
     use crate::query::ast::Literal;
     use std::sync::Arc;
 
@@ -1856,7 +1857,7 @@ mod tests {
     #[test]
     fn infer_projection_field_uses_temporal_types_for_temporal_literals() {
         let batch = RecordBatch::new_empty(Arc::new(Schema::new(
-            Vec::<arrow::datatypes::Field>::new(),
+            Vec::<arrow_schema::Field>::new(),
         )));
 
         let (_, date_ty, _) = infer_projection_field(

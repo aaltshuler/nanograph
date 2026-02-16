@@ -2,11 +2,11 @@ use std::collections::HashMap;
 #[cfg(test)]
 use std::collections::HashSet;
 
-use arrow::array::{
+use arrow_array::{
     Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array,
     Int32Array, Int64Array, StringArray, UInt32Array, UInt64Array,
 };
-use arrow::datatypes::DataType;
+use arrow_schema::DataType;
 
 use crate::catalog::schema_ir::SchemaIR;
 use crate::error::{NanoError, Result};
@@ -258,7 +258,7 @@ fn scalar_value_string(
 mod tests {
     use std::collections::{HashMap, HashSet};
 
-    use arrow::array::StringArray;
+    use arrow_array::StringArray;
 
     use crate::catalog::schema_ir::{build_catalog_from_ir, build_schema_ir};
     use crate::schema::parser::parse_schema;

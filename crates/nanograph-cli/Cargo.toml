@@ -13,11 +13,13 @@ path = "src/main.rs"
 
 [dependencies]
 nanograph = { path = "../nanograph", version = "0.6.0" }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-cast = { workspace = true }
+datafusion-common = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
-arrow = { workspace = true }
-datafusion = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 color-eyre = { workspace = true }

@@ -1,4 +1,4 @@
-use arrow::datatypes::DataType;
+use arrow_schema::DataType;
 
 pub type NodeId = u64;
 pub type EdgeId = u64;
@@ -120,7 +120,7 @@ impl PropType {
     pub fn to_arrow(&self) -> DataType {
         let scalar_dt = self.scalar.to_arrow();
         if self.list {
-            DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
+            DataType::List(std::sync::Arc::new(arrow_schema::Field::new(
                 "item", scalar_dt, true,
             )))
         } else {

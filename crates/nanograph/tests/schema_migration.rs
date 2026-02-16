@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
-use arrow::array::{Array, StringArray};
+use arrow_array::{Array, StringArray};
 use lance::Dataset;
 use lance_index::DatasetIndexExt;
 use tempfile::TempDir;

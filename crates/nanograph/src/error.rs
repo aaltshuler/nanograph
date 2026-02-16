@@ -67,10 +67,10 @@ pub enum NanoError {
     Execution(String),
 
     #[error(transparent)]
-    Arrow(#[from] arrow::error::ArrowError),
+    Arrow(#[from] arrow_schema::ArrowError),
 
     #[error(transparent)]
-    DataFusion(#[from] datafusion::error::DataFusionError),
+    DataFusion(#[from] datafusion_common::DataFusionError),
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use arrow::datatypes::{Field, Schema};
+use arrow_schema::{Field, Schema};
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::{Catalog, EdgeType, NodeType};
@@ -227,7 +227,7 @@ pub fn build_catalog_from_ir(ir: &SchemaIR) -> Result<Catalog> {
             TypeDef::Node(n) => {
                 let mut properties = HashMap::new();
                 let mut indexed_properties = HashSet::new();
-                let mut fields = vec![Field::new("id", arrow::datatypes::DataType::UInt64, false)];
+                let mut fields = vec![Field::new("id", arrow_schema::DataType::UInt64, false)];
 
                 for prop in &n.properties {
                     let scalar = ScalarType::from_str_name(&prop.scalar_type).ok_or_else(|| {

@@ -1,5 +1,6 @@
 /target
 *.nano
+*.nanograph
 *.lance
 .DS_Store
 docs/archive/

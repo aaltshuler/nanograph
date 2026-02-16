@@ -4,15 +4,16 @@ use std::fmt;
 use std::sync::Arc;
 
 use ahash::AHashMap;
-use arrow::array::{
+use arrow_array::{
     Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array,
     Int32Array, Int64Array, ListArray, RecordBatch, StringArray, StructArray, UInt32Array,
     UInt64Array,
 };
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use datafusion::common::Result as DFResult;
-use datafusion::execution::context::TaskContext;
-use datafusion::physical_plan::{
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use datafusion_common::Result as DFResult;
+use datafusion_execution::TaskContext;
+use datafusion_physical_expr::EquivalenceProperties;
+use datafusion_physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 
@@ -74,10 +75,10 @@ impl ExpandExec {
         let output_schema = Arc::new(Schema::new(output_fields));
 
         let properties = PlanProperties::new(
-            datafusion::physical_expr::EquivalenceProperties::new(output_schema.clone()),
-            datafusion::physical_plan::Partitioning::UnknownPartitioning(1),
-            datafusion::physical_plan::execution_plan::EmissionType::Incremental,
-            datafusion::physical_plan::execution_plan::Boundedness::Bounded,
+            EquivalenceProperties::new(output_schema.clone()),
+            datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
+            datafusion_physical_plan::execution_plan::EmissionType::Incremental,
+            datafusion_physical_plan::execution_plan::Boundedness::Bounded,
         );
 
         Self {
@@ -166,12 +167,12 @@ impl ExecutionPlan for ExpandExec {
         let storage = self.storage.clone();
 
         let stream = futures::stream::once(async move {
-            use datafusion::physical_plan::common::collect;
+            use datafusion_physical_plan::common::collect;
             let batches = collect(input.execute(partition, context)?).await?;
 
             // Create an ExpandExec with the real input plan for correct output_schema
             let expand = ExpandExec {
-                input: Arc::new(datafusion::physical_plan::empty::EmptyExec::new(Arc::new(
+                input: Arc::new(datafusion_physical_plan::empty::EmptyExec::new(Arc::new(
                     Schema::new(Vec::<Field>::new()),
                 ))),
                 src_var,
@@ -184,10 +185,10 @@ impl ExecutionPlan for ExpandExec {
                 output_schema: schema.clone(),
                 storage,
                 properties: PlanProperties::new(
-                    datafusion::physical_expr::EquivalenceProperties::new(schema.clone()),
-                    datafusion::physical_plan::Partitioning::UnknownPartitioning(1),
-                    datafusion::physical_plan::execution_plan::EmissionType::Incremental,
-                    datafusion::physical_plan::execution_plan::Boundedness::Bounded,
+                    EquivalenceProperties::new(schema.clone()),
+                    datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
+                    datafusion_physical_plan::execution_plan::EmissionType::Incremental,
+                    datafusion_physical_plan::execution_plan::Boundedness::Bounded,
                 ),
             };
 
@@ -213,18 +214,18 @@ impl ExecutionPlan for ExpandExec {
 
             let mut final_cols = Vec::new();
             for col_arrays in &result_columns {
-                let refs: Vec<&dyn arrow::array::Array> =
+                let refs: Vec<&dyn arrow_array::Array> =
                     col_arrays.iter().map(|a| a.as_ref()).collect();
-                let concatenated = arrow::compute::concat(&refs)?;
+                let concatenated = arrow_select::concat::concat(&refs)?;
                 final_cols.push(concatenated);
             }
 
             RecordBatch::try_new(schema, final_cols)
-                .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+                .map_err(|e| datafusion_common::DataFusionError::ArrowError(Box::new(e), None))
         });
 
         Ok(Box::pin(
-            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+            datafusion_physical_plan::stream::RecordBatchStreamAdapter::new(
                 self.output_schema.clone(),
                 stream,
             ),
@@ -239,7 +240,7 @@ impl ExpandExec {
             .edge_segments
             .get(&self.edge_type)
             .ok_or_else(|| {
-                datafusion::error::DataFusionError::Execution(format!(
+                datafusion_common::DataFusionError::Execution(format!(
                     "edge type {} not found",
                     self.edge_type
                 ))
@@ -250,27 +251,27 @@ impl ExpandExec {
             Direction::In => edge_seg.csc.as_ref(),
         }
         .ok_or_else(|| {
-            datafusion::error::DataFusionError::Execution("CSR not built".to_string())
+            datafusion_common::DataFusionError::Execution("CSR not built".to_string())
         })?;
 
         // Find the src struct column
         let src_col_idx = input
             .schema()
             .index_of(&self.src_var)
-            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+            .map_err(|e| datafusion_common::DataFusionError::Execution(e.to_string()))?;
         let src_struct = input
             .column(src_col_idx)
             .as_any()
             .downcast_ref::<StructArray>()
             .ok_or_else(|| {
-                datafusion::error::DataFusionError::Execution(
+                datafusion_common::DataFusionError::Execution(
                     "source column is not a struct".to_string(),
                 )
             })?;
 
         // Get the id field from the struct
         let id_col = src_struct.column_by_name("id").ok_or_else(|| {
-            datafusion::error::DataFusionError::Execution(
+            datafusion_common::DataFusionError::Execution(
                 "no id field in source struct".to_string(),
             )
         })?;
@@ -278,14 +279,14 @@ impl ExpandExec {
             .as_any()
             .downcast_ref::<UInt64Array>()
             .ok_or_else(|| {
-                datafusion::error::DataFusionError::Execution("id field is not UInt64".to_string())
+                datafusion_common::DataFusionError::Execution("id field is not UInt64".to_string())
             })?;
 
         // Get destination node data
         let dst_all_nodes = self
             .storage
             .get_all_nodes(&self.dst_type)
-            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+            .map_err(|e| datafusion_common::DataFusionError::Execution(e.to_string()))?;
         let dst_batch = match &dst_all_nodes {
             Some(b) => b,
             None => {
@@ -300,7 +301,7 @@ impl ExpandExec {
             .as_any()
             .downcast_ref::<UInt64Array>()
             .ok_or_else(|| {
-                datafusion::error::DataFusionError::Execution(
+                datafusion_common::DataFusionError::Execution(
                     "dst id column is not UInt64".to_string(),
                 )
             })?;
@@ -328,7 +329,7 @@ impl ExpandExec {
         let mut valid_indices: Vec<(usize, usize)> = Vec::with_capacity(output_row_indices.len());
         for (src_idx, dst_id) in &output_row_indices {
             let dst_row = dst_id_to_row.get(dst_id).copied().ok_or_else(|| {
-                datafusion::error::DataFusionError::Execution(format!(
+                datafusion_common::DataFusionError::Execution(format!(
                     "edge {} references missing destination node id {}",
                     self.edge_type, dst_id
                 ))
@@ -371,14 +372,14 @@ impl ExpandExec {
         output_columns.push(Arc::new(dst_struct_array));
 
         RecordBatch::try_new(self.output_schema.clone(), output_columns)
-            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+            .map_err(|e| datafusion_common::DataFusionError::ArrowError(Box::new(e), None))
     }
 }
 
 /// Take specific rows from an array by index.
 fn take_rows(array: &ArrayRef, indices: &[usize]) -> DFResult<ArrayRef> {
     let idx_array = UInt64Array::from(indices.iter().map(|&i| i as u64).collect::<Vec<_>>());
-    let taken = arrow::compute::take(array.as_ref(), &idx_array, None)?;
+    let taken = arrow_select::take::take(array.as_ref(), &idx_array, None)?;
     Ok(taken)
 }
 
@@ -933,7 +934,7 @@ fn array_value_to_json(array: &ArrayRef, row: usize) -> serde_json::Value {
             .downcast_ref::<Date32Array>()
             .map(|a| {
                 let days = a.value(row);
-                arrow::temporal_conversions::date32_to_datetime(days)
+                arrow_array::temporal_conversions::date32_to_datetime(days)
                     .map(|dt| serde_json::Value::String(dt.format("%Y-%m-%d").to_string()))
                     .unwrap_or_else(|| serde_json::Value::Number((days as i64).into()))
             })
@@ -943,7 +944,7 @@ fn array_value_to_json(array: &ArrayRef, row: usize) -> serde_json::Value {
             .downcast_ref::<Date64Array>()
             .map(|a| {
                 let ms = a.value(row);
-                arrow::temporal_conversions::date64_to_datetime(ms)
+                arrow_array::temporal_conversions::date64_to_datetime(ms)
                     .map(|dt| serde_json::Value::String(dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()))
                     .unwrap_or_else(|| serde_json::Value::Number(ms.into()))
             })

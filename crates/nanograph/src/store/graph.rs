@@ -2,8 +2,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow::array::{Array, AsArray, RecordBatch, UInt64Builder};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef, UInt64Type};
+use arrow_array::{Array, RecordBatch};
+use arrow_array::builder::UInt64Builder;
+use arrow_array::cast::AsArray;
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_array::types::UInt64Type;
 use tracing::{debug, info};
 
 use crate::catalog::Catalog;
@@ -246,7 +249,7 @@ impl GraphStorage {
                 if seg.batches.len() == 1 {
                     return Ok(Some(seg.batches[0].clone()));
                 }
-                let batch = arrow::compute::concat_batches(&seg.schema, &seg.batches)
+                let batch = arrow_select::concat::concat_batches(&seg.schema, &seg.batches)
                     .map_err(|e| NanoError::Storage(format!("concat error: {}", e)))?;
                 Ok(Some(batch))
             }
@@ -352,11 +355,11 @@ impl GraphStorage {
 
         let num_edges = segment.edge_ids.len();
         let id_arr: Arc<dyn Array> =
-            Arc::new(arrow::array::UInt64Array::from(segment.edge_ids.clone()));
+            Arc::new(arrow_array::UInt64Array::from(segment.edge_ids.clone()));
         let src_arr: Arc<dyn Array> =
-            Arc::new(arrow::array::UInt64Array::from(segment.src_ids.clone()));
+            Arc::new(arrow_array::UInt64Array::from(segment.src_ids.clone()));
         let dst_arr: Arc<dyn Array> =
-            Arc::new(arrow::array::UInt64Array::from(segment.dst_ids.clone()));
+            Arc::new(arrow_array::UInt64Array::from(segment.dst_ids.clone()));
 
         let mut fields = vec![
             Field::new("id", DataType::UInt64, false),
@@ -371,7 +374,7 @@ impl GraphStorage {
             let prop_batch = if segment.batches.len() == 1 {
                 segment.batches[0].clone()
             } else {
-                arrow::compute::concat_batches(&prop_schema, &segment.batches)
+                arrow_select::concat::concat_batches(&prop_schema, &segment.batches)
                     .map_err(|e| NanoError::Storage(format!("concat error: {}", e)))?
             };
 
@@ -431,7 +434,7 @@ mod tests {
     use super::*;
     use crate::catalog::build_catalog;
     use crate::schema::parser::parse_schema;
-    use arrow::array::StringArray;
+    use arrow_array::StringArray;
 
     fn test_storage() -> GraphStorage {
         let schema = parse_schema(
@@ -467,7 +470,7 @@ edge WorksAt: Person -> Company
             person_schema,
             vec![
                 Arc::new(StringArray::from(vec!["Alice", "Bob"])),
-                Arc::new(arrow::array::Int32Array::from(vec![Some(30), Some(25)])),
+                Arc::new(arrow_array::Int32Array::from(vec![Some(30), Some(25)])),
             ],
         )
         .unwrap();
@@ -494,7 +497,7 @@ edge WorksAt: Person -> Company
             person_schema,
             vec![
                 Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])),
-                Arc::new(arrow::array::Int32Array::from(vec![
+                Arc::new(arrow_array::Int32Array::from(vec![
                     Some(30),
                     Some(25),
                     Some(35),
@@ -535,7 +538,7 @@ edge WorksAt: Person -> Company
             person_schema,
             vec![
                 Arc::new(StringArray::from(vec!["Alice"])),
-                Arc::new(arrow::array::Int32Array::from(vec![Some(30)])),
+                Arc::new(arrow_array::Int32Array::from(vec![Some(30)])),
             ],
         )
         .unwrap();

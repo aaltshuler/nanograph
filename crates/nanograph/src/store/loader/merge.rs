@@ -2,12 +2,12 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
-use arrow::array::{
+use arrow_array::{
     Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array,
     Int32Array, Int64Array, ListArray, RecordBatch, StringArray, UInt32Array, UInt64Array,
-    UInt64Builder,
 };
-use arrow::datatypes::DataType;
+use arrow_array::builder::UInt64Builder;
+use arrow_schema::DataType;
 
 use crate::catalog::schema_ir::SchemaIR;
 use crate::error::{NanoError, Result};
@@ -121,7 +121,7 @@ pub(crate) fn append_storage(
                 let (incoming_reassigned, remap) =
                     reassign_node_ids(incoming_batch, &mut next_node_id)?;
                 let schema = existing_batch.schema();
-                let combined = arrow::compute::concat_batches(
+                let combined = arrow_select::concat::concat_batches(
                     &schema,
                     &[existing_batch.clone(), incoming_reassigned],
                 )
@@ -653,7 +653,7 @@ fn array_value_to_json(array: &ArrayRef, row: usize) -> serde_json::Value {
             .downcast_ref::<Date32Array>()
             .map(|a| {
                 let days = a.value(row);
-                arrow::temporal_conversions::date32_to_datetime(days)
+                arrow_array::temporal_conversions::date32_to_datetime(days)
                     .map(|dt| serde_json::Value::String(dt.format("%Y-%m-%d").to_string()))
                     .unwrap_or_else(|| serde_json::Value::Number((days as i64).into()))
             })
@@ -663,7 +663,7 @@ fn array_value_to_json(array: &ArrayRef, row: usize) -> serde_json::Value {
             .downcast_ref::<Date64Array>()
             .map(|a| {
                 let ms = a.value(row);
-                arrow::temporal_conversions::date64_to_datetime(ms)
+                arrow_array::temporal_conversions::date64_to_datetime(ms)
                     .map(|dt| serde_json::Value::String(dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()))
                     .unwrap_or_else(|| serde_json::Value::Number(ms.into()))
             })
@@ -691,7 +691,7 @@ mod tests {
 
     use crate::catalog::schema_ir::{build_catalog_from_ir, build_schema_ir};
     use crate::schema::parser::parse_schema;
-    use arrow::datatypes::{Field, Schema};
+    use arrow_schema::{Field, Schema};
 
     use super::*;
 

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use ariadne::{Color, Label, Report, ReportKind, Source};
-use arrow::array::RecordBatch;
+use arrow_array::RecordBatch;
 use clap::{Parser, Subcommand};
 use color_eyre::eyre::{Result, WrapErr, eyre};
 use tracing::{debug, info, instrument};
@@ -744,7 +744,7 @@ async fn cmd_export(db_path: PathBuf, format: &str, json: bool) -> Result<()> {
 }
 
 fn build_export_rows(db: &Database) -> Result<Vec<serde_json::Value>> {
-    use arrow::array::{Array, StringArray, UInt64Array};
+    use arrow_array::{Array, StringArray, UInt64Array};
 
     let mut rows = Vec::new();
     let mut node_labels: HashMap<String, HashMap<u64, String>> = HashMap::new();
@@ -1485,7 +1485,7 @@ fn render_results(format: &str, results: &[RecordBatch]) -> Result<()> {
             if results.is_empty() {
                 println!("(empty result)");
             } else {
-                let formatted = arrow::util::pretty::pretty_format_batches(results)
+                let formatted = arrow_cast::pretty::pretty_format_batches(results)
                     .wrap_err("failed to render table output")?;
                 println!("{}", formatted);
             }
@@ -1509,8 +1509,8 @@ fn render_results(format: &str, results: &[RecordBatch]) -> Result<()> {
 }
 
 fn mutation_result_batch(result: MutationExecResult) -> Result<RecordBatch> {
-    use arrow::array::UInt64Array;
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow_array::UInt64Array;
+    use arrow_schema::{DataType, Field, Schema};
     let schema = Arc::new(Schema::new(vec![
         Field::new("affected_nodes", DataType::UInt64, false),
         Field::new("affected_edges", DataType::UInt64, false),
@@ -1535,7 +1535,7 @@ fn print_csv(batch: &RecordBatch) {
         for col in 0..batch.num_columns() {
             let col_arr = batch.column(col);
             values.push(
-                arrow::util::display::array_value_to_string(col_arr, row).unwrap_or_default(),
+                arrow_cast::display::array_value_to_string(col_arr, row).unwrap_or_default(),
             );
         }
         println!("{}", values.join(","));
@@ -1548,7 +1548,7 @@ fn print_jsonl(batch: &RecordBatch) {
         let mut map = serde_json::Map::new();
         for (col_idx, field) in schema.fields().iter().enumerate() {
             let col_arr = batch.column(col_idx);
-            let val = arrow::util::display::array_value_to_string(col_arr, row).unwrap_or_default();
+            let val = arrow_cast::display::array_value_to_string(col_arr, row).unwrap_or_default();
             map.insert(field.name().clone(), serde_json::Value::String(val));
         }
         println!("{}", serde_json::Value::Object(map));
@@ -1578,12 +1578,12 @@ fn record_batches_to_json_rows(results: &[RecordBatch]) -> Vec<serde_json::Value
     out
 }
 
-fn cli_array_value_to_json(array: &arrow::array::ArrayRef, row: usize) -> serde_json::Value {
-    use arrow::array::{
+fn cli_array_value_to_json(array: &arrow_array::ArrayRef, row: usize) -> serde_json::Value {
+    use arrow_array::{
         Array, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int32Array,
         Int64Array, ListArray, StringArray, UInt32Array, UInt64Array,
     };
-    use arrow::datatypes::DataType;
+    use arrow_schema::DataType;
 
     if array.is_null(row) {
         return serde_json::Value::Null;
@@ -1637,7 +1637,7 @@ fn cli_array_value_to_json(array: &arrow::array::ArrayRef, row: usize) -> serde_
             .downcast_ref::<Date32Array>()
             .map(|a| {
                 let days = a.value(row);
-                arrow::temporal_conversions::date32_to_datetime(days)
+                arrow_array::temporal_conversions::date32_to_datetime(days)
                     .map(|dt| serde_json::Value::String(dt.format("%Y-%m-%d").to_string()))
                     .unwrap_or_else(|| serde_json::Value::Number((days as i64).into()))
             })
@@ -1647,7 +1647,7 @@ fn cli_array_value_to_json(array: &arrow::array::ArrayRef, row: usize) -> serde_
             .downcast_ref::<Date64Array>()
             .map(|a| {
                 let ms = a.value(row);
-                arrow::temporal_conversions::date64_to_datetime(ms)
+                arrow_array::temporal_conversions::date64_to_datetime(ms)
                     .map(|dt| serde_json::Value::String(dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()))
                     .unwrap_or_else(|| serde_json::Value::Number(ms.into()))
             })
@@ -1666,7 +1666,7 @@ fn cli_array_value_to_json(array: &arrow::array::ArrayRef, row: usize) -> serde_
             .unwrap_or(serde_json::Value::Null),
         _ => {
             let display =
-                arrow::util::display::array_value_to_string(array, row).unwrap_or_default();
+                arrow_cast::display::array_value_to_string(array, row).unwrap_or_default();
             serde_json::Value::String(display)
         }
     }
@@ -1779,7 +1779,7 @@ fn build_param_map(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{ArrayRef, Date32Array, Date64Array, Int32Array, StringArray};
+    use arrow_array::{ArrayRef, Date32Array, Date64Array, Int32Array, StringArray};
     use nanograph::store::txlog::read_visible_cdc_entries;
     use std::sync::Arc;
     use tempfile::TempDir;

@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow::array::{Array, Int32Array, Int64Array, RecordBatch, StringArray, UInt64Array};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow_array::{Array, Int32Array, Int64Array, RecordBatch, StringArray, UInt64Array};
+use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use lance_index::DatasetIndexExt;
 
@@ -914,7 +914,7 @@ async fn test_update_mutation_query_preserves_id_and_edges() {
         .column_by_name("id")
         .unwrap()
         .as_any()
-        .downcast_ref::<arrow::array::UInt64Array>()
+        .downcast_ref::<arrow_array::UInt64Array>()
         .unwrap();
     let before_names = before
         .column_by_name("name")
@@ -953,7 +953,7 @@ query update_person($name: String, $age: I32) {
         .column_by_name("id")
         .unwrap()
         .as_any()
-        .downcast_ref::<arrow::array::UInt64Array>()
+        .downcast_ref::<arrow_array::UInt64Array>()
         .unwrap();
     let after_names = after
         .column_by_name("name")

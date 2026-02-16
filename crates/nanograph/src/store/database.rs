@@ -3,14 +3,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use arrow::record_batch::{RecordBatch, RecordBatchIterator};
-use arrow::{
-    array::{
-        Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Date64Array, Float32Array,
-        Float64Array, Int32Array, Int64Array, ListArray, StringArray, UInt32Array, UInt64Array,
-    },
-    datatypes::DataType,
+use arrow_array::{
+    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array,
+    Float64Array, Int32Array, Int64Array, ListArray, RecordBatch, RecordBatchIterator, StringArray,
+    UInt32Array, UInt64Array,
 };
+use arrow_array::builder::BooleanBuilder;
+use arrow_schema::DataType;
 use futures::StreamExt;
 use lance::Dataset;
 use lance::dataset::cleanup::CleanupPolicyBuilder;
@@ -441,7 +440,7 @@ impl Database {
             keep_builder.append_value(!delete);
         }
         let keep_mask = keep_builder.finish();
-        let filtered_target = arrow::compute::filter_record_batch(&target_batch, &keep_mask)
+        let filtered_target = arrow_select::filter::filter_record_batch(&target_batch, &keep_mask)
             .map_err(|e| NanoError::Storage(format!("node delete filter error: {}", e)))?;
 
         let old_next_node_id = self.storage.next_node_id();
@@ -517,7 +516,7 @@ impl Database {
             keep_builder.append_value(!delete);
         }
         let keep_mask = keep_builder.finish();
-        let filtered_target = arrow::compute::filter_record_batch(&target_batch, &keep_mask)
+        let filtered_target = arrow_select::filter::filter_record_batch(&target_batch, &keep_mask)
             .map_err(|e| NanoError::Storage(format!("edge delete filter error: {}", e)))?;
         let deleted_edges = target_batch
             .num_rows()
@@ -1311,7 +1310,7 @@ fn parse_predicate_array(value: &str, dt: &DataType, num_rows: usize) -> Result<
             } else {
                 Arc::new(StringArray::from(vec![trim_quotes; num_rows]))
             };
-            arrow::compute::cast(&base, &DataType::Date32).map_err(|e| {
+            arrow_cast::cast(&base, &DataType::Date32).map_err(|e| {
                 NanoError::Storage(format!(
                     "invalid Date32 literal '{}' for delete predicate (expected ISO date string or days since epoch): {}",
                     value, e
@@ -1324,7 +1323,7 @@ fn parse_predicate_array(value: &str, dt: &DataType, num_rows: usize) -> Result<
             } else {
                 Arc::new(StringArray::from(vec![trim_quotes; num_rows]))
             };
-            arrow::compute::cast(&base, &DataType::Date64).map_err(|e| {
+            arrow_cast::cast(&base, &DataType::Date64).map_err(|e| {
                 NanoError::Storage(format!(
                     "invalid Date64 literal '{}' for delete predicate (expected ISO datetime string or ms since epoch): {}",
                     value, e
@@ -1351,7 +1350,7 @@ fn trim_surrounding_quotes(s: &str) -> &str {
 }
 
 fn compare_for_delete(left: &ArrayRef, right: &ArrayRef, op: DeleteOp) -> Result<BooleanArray> {
-    use arrow::compute::kernels::cmp;
+    use arrow_ord::cmp;
 
     match op {
         DeleteOp::Eq => cmp::eq(left, right),
@@ -1435,7 +1434,7 @@ fn filter_edge_batch_by_deleted_nodes(
     }
 
     let keep_mask = keep_builder.finish();
-    arrow::compute::filter_record_batch(batch, &keep_mask)
+    arrow_select::filter::filter_record_batch(batch, &keep_mask)
         .map_err(|e| NanoError::Storage(format!("edge delete filter error: {}", e)))
 }
 
@@ -1563,7 +1562,7 @@ fn cdc_array_value_to_json(array: &ArrayRef, row: usize) -> serde_json::Value {
             .downcast_ref::<Date32Array>()
             .map(|a| {
                 let days = a.value(row);
-                arrow::temporal_conversions::date32_to_datetime(days)
+                arrow_array::temporal_conversions::date32_to_datetime(days)
                     .map(|dt| serde_json::Value::String(dt.format("%Y-%m-%d").to_string()))
                     .unwrap_or_else(|| serde_json::Value::Number((days as i64).into()))
             })
@@ -1573,7 +1572,7 @@ fn cdc_array_value_to_json(array: &ArrayRef, row: usize) -> serde_json::Value {
             .downcast_ref::<Date64Array>()
             .map(|a| {
                 let ms = a.value(row);
-                arrow::temporal_conversions::date64_to_datetime(ms)
+                arrow_array::temporal_conversions::date64_to_datetime(ms)
                     .map(|dt| serde_json::Value::String(dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()))
                     .unwrap_or_else(|| serde_json::Value::Number(ms.into()))
             })
@@ -1591,7 +1590,7 @@ fn cdc_array_value_to_json(array: &ArrayRef, row: usize) -> serde_json::Value {
             })
             .unwrap_or(serde_json::Value::Null),
         _ => serde_json::Value::String(
-            arrow::util::display::array_value_to_string(array, row).unwrap_or_default(),
+            arrow_cast::display::array_value_to_string(array, row).unwrap_or_default(),
         ),
     }
 }
@@ -1689,7 +1688,7 @@ fn dataset_entity_key(kind: &str, type_name: &str) -> String {
 }
 
 fn build_append_batch_from_cdc(
-    schema: std::sync::Arc<arrow::datatypes::Schema>,
+    schema: std::sync::Arc<arrow_schema::Schema>,
     insert_events: &[&CdcLogEntry],
 ) -> Result<Option<RecordBatch>> {
     if insert_events.is_empty() {
@@ -1735,7 +1734,7 @@ fn build_append_batch_from_cdc(
 }
 
 fn build_upsert_batch_from_cdc(
-    schema: std::sync::Arc<arrow::datatypes::Schema>,
+    schema: std::sync::Arc<arrow_schema::Schema>,
     upsert_events: &[&CdcLogEntry],
 ) -> Result<Option<RecordBatch>> {
     if upsert_events.is_empty() {
@@ -1930,7 +1929,7 @@ fn write_cdc_analytics_state(db_path: &Path, state: &CdcAnalyticsState) -> Resul
 }
 
 fn cdc_rows_to_analytics_batch(rows: &[CdcLogEntry]) -> Result<RecordBatch> {
-    use arrow::datatypes::{Field, Schema};
+    use arrow_schema::{Field, Schema};
 
     let payload_json: Vec<String> = rows
         .iter()
@@ -2183,8 +2182,8 @@ mod tests {
     use crate::store::txlog::{
         append_tx_catalog_entry, read_tx_catalog_entries, read_visible_cdc_entries,
     };
-    use arrow::array::{Array, StringArray, UInt64Array};
-    use arrow::datatypes::{Field, Schema};
+    use arrow_array::{Array, StringArray, UInt64Array};
+    use arrow_schema::{Field, Schema};
     use lance_index::DatasetIndexExt;
     use std::collections::HashSet;
     use tempfile::TempDir;
@@ -2342,12 +2341,12 @@ edge Knows: Person -> Person
         let id_col = batch
             .column(0)
             .as_any()
-            .downcast_ref::<arrow::array::UInt64Array>()
+            .downcast_ref::<arrow_array::UInt64Array>()
             .unwrap();
         let name_col = batch
             .column(1)
             .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
+            .downcast_ref::<arrow_array::StringArray>()
             .unwrap();
         (0..batch.num_rows())
             .find(|&i| name_col.value(i) == name)
@@ -2359,12 +2358,12 @@ edge Knows: Person -> Person
         let name_col = batch
             .column(1)
             .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
+            .downcast_ref::<arrow_array::StringArray>()
             .unwrap();
         let age_col = batch
             .column(2)
             .as_any()
-            .downcast_ref::<arrow::array::Int32Array>()
+            .downcast_ref::<arrow_array::Int32Array>()
             .unwrap();
         (0..batch.num_rows()).find_map(|i| {
             if name_col.value(i) == name {
@@ -2383,12 +2382,12 @@ edge Knows: Person -> Person
         let name_col = batch
             .column(1)
             .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
+            .downcast_ref::<arrow_array::StringArray>()
             .unwrap();
         let email_col = batch
             .column(2)
             .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
+            .downcast_ref::<arrow_array::StringArray>()
             .unwrap();
         (0..batch.num_rows())
             .find(|&i| name_col.value(i) == name)
@@ -2943,7 +2942,7 @@ edge Knows: Person -> Person
         let name_col = persons
             .column(1)
             .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
+            .downcast_ref::<arrow_array::StringArray>()
             .unwrap();
         let mut names: Vec<String> = (0..persons.num_rows())
             .map(|i| name_col.value(i).to_string())
@@ -3084,12 +3083,12 @@ edge Knows: Person -> Person
         let id_col = persons
             .column(0)
             .as_any()
-            .downcast_ref::<arrow::array::UInt64Array>()
+            .downcast_ref::<arrow_array::UInt64Array>()
             .unwrap();
         let name_col = persons
             .column(1)
             .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
+            .downcast_ref::<arrow_array::StringArray>()
             .unwrap();
         let alice_id = (0..persons.num_rows())
             .find(|&i| name_col.value(i) == "Alice")
@@ -3148,7 +3147,7 @@ edge Knows: Person -> Person
         let company_name_col = companies_after
             .column(1)
             .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
+            .downcast_ref::<arrow_array::StringArray>()
             .unwrap();
         assert_eq!(company_name_col.value(0), "Acme");
     }

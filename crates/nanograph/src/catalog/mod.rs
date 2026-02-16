@@ -3,7 +3,7 @@ pub mod schema_ir;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
 use crate::error::{NanoError, Result};
 use crate::schema::ast::{SchemaDecl, SchemaFile};
