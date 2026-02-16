@@ -1,5 +1,8 @@
 # nanograph
 
+[![Crates.io](https://img.shields.io/crates/v/nanograph)](https://crates.io/crates/nanograph)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 On-device property graph database. No server, no cloud, no connection strings. Think DuckDB, but for graphs.
 
 Schema-as-code, compile-time validated, Arrow-native.
@@ -23,12 +26,21 @@ Schema-as-code, compile-time validated, Arrow-native.
 - **Built-in CDC** -- every mutation is logged to a commit-gated journal. Replay decision traces, sync downstream, or audit changes from any version.
 - **Fast** -- Rust, Arrow columnar execution, Lance storage with scalar indexes. Sub-millisecond opens, vectorized scans, zero cold-start.
 
+## Install
+
+```bash
+cargo install nanograph-cli
+```
+
+Or as a library dependency:
+
+```bash
+cargo add nanograph
+```
+
 ## Quick start
 
 ```bash
-# Build
-cargo build
-
 # Initialize a database from a schema
 nanograph init my.nano --schema schema.pg
 
