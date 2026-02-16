@@ -28,15 +28,16 @@ Schema-as-code, compile-time validated, Arrow-native.
 
 ## Install
 
+Requirements:
+- [Rust](https://www.rust-lang.org/tools/install) (1.85+)
+- `protoc` (`brew install protobuf`)
+
 ```bash
 cargo install nanograph-cli
 ```
 
-Or as a library dependency:
+Built on Arrow, Lance, and DataFusion — first build may take a few minutes.
 
-```bash
-cargo add nanograph
-```
 
 ## Quick start
 
