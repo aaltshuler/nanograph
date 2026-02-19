@@ -2569,6 +2569,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -3737,7 +3738,7 @@ checksum = "2195bf6aa996a481483b29d62a7663eed3fe39600c460e323f8ff41e90bdd89b"
 
 [[package]]
 name = "nanograph"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "ahash",
  "arrow-array",
@@ -3753,8 +3754,10 @@ dependencies = [
  "futures",
  "lance",
  "lance-index",
+ "lance-linalg",
  "pest",
  "pest_derive",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
@@ -3765,7 +3768,7 @@ dependencies = [
 
 [[package]]
 name = "nanograph-cli"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "ariadne",
  "arrow-array",
@@ -4549,6 +4552,7 @@ dependencies = [
  "base64",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",
@@ -4583,6 +4587,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams",
  "web-sys",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -5929,6 +5934,15 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22cfaf3c063993ff62e73cb4311efde4db1efb31ab78a3e5c457939ad5cc0bed"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]

@@ -89,11 +89,44 @@ pub struct IRFilter {
 
 #[derive(Debug, Clone)]
 pub enum IRExpr {
-    PropAccess { variable: String, property: String },
+    PropAccess {
+        variable: String,
+        property: String,
+    },
+    Nearest {
+        variable: String,
+        property: String,
+        query: Box<IRExpr>,
+    },
+    Search {
+        field: Box<IRExpr>,
+        query: Box<IRExpr>,
+    },
+    Fuzzy {
+        field: Box<IRExpr>,
+        query: Box<IRExpr>,
+        max_edits: Option<Box<IRExpr>>,
+    },
+    MatchText {
+        field: Box<IRExpr>,
+        query: Box<IRExpr>,
+    },
+    Bm25 {
+        field: Box<IRExpr>,
+        query: Box<IRExpr>,
+    },
+    Rrf {
+        primary: Box<IRExpr>,
+        secondary: Box<IRExpr>,
+        k: Option<Box<IRExpr>>,
+    },
     Variable(String),
     Param(String),
     Literal(Literal),
-    Aggregate { func: AggFunc, arg: Box<IRExpr> },
+    Aggregate {
+        func: AggFunc,
+        arg: Box<IRExpr>,
+    },
     AliasRef(String),
 }
 

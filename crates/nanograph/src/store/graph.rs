@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow_array::{Array, RecordBatch};
 use arrow_array::builder::UInt64Builder;
 use arrow_array::cast::AsArray;
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use arrow_array::types::UInt64Type;
+use arrow_array::{Array, RecordBatch};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use tracing::{debug, info};
 
 use crate::catalog::Catalog;

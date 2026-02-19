@@ -1,6 +1,6 @@
 [package]
 name = "nanograph"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2024"
 description = "Embedded typed property graph database. Schema-as-code, compile-time validated, Arrow-native."
 repository = "https://github.com/aaltshuler/nanograph"
@@ -21,6 +21,7 @@ datafusion-execution = { workspace = true }
 datafusion-common = { workspace = true }
 lance = { workspace = true }
 lance-index = { workspace = true }
+lance-linalg = { workspace = true }
 pest = { workspace = true }
 pest_derive = { workspace = true }
 thiserror = { workspace = true }
@@ -31,6 +32,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 ahash = { workspace = true }
+reqwest = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

@@ -3,12 +3,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use arrow_array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array,
-    Float64Array, Int32Array, Int64Array, ListArray, RecordBatch, RecordBatchIterator, StringArray,
-    UInt32Array, UInt64Array,
-};
 use arrow_array::builder::BooleanBuilder;
+use arrow_array::{
+    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array,
+    Int32Array, Int64Array, ListArray, RecordBatch, RecordBatchIterator, StringArray, UInt32Array,
+    UInt64Array,
+};
 use arrow_schema::DataType;
 use futures::StreamExt;
 use lance::Dataset;
@@ -23,7 +23,7 @@ use crate::catalog::schema_ir::{SchemaIR, build_catalog_from_ir, build_schema_ir
 use crate::error::{NanoError, Result};
 use crate::schema::parser::parse_schema;
 use crate::store::graph::GraphStorage;
-use crate::store::indexing::rebuild_node_scalar_indexes;
+use crate::store::indexing::{rebuild_node_scalar_indexes, rebuild_node_vector_indexes};
 use crate::store::loader::{build_next_storage_for_load, json_values_to_array};
 use crate::store::manifest::{DatasetEntry, GraphManifest, hash_string};
 use crate::store::migration::reconcile_migration_sidecars;
@@ -1098,6 +1098,7 @@ impl Database {
                     write_lance_batch(&dataset_path, batch).await?
                 };
                 rebuild_node_scalar_indexes(&dataset_path, node_def).await?;
+                rebuild_node_vector_indexes(&dataset_path, node_def).await?;
                 self.storage
                     .set_node_dataset_path(&node_def.name, dataset_path.clone());
                 dataset_entries.push(DatasetEntry {
@@ -1573,7 +1574,9 @@ fn cdc_array_value_to_json(array: &ArrayRef, row: usize) -> serde_json::Value {
             .map(|a| {
                 let ms = a.value(row);
                 arrow_array::temporal_conversions::date64_to_datetime(ms)
-                    .map(|dt| serde_json::Value::String(dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()))
+                    .map(|dt| {
+                        serde_json::Value::String(dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+                    })
                     .unwrap_or_else(|| serde_json::Value::Number(ms.into()))
             })
             .unwrap_or(serde_json::Value::Null),
@@ -2325,6 +2328,22 @@ edge Knows: Person -> Person
 "#
     }
 
+    fn vector_indexed_schema_src() -> &'static str {
+        r#"node Doc {
+    slug: String @key
+    embedding: Vector(4) @index
+    title: String
+}
+"#
+    }
+
+    fn vector_indexed_data_src() -> &'static str {
+        r#"{"type": "Doc", "data": {"slug": "a", "embedding": [1.0, 0.0, 0.0, 0.0], "title": "A"}}
+{"type": "Doc", "data": {"slug": "b", "embedding": [0.0, 1.0, 0.0, 0.0], "title": "B"}}
+{"type": "Doc", "data": {"slug": "c", "embedding": [0.0, 0.0, 1.0, 0.0], "title": "C"}}
+"#
+    }
+
     fn nullable_unique_ok_data() -> &'static str {
         r#"{"type": "Person", "data": {"name": "Alice", "nick": null}}
 {"type": "Person", "data": {"name": "Bob", "nick": null}}
@@ -2913,6 +2932,69 @@ edge Knows: Person -> Person
                 expected
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_load_builds_vector_indexes_for_indexed_vector_properties() {
+        let dir = test_dir("vector_indexed_props");
+        let path = dir.path();
+
+        let mut db = Database::init(path, vector_indexed_schema_src())
+            .await
+            .unwrap();
+        db.load(vector_indexed_data_src()).await.unwrap();
+
+        let doc = db
+            .schema_ir
+            .node_types()
+            .find(|n| n.name == "Doc")
+            .expect("doc node type");
+        let expected_index_name =
+            crate::store::indexing::vector_index_name(doc.type_id, "embedding");
+        let dataset_path = path.join("nodes").join(SchemaIR::dir_name(doc.type_id));
+
+        let uri = dataset_path.to_string_lossy().to_string();
+        let dataset = Dataset::open(&uri).await.unwrap();
+        let index_names: HashSet<String> = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .map(|idx| idx.name.clone())
+            .collect();
+        assert!(
+            index_names.contains(&expected_index_name),
+            "expected vector index {} to exist",
+            expected_index_name
+        );
+
+        let stats: serde_json::Value = serde_json::from_str(
+            &dataset
+                .index_statistics(&expected_index_name)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            stats["index_type"].as_str(),
+            Some("IVF_PQ") | Some("IVF_FLAT")
+        ));
+
+        drop(db);
+        Database::open(path).await.unwrap();
+        let reopened = Dataset::open(&uri).await.unwrap();
+        let reopened_names: HashSet<String> = reopened
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .map(|idx| idx.name.clone())
+            .collect();
+        assert!(
+            reopened_names.contains(&expected_index_name),
+            "expected vector index {} after reopen",
+            expected_index_name
+        );
     }
 
     #[tokio::test]

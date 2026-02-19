@@ -31,12 +31,14 @@ mutation_predicate = { ident ~ comp_op ~ match_value }
 param_list = { param ~ ("," ~ param)* }
 param = { variable ~ ":" ~ type_ref }
 
-type_ref = { base_type ~ "?"? }
+type_ref = { (base_type | vector_type) ~ "?"? }
+vector_type = { "Vector" ~ "(" ~ integer ~ ")" }
 base_type = { "String" | "Bool" | "I32" | "I64" | "U32" | "U64" | "F32" | "F64" | "DateTime" | "Date" }
 
 match_clause = { "match" ~ "{" ~ clause+ ~ "}" }
 
-clause = { negation | binding | filter | traversal }
+clause = { negation | binding | filter | traversal | text_search_clause }
+text_search_clause = { search_call | fuzzy_call | match_text_call }
 
 // Binding: $p: Person { name: "Alice" }
 binding = { variable ~ ":" ~ type_name ~ ("{" ~ prop_match_list ~ "}")? }
@@ -61,14 +63,21 @@ projection = { expr ~ ("as" ~ ident)? ~ ","? }
 
 // Order clause
 order_clause = { "order" ~ "{" ~ ordering ~ ("," ~ ordering)* ~ "}" }
-ordering = { expr ~ order_dir? }
+ordering = { nearest_ordering | (expr ~ order_dir?) }
+nearest_ordering = { "nearest" ~ "(" ~ prop_access ~ "," ~ expr ~ ")" }
 order_dir = { "asc" | "desc" }
 
 // Limit clause
 limit_clause = { "limit" ~ integer }
 
 // Expressions
-expr = { agg_call | prop_access | variable | literal | ident }
+expr = { search_call | fuzzy_call | match_text_call | bm25_call | rrf_call | agg_call | prop_access | variable | literal | ident }
+search_call = { "search" ~ "(" ~ expr ~ "," ~ expr ~ ")" }
+fuzzy_call = { "fuzzy" ~ "(" ~ expr ~ "," ~ expr ~ ("," ~ expr)? ~ ")" }
+match_text_call = { "match_text" ~ "(" ~ expr ~ "," ~ expr ~ ")" }
+bm25_call = { "bm25" ~ "(" ~ expr ~ "," ~ expr ~ ")" }
+rank_expr = { nearest_ordering | bm25_call }
+rrf_call = { "rrf" ~ "(" ~ rank_expr ~ "," ~ rank_expr ~ ("," ~ expr)? ~ ")" }
 
 prop_access = { variable ~ "." ~ ident }
 

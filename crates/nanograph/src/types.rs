@@ -15,10 +15,19 @@ pub enum ScalarType {
     F64,
     Date,
     DateTime,
+    Vector(u32),
 }
 
 impl ScalarType {
     pub fn from_str_name(s: &str) -> Option<Self> {
+        if let Some(inner) = s.strip_prefix("Vector(").and_then(|t| t.strip_suffix(')')) {
+            let dim = inner.parse::<u32>().ok()?;
+            if dim == 0 {
+                return None;
+            }
+            return Some(Self::Vector(dim));
+        }
+
         match s {
             "String" => Some(Self::String),
             "Bool" => Some(Self::Bool),
@@ -46,6 +55,10 @@ impl ScalarType {
             Self::F64 => DataType::Float64,
             Self::Date => DataType::Date32,
             Self::DateTime => DataType::Date64,
+            Self::Vector(dim) => DataType::FixedSizeList(
+                std::sync::Arc::new(arrow_schema::Field::new("item", DataType::Float32, false)),
+                *dim as i32,
+            ),
         }
     }
 
@@ -70,6 +83,7 @@ impl std::fmt::Display for ScalarType {
             Self::F64 => "F64",
             Self::Date => "Date",
             Self::DateTime => "DateTime",
+            Self::Vector(dim) => return write!(f, "Vector({})", dim),
         };
         write!(f, "{}", s)
     }

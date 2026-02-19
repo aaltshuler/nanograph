@@ -945,7 +945,9 @@ fn array_value_to_json(array: &ArrayRef, row: usize) -> serde_json::Value {
             .map(|a| {
                 let ms = a.value(row);
                 arrow_array::temporal_conversions::date64_to_datetime(ms)
-                    .map(|dt| serde_json::Value::String(dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()))
+                    .map(|dt| {
+                        serde_json::Value::String(dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+                    })
                     .unwrap_or_else(|| serde_json::Value::Number(ms.into()))
             })
             .unwrap_or(serde_json::Value::Null),

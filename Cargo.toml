@@ -22,6 +22,7 @@ datafusion-common = "52"
 # Lance (local-only — no cloud backends)
 lance = { version = "2.0", default-features = false }
 lance-index = "2.0"
+lance-linalg = "2.0"
 
 futures = "0.3"
 async-trait = "0.1"
@@ -38,6 +39,7 @@ color-eyre = "0.6"
 tempfile = "3"
 ahash = "0.8"
 ariadne = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 
 [profile.dev]
 debug = 0

@@ -25,7 +25,7 @@ cargo fmt                                # format
 RUST_LOG=debug cargo run -p nanograph-cli -- run ...  # enable tracing
 ```
 
-**Requires `protoc`** (Protocol Buffers compiler) at build time for the Lance dependency. Rust edition 2024; `debug = 0` in dev profile (no debuginfo — builds are faster but backtraces are address-only). Dependencies are compiled with `opt-level = 2` even in dev profile so tests run at reasonable speed while the nanograph crate itself stays unoptimized for fast rebuilds.
+**Requires `protoc`** (Protocol Buffers compiler) at build time for the Lance dependency. MSRV 1.85, Rust edition 2024. `debug = 0` in dev profile (no debuginfo — builds are faster but backtraces are address-only). Dependencies are compiled with `opt-level = 2` even in dev profile so tests run at reasonable speed while the nanograph crate itself stays unoptimized for fast rebuilds. Release profile uses `lto = "thin"` and `codegen-units = 16`.
 
 ## Architecture
 
@@ -49,6 +49,18 @@ The system supports two execution modes that affect many code paths:
          → execute_query() → Vec<RecordBatch>
 ```
 
+### Vector Search & Embeddings
+
+Semantic search is built on `Vector(dim)` properties and Lance's exact KNN. Two workflows:
+- **Manual vectors**: Put vectors directly in JSONL data, query with `nearest(prop, $param)` ordering.
+- **Auto-embedding**: Annotate a `Vector(dim)` property with `@embed(source_prop)` — embeddings are generated from the source String property at load time via OpenAI API.
+
+Query predicates: `nearest(vector_prop, query)` orders by cosine distance, `search(string_prop, query)` for exact substring match, `fuzzy(string_prop, query[, max_edits])` for fuzzy text match. `nearest` is an ordering expression used in `order` clauses.
+
+Embedding cache: `_embedding_cache.jsonl` in the DB directory caches content-hashed embeddings to avoid re-embedding unchanged data. Large text (>1500 chars by default) is chunked with overlap and averaged.
+
+Key modules: `embedding.rs` (OpenAI client, retry, mock mode), `store/loader/embeddings.rs` (load-time materialization, caching, chunking).
+
 ### Module Map (`crates/nanograph/src/`)
 
 | Module | Role |
@@ -63,11 +75,12 @@ The system supports two execution modes that affect many code paths:
 | `store/database.rs` | Lance-backed persistence, delete API, load modes, compact/cleanup/doctor |
 | `store/graph.rs` | In-memory GraphStorage with CSR/CSC indices |
 | `store/csr.rs` | CSR/CSC adjacency structure — core graph index for traversal |
-| `store/loader/` | Load orchestration: `jsonl.rs` (parsing + Arrow builders), `constraints.rs`, `merge.rs` |
+| `store/loader/` | Load orchestration: `jsonl.rs` (parsing + Arrow builders), `constraints.rs`, `merge.rs`, `embeddings.rs` (load-time embedding materialization) |
 | `store/indexing.rs` | Lance scalar index lifecycle |
 | `store/migration.rs` | Schema evolution engine |
 | `store/manifest.rs` | Dataset inventory (`graph.manifest.json`) — tracks which node/edge types have Lance datasets |
 | `store/txlog.rs` | Transaction catalog + CDC log (`_tx_catalog.jsonl`, `_cdc_log.jsonl`) |
+| `embedding.rs` | OpenAI embedding client, retry logic, mock mode |
 | `types.rs` | Core type definitions, `PropType`, Arrow type mappings |
 | `error.rs` | `NanoError` error type |
 
@@ -105,13 +118,14 @@ All commands support `--json` global flag for structured output. Core: `init`, `
 
 ### Type System
 
-Scalar types: `String`, `I32`, `I64`, `U64`, `F32`, `F64`, `Bool`, `Date`, `DateTime`. Enum types: `enum(val1, val2, ...)`. List types: `[String]`, `[I32]`, etc. All property types are nullable by appending `?`. Query literals include `date("2026-01-15")`, `datetime("2026-01-15T10:00:00Z")`, and list literals `[1, 2, 3]`.
+Scalar types: `String`, `I32`, `I64`, `U64`, `F32`, `F64`, `Bool`, `Date`, `DateTime`. Vector type: `Vector(dim)` for fixed-size float vectors (semantic search). Enum types: `enum(val1, val2, ...)`. List types: `[String]`, `[I32]`, etc. All property types are nullable by appending `?`. Query literals include `date("2026-01-15")`, `datetime("2026-01-15T10:00:00Z")`, and list literals `[1, 2, 3]`.
 
 ### Schema Annotations
 
 - `@key` — single property per node type, used for keyed merge. Auto-indexed.
 - `@unique` — enforced on load/upsert. Nullable unique allows multiple nulls.
 - `@index` — Lance scalar (B-tree) index. Enables index-backed filtering.
+- `@embed(source_prop)` — auto-generates embeddings from a String property at load time. Target must be `Vector(dim)`.
 - `@rename_from("old")` — tracks type/property renames for migration.
 
 List properties cannot have `@key`, `@unique`, or `@index`.
@@ -130,6 +144,19 @@ delete Person where name = $name
 
 `insert` = append. `update` requires `@key`, uses merge. `delete` cascades edges. Typechecked at compile time (T10-T14).
 
+## Environment Variables
+
+The CLI loads `.env` from CWD at startup (custom parser, no external dependency). Variables are only set if not already present in the environment.
+
+- `OPENAI_API_KEY` — required only for real embedding API calls.
+- `NANOGRAPH_EMBED_MODEL` — OpenAI model name (default: `text-embedding-3-small`).
+- `NANOGRAPH_EMBED_BATCH_SIZE` — batch size for API calls (default: 64).
+- `NANOGRAPH_EMBED_CHUNK_CHARS` — chunk size for large text; 0 disables (default: 1500).
+- `NANOGRAPH_EMBED_CHUNK_OVERLAP_CHARS` — overlap between chunks (default: 200).
+- `NANOGRAPH_EMBEDDINGS_MOCK=1` — use deterministic mock embeddings (no API key needed). Used in tests/CI.
+
+See `.env.example` for reference.
+
 ## Common Change Patterns
 
 **Adding a new scalar type**: `types.rs` (PropType + Arrow mapping) → `schema.pest` + `schema/parser.rs` → `query.pest` + `query/parser.rs` (literal syntax) → `query/typecheck.rs` → `store/loader/jsonl.rs` (Arrow builder) → `store/database.rs` (predicate handling if needed).
@@ -142,7 +169,7 @@ delete Person where name = $name
 
 ## Version Constraints
 
-Arrow 57, DataFusion 52, Lance 2.0 + lance-index 2.0 — these must stay compatible with each other. Pest 2 for both grammars.
+Arrow 57, DataFusion 52, Lance 2.0 + lance-index 2.0 — these must stay compatible with each other. Pest 2 for both grammars. Dependencies use sub-crates, not monolithic packages: `arrow-array`, `arrow-schema`, `arrow-select`, `arrow-cast`, `arrow-ord` (not `arrow`); `datafusion-physical-plan`, `datafusion-physical-expr`, `datafusion-execution`, `datafusion-common` (not `datafusion`). Import accordingly. All dependency versions are centralized in the root `Cargo.toml` under `[workspace.dependencies]` — add or update versions there, then reference with `dep.workspace = true` in crate-level Cargo.toml files.
 
 ## Design Documents
 
@@ -151,6 +178,8 @@ Arrow 57, DataFusion 52, Lance 2.0 + lance-index 2.0 — these must stay compati
 - `docs/dev/db-features.md` — feature roadmap with implementation status
 - `docs/dev/test-framework.md` — test tiers, commands, fixture policy, CI guidance
 - `docs/dev/backlog.md` — current backlog and priorities
+- `docs/dev/search-plan.md` — search feature phased plan (vector, text, hybrid)
+- `docs/dev/fts-rfc.md` — Phase 4 RFC for `match_text`, `bm25`, `rrf` syntax
 
 Source of truth for behavior is code. Update docs in the same PR when behavior changes.
 
@@ -158,7 +187,9 @@ Source of truth for behavior is code. Update docs in the same PR when behavior c
 
 Test schemas, queries, and data live in `crates/nanograph/tests/fixtures/` (test.pg, test.gq, test.jsonl). Star Wars example in `examples/starwars/`. Migration tests in `crates/nanograph/tests/schema_migration.rs`. Index performance harness in `crates/nanograph/tests/index_perf.rs` (run with `--ignored`). Write amplification harness in `crates/nanograph/tests/write_amp_perf.rs` (run with `--ignored`).
 
-CLI scenario scripts live in `tests/cli/scenarios/` and use shared helpers from `tests/cli/lib/common.sh` (build helpers, assertion macros, query runners). Scenarios: `lifecycle`, `migration`, `query_mutations`, `maintenance`, `revops_typed_cdc`. Run all via `bash tests/cli/run-cli-e2e.sh` or one via `bash tests/cli/run-cli-e2e.sh <scenario>`.
+CLI scenario scripts live in `tests/cli/scenarios/` and use shared helpers from `tests/cli/lib/common.sh` (build helpers, assertion macros, query runners). Scenarios: `lifecycle`, `migration`, `query_mutations`, `maintenance`, `revops_typed_cdc`, `text_search`, `context_graph_search`. Run all via `bash tests/cli/run-cli-e2e.sh` or one via `bash tests/cli/run-cli-e2e.sh <scenario>`.
+
+CLI integration tests (Rust) in `crates/nanograph-cli/tests/` — e.g. `semantic_search.rs` validates `@embed` + `nearest()` with mock embeddings.
 
 ## Known Pitfalls
 

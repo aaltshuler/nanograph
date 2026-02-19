@@ -3,9 +3,9 @@ use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator, UInt64Array, new_null_array};
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
+use arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator, UInt64Array, new_null_array};
 use lance::Dataset;
 use lance::dataset::{WriteMode, WriteParams};
 use serde::{Deserialize, Serialize};
@@ -434,6 +434,11 @@ fn build_desired_schema_ir(
                 unique: prop.annotations.iter().any(|a| a.name == "unique"),
                 index: prop.annotations.iter().any(|a| a.name == "key")
                     || prop.annotations.iter().any(|a| a.name == "index"),
+                embed_source: prop
+                    .annotations
+                    .iter()
+                    .find(|a| a.name == "embed")
+                    .and_then(|a| a.value.clone()),
             });
         }
 
@@ -533,6 +538,7 @@ fn build_desired_schema_ir(
                 key: false,
                 unique: false,
                 index: false,
+                embed_source: None,
             });
         }
 

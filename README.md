@@ -2,6 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/nanograph)](https://crates.io/crates/nanograph)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![MSRV](https://img.shields.io/badge/MSRV-1.85-blue)](https://www.rust-lang.org)
 
 On-device property graph database. No server, no cloud, no connection strings. Think DuckDB, but for graphs.
 

@@ -158,6 +158,22 @@ fn parse_type_ref(pair: pest::iterators::Pair<Rule>) -> Result<PropType> {
                 .ok_or_else(|| NanoError::Parse(format!("unknown type: {}", inner.as_str())))?;
             Ok(PropType::scalar(scalar, nullable))
         }
+        Rule::vector_type => {
+            let dim_text = inner
+                .into_inner()
+                .next()
+                .ok_or_else(|| NanoError::Parse("Vector type missing dimension".to_string()))?
+                .as_str();
+            let dim = dim_text
+                .parse::<u32>()
+                .map_err(|e| NanoError::Parse(format!("invalid Vector dimension: {}", e)))?;
+            if dim == 0 {
+                return Err(NanoError::Parse(
+                    "Vector dimension must be greater than zero".to_string(),
+                ));
+            }
+            Ok(PropType::scalar(ScalarType::Vector(dim), nullable))
+        }
         Rule::list_type => {
             let element = inner
                 .into_inner()
@@ -217,7 +233,11 @@ fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
         match decl {
             SchemaDecl::Node(node) => {
                 for ann in &node.annotations {
-                    if ann.name == "key" || ann.name == "unique" || ann.name == "index" {
+                    if ann.name == "key"
+                        || ann.name == "unique"
+                        || ann.name == "index"
+                        || ann.name == "embed"
+                    {
                         return Err(NanoError::Parse(format!(
                             "@{} is only supported on node properties (node {})",
                             ann.name, node.name
@@ -230,12 +250,23 @@ fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
                     let mut key_seen = false;
                     let mut unique_seen = false;
                     let mut index_seen = false;
+                    let mut embed_seen = false;
+                    let is_vector = matches!(prop.prop_type.scalar, ScalarType::Vector(_));
                     for ann in &prop.annotations {
                         if prop.prop_type.list
-                            && (ann.name == "key" || ann.name == "unique" || ann.name == "index")
+                            && (ann.name == "key"
+                                || ann.name == "unique"
+                                || ann.name == "index"
+                                || ann.name == "embed")
                         {
                             return Err(NanoError::Parse(format!(
                                 "@{} is not supported on list property {}.{}",
+                                ann.name, node.name, prop.name
+                            )));
+                        }
+                        if is_vector && (ann.name == "key" || ann.name == "unique") {
+                            return Err(NanoError::Parse(format!(
+                                "@{} is not supported on vector property {}.{}",
                                 ann.name, node.name, prop.name
                             )));
                         }
@@ -282,6 +313,59 @@ fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
                                 )));
                             }
                             index_seen = true;
+                        } else if ann.name == "embed" {
+                            if embed_seen {
+                                return Err(NanoError::Parse(format!(
+                                    "property {}.{} declares @embed multiple times",
+                                    node.name, prop.name
+                                )));
+                            }
+                            embed_seen = true;
+
+                            if !is_vector {
+                                return Err(NanoError::Parse(format!(
+                                    "@embed is only supported on vector properties ({}.{})",
+                                    node.name, prop.name
+                                )));
+                            }
+                            if prop.prop_type.list {
+                                return Err(NanoError::Parse(format!(
+                                    "@embed is not supported on list-wrapped vectors ({}.{})",
+                                    node.name, prop.name
+                                )));
+                            }
+
+                            let source_prop = ann.value.as_deref().ok_or_else(|| {
+                                NanoError::Parse(format!(
+                                    "@embed on {}.{} requires a source property name",
+                                    node.name, prop.name
+                                ))
+                            })?;
+                            if source_prop.trim().is_empty() {
+                                return Err(NanoError::Parse(format!(
+                                    "@embed on {}.{} requires a non-empty source property name",
+                                    node.name, prop.name
+                                )));
+                            }
+
+                            let source_decl = node
+                                .properties
+                                .iter()
+                                .find(|p| p.name == source_prop)
+                                .ok_or_else(|| {
+                                    NanoError::Parse(format!(
+                                        "@embed on {}.{} references unknown source property {}",
+                                        node.name, prop.name, source_prop
+                                    ))
+                                })?;
+                            if source_decl.prop_type.list
+                                || source_decl.prop_type.scalar != ScalarType::String
+                            {
+                                return Err(NanoError::Parse(format!(
+                                    "@embed source property {}.{} must be String",
+                                    node.name, source_prop
+                                )));
+                            }
                         }
                     }
                 }
@@ -295,7 +379,11 @@ fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
             }
             SchemaDecl::Edge(edge) => {
                 for ann in &edge.annotations {
-                    if ann.name == "key" || ann.name == "unique" || ann.name == "index" {
+                    if ann.name == "key"
+                        || ann.name == "unique"
+                        || ann.name == "index"
+                        || ann.name == "embed"
+                    {
                         return Err(NanoError::Parse(format!(
                             "@{} is not supported on edges (edge {})",
                             ann.name, edge.name
@@ -305,7 +393,11 @@ fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
 
                 for prop in &edge.properties {
                     for ann in &prop.annotations {
-                        if ann.name == "key" || ann.name == "unique" || ann.name == "index" {
+                        if ann.name == "key"
+                            || ann.name == "unique"
+                            || ann.name == "index"
+                            || ann.name == "embed"
+                        {
                             return Err(NanoError::Parse(format!(
                                 "@{} is not supported on edge properties (edge {}.{})",
                                 ann.name, edge.name, prop.name
@@ -411,6 +503,28 @@ node Person {
                 assert_eq!(n.properties[0].annotations[0].name, "unique");
                 assert_eq!(n.properties[1].annotations[0].name, "key");
                 assert_eq!(n.properties[2].annotations[0].name, "index");
+            }
+            _ => panic!("expected Node"),
+        }
+    }
+
+    #[test]
+    fn test_parse_embed_annotation_identifier_arg() {
+        let input = r#"
+node Doc {
+    title: String
+    embedding: Vector(3) @embed(title)
+}
+"#;
+        let schema = parse_schema(input).unwrap();
+        match &schema.declarations[0] {
+            SchemaDecl::Node(n) => {
+                assert_eq!(n.properties[1].annotations.len(), 1);
+                assert_eq!(n.properties[1].annotations[0].name, "embed");
+                assert_eq!(
+                    n.properties[1].annotations[0].value.as_deref(),
+                    Some("title")
+                );
             }
             _ => panic!("expected Node"),
         }
@@ -554,6 +668,71 @@ edge Knows: Person -> Person {
     }
 
     #[test]
+    fn test_reject_embed_without_source_property() {
+        let input = r#"
+node Doc {
+    title: String
+    embedding: Vector(3) @embed
+}
+"#;
+        let err = parse_schema(input).unwrap_err();
+        assert!(err.to_string().contains("requires a source property name"));
+    }
+
+    #[test]
+    fn test_reject_embed_on_non_vector_property() {
+        let input = r#"
+node Doc {
+    title: String @embed(title)
+}
+"#;
+        let err = parse_schema(input).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("only supported on vector properties")
+        );
+    }
+
+    #[test]
+    fn test_reject_embed_unknown_source_property() {
+        let input = r#"
+node Doc {
+    title: String
+    embedding: Vector(3) @embed(body)
+}
+"#;
+        let err = parse_schema(input).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("references unknown source property")
+        );
+    }
+
+    #[test]
+    fn test_reject_embed_source_not_string() {
+        let input = r#"
+node Doc {
+    body: I32
+    embedding: Vector(3) @embed(body)
+}
+"#;
+        let err = parse_schema(input).unwrap_err();
+        assert!(err.to_string().contains("must be String"));
+    }
+
+    #[test]
+    fn test_reject_embed_on_edge_property() {
+        let input = r#"
+node Doc { title: String }
+edge Linked: Doc -> Doc {
+    embedding: Vector(3) @embed(title)
+}
+"#;
+        let err = parse_schema(input).unwrap_err();
+        assert!(err.to_string().contains("edge properties"));
+    }
+
+    #[test]
     fn test_parse_enum_and_list_types() {
         let input = r#"
 node Ticket {
@@ -605,6 +784,34 @@ node Ticket {
 "#;
         let err = parse_schema(input).unwrap_err();
         assert!(err.to_string().contains("list property"));
+    }
+
+    #[test]
+    fn test_parse_vector_type() {
+        let input = r#"
+node Doc {
+    embedding: Vector(3)
+}
+"#;
+        let schema = parse_schema(input).unwrap();
+        match &schema.declarations[0] {
+            SchemaDecl::Node(n) => match n.properties[0].prop_type.scalar {
+                ScalarType::Vector(dim) => assert_eq!(dim, 3),
+                other => panic!("expected vector type, got {:?}", other),
+            },
+            _ => panic!("expected node"),
+        }
+    }
+
+    #[test]
+    fn test_reject_zero_vector_dimension() {
+        let input = r#"
+node Doc {
+    embedding: Vector(0)
+}
+"#;
+        let err = parse_schema(input).unwrap_err();
+        assert!(err.to_string().contains("Vector dimension"));
     }
 
     #[test]

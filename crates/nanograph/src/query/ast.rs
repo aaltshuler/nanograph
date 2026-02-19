@@ -89,10 +89,43 @@ impl std::fmt::Display for CompOp {
 
 #[derive(Debug, Clone)]
 pub enum Expr {
-    PropAccess { variable: String, property: String },
+    PropAccess {
+        variable: String,
+        property: String,
+    },
+    Nearest {
+        variable: String,
+        property: String,
+        query: Box<Expr>,
+    },
+    Search {
+        field: Box<Expr>,
+        query: Box<Expr>,
+    },
+    Fuzzy {
+        field: Box<Expr>,
+        query: Box<Expr>,
+        max_edits: Option<Box<Expr>>,
+    },
+    MatchText {
+        field: Box<Expr>,
+        query: Box<Expr>,
+    },
+    Bm25 {
+        field: Box<Expr>,
+        query: Box<Expr>,
+    },
+    Rrf {
+        primary: Box<Expr>,
+        secondary: Box<Expr>,
+        k: Option<Box<Expr>>,
+    },
     Variable(String),
     Literal(Literal),
-    Aggregate { func: AggFunc, arg: Box<Expr> },
+    Aggregate {
+        func: AggFunc,
+        arg: Box<Expr>,
+    },
     AliasRef(String),
 }
 

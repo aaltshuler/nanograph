@@ -8,7 +8,7 @@ use ariadne::{Color, Label, Report, ReportKind, Source};
 use arrow_array::RecordBatch;
 use clap::{Parser, Subcommand};
 use color_eyre::eyre::{Result, WrapErr, eyre};
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 use tracing_subscriber::EnvFilter;
 
 use nanograph::error::{NanoError, ParseDiagnostic};
@@ -216,6 +216,7 @@ impl From<LoadModeArg> for LoadMode {
 async fn main() -> Result<()> {
     color_eyre::install()?;
     init_tracing();
+    load_dotenv_for_process();
 
     let cli = Cli::parse();
 
@@ -868,12 +869,200 @@ fn prop_type_string(prop: &nanograph::schema_ir::PropDef) -> String {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DotenvLoadStats {
+    loaded: usize,
+    skipped_existing: usize,
+}
+
+fn load_dotenv_for_process() {
+    let cwd = match std::env::current_dir() {
+        Ok(path) => path,
+        Err(err) => {
+            warn!(
+                "failed to resolve current directory for .env loading: {}",
+                err
+            );
+            return;
+        }
+    };
+
+    match load_dotenv_from_dir_with(
+        &cwd,
+        |key| std::env::var_os(key).is_some(),
+        |key, value| {
+            // SAFETY: this runs once during CLI process bootstrap before command execution.
+            unsafe { std::env::set_var(key, value) };
+        },
+    ) {
+        Ok(Some(stats)) => {
+            debug!(
+                loaded = stats.loaded,
+                skipped_existing = stats.skipped_existing,
+                dotenv_path = %cwd.join(".env").display(),
+                "loaded .env entries"
+            );
+        }
+        Ok(None) => {
+            debug!(cwd = %cwd.display(), "no .env file found");
+        }
+        Err(err) => {
+            warn!(
+                dotenv_path = %cwd.join(".env").display(),
+                "failed to load .env: {}",
+                err
+            );
+        }
+    }
+}
+
+fn load_dotenv_from_dir_with<FExists, FSet>(
+    dir: &Path,
+    exists: FExists,
+    set: FSet,
+) -> std::result::Result<Option<DotenvLoadStats>, String>
+where
+    FExists: FnMut(&str) -> bool,
+    FSet: FnMut(&str, &str),
+{
+    let path = dir.join(".env");
+    if !path.exists() {
+        return Ok(None);
+    }
+    load_dotenv_from_path_with(&path, exists, set).map(Some)
+}
+
+fn load_dotenv_from_path_with<FExists, FSet>(
+    path: &Path,
+    mut exists: FExists,
+    mut set: FSet,
+) -> std::result::Result<DotenvLoadStats, String>
+where
+    FExists: FnMut(&str) -> bool,
+    FSet: FnMut(&str, &str),
+{
+    let mut stats = DotenvLoadStats::default();
+    for (key, value) in parse_dotenv_entries(path)? {
+        if exists(&key) {
+            stats.skipped_existing += 1;
+            continue;
+        }
+        set(&key, &value);
+        stats.loaded += 1;
+    }
+    Ok(stats)
+}
+
+fn parse_dotenv_entries(path: &Path) -> std::result::Result<Vec<(String, String)>, String> {
+    let source = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read {}: {}", path.display(), e))?;
+    let mut out = Vec::new();
+
+    for (line_no, raw_line) in source.lines().enumerate() {
+        let mut line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("export ") {
+            line = rest.trim_start();
+        }
+
+        let Some(eq_pos) = line.find('=') else {
+            return Err(format!(
+                "invalid .env line {} in {}: expected KEY=VALUE",
+                line_no + 1,
+                path.display()
+            ));
+        };
+        let key = line[..eq_pos].trim();
+        if !is_valid_env_key(key) {
+            return Err(format!(
+                "invalid .env key '{}' on line {} in {}",
+                key,
+                line_no + 1,
+                path.display()
+            ));
+        }
+
+        let value_part = line[eq_pos + 1..].trim();
+        let value = parse_dotenv_value(value_part).map_err(|msg| {
+            format!(
+                "invalid .env value for '{}' on line {} in {}: {}",
+                key,
+                line_no + 1,
+                path.display(),
+                msg
+            )
+        })?;
+        out.push((key.to_string(), value));
+    }
+
+    Ok(out)
+}
+
+fn parse_dotenv_value(value: &str) -> std::result::Result<String, &'static str> {
+    if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+        let inner = &value[1..value.len() - 1];
+        let mut out = String::with_capacity(inner.len());
+        let mut chars = inner.chars();
+        while let Some(ch) = chars.next() {
+            if ch != '\\' {
+                out.push(ch);
+                continue;
+            }
+            let Some(next) = chars.next() else {
+                return Err("unterminated escape sequence");
+            };
+            match next {
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                '\\' => out.push('\\'),
+                '"' => out.push('"'),
+                other => out.push(other),
+            }
+        }
+        return Ok(out);
+    }
+
+    if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
+        return Ok(value[1..value.len() - 1].to_string());
+    }
+
+    let unquoted = value
+        .split_once(" #")
+        .map(|(left, _)| left)
+        .unwrap_or(value)
+        .trim_end();
+    Ok(unquoted.to_string())
+}
+
+fn is_valid_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
 fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_log_filter()));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
         .try_init();
+}
+
+fn default_log_filter() -> &'static str {
+    if cfg!(debug_assertions) {
+        "info"
+    } else {
+        "error"
+    }
 }
 
 fn normalize_span(span: Option<nanograph::error::SourceSpan>, source: &str) -> Range<usize> {
@@ -1534,9 +1723,8 @@ fn print_csv(batch: &RecordBatch) {
         let mut values = Vec::new();
         for col in 0..batch.num_columns() {
             let col_arr = batch.column(col);
-            values.push(
-                arrow_cast::display::array_value_to_string(col_arr, row).unwrap_or_default(),
-            );
+            values
+                .push(arrow_cast::display::array_value_to_string(col_arr, row).unwrap_or_default());
         }
         println!("{}", values.join(","));
     }
@@ -1580,8 +1768,8 @@ fn record_batches_to_json_rows(results: &[RecordBatch]) -> Vec<serde_json::Value
 
 fn cli_array_value_to_json(array: &arrow_array::ArrayRef, row: usize) -> serde_json::Value {
     use arrow_array::{
-        Array, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int32Array,
-        Int64Array, ListArray, StringArray, UInt32Array, UInt64Array,
+        Array, BooleanArray, Date32Array, Date64Array, FixedSizeListArray, Float32Array,
+        Float64Array, Int32Array, Int64Array, ListArray, StringArray, UInt32Array, UInt64Array,
     };
     use arrow_schema::DataType;
 
@@ -1648,13 +1836,27 @@ fn cli_array_value_to_json(array: &arrow_array::ArrayRef, row: usize) -> serde_j
             .map(|a| {
                 let ms = a.value(row);
                 arrow_array::temporal_conversions::date64_to_datetime(ms)
-                    .map(|dt| serde_json::Value::String(dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()))
+                    .map(|dt| {
+                        serde_json::Value::String(dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+                    })
                     .unwrap_or_else(|| serde_json::Value::Number(ms.into()))
             })
             .unwrap_or(serde_json::Value::Null),
         DataType::List(_) => array
             .as_any()
             .downcast_ref::<ListArray>()
+            .map(|a| {
+                let values = a.value(row);
+                serde_json::Value::Array(
+                    (0..values.len())
+                        .map(|idx| cli_array_value_to_json(&values, idx))
+                        .collect(),
+                )
+            })
+            .unwrap_or(serde_json::Value::Null),
+        DataType::FixedSizeList(_, _) => array
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
             .map(|a| {
                 let values = a.value(row);
                 serde_json::Value::Array(
@@ -1765,6 +1967,49 @@ fn build_param_map(
                 }
                 "Date" => Literal::Date(value.clone()),
                 "DateTime" => Literal::DateTime(value.clone()),
+                other if other.starts_with("Vector(") => {
+                    let expected_dim = parse_vector_dim_type(other).ok_or_else(|| {
+                        eyre!(
+                            "param '{}': invalid vector type '{}' (expected Vector(N))",
+                            key,
+                            other
+                        )
+                    })?;
+                    let parsed: serde_json::Value = serde_json::from_str(value).map_err(|e| {
+                        eyre!(
+                            "param '{}': expected JSON array for {}, got '{}': {}",
+                            key,
+                            other,
+                            value,
+                            e
+                        )
+                    })?;
+                    let items = parsed.as_array().ok_or_else(|| {
+                        eyre!(
+                            "param '{}': expected JSON array for {}, got '{}'",
+                            key,
+                            other,
+                            value
+                        )
+                    })?;
+                    if items.len() != expected_dim {
+                        return Err(eyre!(
+                            "param '{}': expected {} values for {}, got {}",
+                            key,
+                            expected_dim,
+                            other,
+                            items.len()
+                        ));
+                    }
+                    let mut out = Vec::with_capacity(items.len());
+                    for item in items {
+                        let num = item.as_f64().ok_or_else(|| {
+                            eyre!("param '{}': vector element '{}' is not numeric", key, item)
+                        })?;
+                        out.push(Literal::Float(num));
+                    }
+                    Literal::List(out)
+                }
                 _ => Literal::String(value.clone()),
             }
         } else {
@@ -1776,16 +2021,88 @@ fn build_param_map(
     Ok(map)
 }
 
+fn parse_vector_dim_type(type_name: &str) -> Option<usize> {
+    let dim = type_name
+        .strip_prefix("Vector(")?
+        .strip_suffix(')')?
+        .parse::<usize>()
+        .ok()?;
+    if dim == 0 { None } else { Some(dim) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow_array::{ArrayRef, Date32Array, Date64Array, Int32Array, StringArray};
     use nanograph::store::txlog::read_visible_cdc_entries;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use tempfile::TempDir;
 
     fn write_file(path: &Path, content: &str) {
         std::fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn dotenv_loader_sets_missing_and_skips_existing_keys() {
+        let dir = TempDir::new().unwrap();
+        let dotenv_path = dir.path().join(".env");
+        write_file(
+            &dotenv_path,
+            "OPENAI_API_KEY=from_file\nNANOGRAPH_EMBEDDINGS_MOCK=1\n",
+        );
+
+        let env = RefCell::new(HashMap::from([(
+            "OPENAI_API_KEY".to_string(),
+            "preset".to_string(),
+        )]));
+        let stats = load_dotenv_from_path_with(
+            &dotenv_path,
+            |key| env.borrow().contains_key(key),
+            |key, value| {
+                env.borrow_mut().insert(key.to_string(), value.to_string());
+            },
+        )
+        .unwrap();
+
+        assert_eq!(stats.loaded, 1);
+        assert_eq!(stats.skipped_existing, 1);
+        assert_eq!(
+            env.borrow().get("OPENAI_API_KEY").map(String::as_str),
+            Some("preset")
+        );
+        assert_eq!(
+            env.borrow()
+                .get("NANOGRAPH_EMBEDDINGS_MOCK")
+                .map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn dotenv_loader_is_noop_when_file_missing() {
+        let dir = TempDir::new().unwrap();
+        let env = RefCell::new(HashMap::<String, String>::new());
+        let stats = load_dotenv_from_dir_with(
+            dir.path(),
+            |key| env.borrow().contains_key(key),
+            |key, value| {
+                env.borrow_mut().insert(key.to_string(), value.to_string());
+            },
+        )
+        .unwrap();
+        assert!(stats.is_none());
+        assert!(env.borrow().is_empty());
+    }
+
+    #[test]
+    fn default_log_filter_matches_build_mode() {
+        if cfg!(debug_assertions) {
+            assert_eq!(default_log_filter(), "info");
+        } else {
+            assert_eq!(default_log_filter(), "error");
+        }
     }
 
     #[test]
@@ -2101,6 +2418,27 @@ mod tests {
             params.get("dt"),
             Some(Literal::DateTime(v)) if v == "2026-02-14T10:00:00Z"
         ));
+    }
+
+    #[test]
+    fn build_param_map_parses_vector_type() {
+        let query_params = vec![nanograph::query::ast::Param {
+            name: "q".to_string(),
+            type_name: "Vector(3)".to_string(),
+            nullable: false,
+        }];
+        let raw = vec![("q".to_string(), "[0.1, 0.2, 0.3]".to_string())];
+
+        let params = build_param_map(&query_params, &raw).unwrap();
+        match params.get("q") {
+            Some(Literal::List(items)) => {
+                assert_eq!(items.len(), 3);
+                assert!(matches!(items[0], Literal::Float(_)));
+                assert!(matches!(items[1], Literal::Float(_)));
+                assert!(matches!(items[2], Literal::Float(_)));
+            }
+            other => panic!("expected vector list literal, got {:?}", other),
+        }
     }
 
     #[test]

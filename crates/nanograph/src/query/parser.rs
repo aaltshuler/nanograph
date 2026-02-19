@@ -149,6 +149,7 @@ fn parse_clause(pair: pest::iterators::Pair<Rule>) -> Result<Clause> {
         Rule::binding => Ok(Clause::Binding(parse_binding(inner)?)),
         Rule::traversal => Ok(Clause::Traversal(parse_traversal(inner)?)),
         Rule::filter => Ok(Clause::Filter(parse_filter(inner)?)),
+        Rule::text_search_clause => Ok(parse_text_search_clause(inner)?),
         Rule::negation => {
             let mut clauses = Vec::new();
             for c in inner.into_inner() {
@@ -163,6 +164,30 @@ fn parse_clause(pair: pest::iterators::Pair<Rule>) -> Result<Clause> {
             inner.as_rule()
         ))),
     }
+}
+
+fn parse_text_search_clause(pair: pest::iterators::Pair<Rule>) -> Result<Clause> {
+    let inner = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| NanoError::Parse("text search clause cannot be empty".to_string()))?;
+    let expr = match inner.as_rule() {
+        Rule::search_call => parse_search_call(inner)?,
+        Rule::fuzzy_call => parse_fuzzy_call(inner)?,
+        Rule::match_text_call => parse_match_text_call(inner)?,
+        other => {
+            return Err(NanoError::Parse(format!(
+                "unexpected text search clause rule: {:?}",
+                other
+            )));
+        }
+    };
+
+    Ok(Clause::Filter(Filter {
+        left: expr,
+        op: CompOp::Eq,
+        right: Expr::Literal(Literal::Bool(true)),
+    }))
 }
 
 fn parse_binding(pair: pest::iterators::Pair<Rule>) -> Result<Binding> {
@@ -391,12 +416,134 @@ fn parse_expr(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
                 arg: Box::new(arg),
             })
         }
+        Rule::search_call => parse_search_call(inner),
+        Rule::fuzzy_call => parse_fuzzy_call(inner),
+        Rule::match_text_call => parse_match_text_call(inner),
+        Rule::bm25_call => parse_bm25_call(inner),
+        Rule::rrf_call => parse_rrf_call(inner),
         Rule::ident => Ok(Expr::AliasRef(inner.as_str().to_string())),
         _ => Err(NanoError::Parse(format!(
             "unexpected expr rule: {:?}",
             inner.as_rule()
         ))),
     }
+}
+
+fn parse_search_call(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
+    let mut args = pair.into_inner();
+    let field = args
+        .next()
+        .ok_or_else(|| NanoError::Parse("search() missing field argument".to_string()))?;
+    let query = args
+        .next()
+        .ok_or_else(|| NanoError::Parse("search() missing query argument".to_string()))?;
+    if args.next().is_some() {
+        return Err(NanoError::Parse(
+            "search() accepts exactly 2 arguments".to_string(),
+        ));
+    }
+    Ok(Expr::Search {
+        field: Box::new(parse_expr(field)?),
+        query: Box::new(parse_expr(query)?),
+    })
+}
+
+fn parse_fuzzy_call(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
+    let mut args = pair.into_inner();
+    let field = args
+        .next()
+        .ok_or_else(|| NanoError::Parse("fuzzy() missing field argument".to_string()))?;
+    let query = args
+        .next()
+        .ok_or_else(|| NanoError::Parse("fuzzy() missing query argument".to_string()))?;
+    let max_edits = args.next().map(parse_expr).transpose()?.map(Box::new);
+    if args.next().is_some() {
+        return Err(NanoError::Parse(
+            "fuzzy() accepts at most 3 arguments".to_string(),
+        ));
+    }
+    Ok(Expr::Fuzzy {
+        field: Box::new(parse_expr(field)?),
+        query: Box::new(parse_expr(query)?),
+        max_edits,
+    })
+}
+
+fn parse_match_text_call(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
+    let mut args = pair.into_inner();
+    let field = args
+        .next()
+        .ok_or_else(|| NanoError::Parse("match_text() missing field argument".to_string()))?;
+    let query = args
+        .next()
+        .ok_or_else(|| NanoError::Parse("match_text() missing query argument".to_string()))?;
+    if args.next().is_some() {
+        return Err(NanoError::Parse(
+            "match_text() accepts exactly 2 arguments".to_string(),
+        ));
+    }
+    Ok(Expr::MatchText {
+        field: Box::new(parse_expr(field)?),
+        query: Box::new(parse_expr(query)?),
+    })
+}
+
+fn parse_bm25_call(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
+    let mut args = pair.into_inner();
+    let field = args
+        .next()
+        .ok_or_else(|| NanoError::Parse("bm25() missing field argument".to_string()))?;
+    let query = args
+        .next()
+        .ok_or_else(|| NanoError::Parse("bm25() missing query argument".to_string()))?;
+    if args.next().is_some() {
+        return Err(NanoError::Parse(
+            "bm25() accepts exactly 2 arguments".to_string(),
+        ));
+    }
+    Ok(Expr::Bm25 {
+        field: Box::new(parse_expr(field)?),
+        query: Box::new(parse_expr(query)?),
+    })
+}
+
+fn parse_rank_expr(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
+    let inner = if pair.as_rule() == Rule::rank_expr {
+        pair.into_inner()
+            .next()
+            .ok_or_else(|| NanoError::Parse("rank expression cannot be empty".to_string()))?
+    } else {
+        pair
+    };
+    match inner.as_rule() {
+        Rule::nearest_ordering => parse_nearest_ordering(inner),
+        Rule::bm25_call => parse_bm25_call(inner),
+        other => Err(NanoError::Parse(format!(
+            "rrf() rank expression must be nearest(...) or bm25(...), got {:?}",
+            other
+        ))),
+    }
+}
+
+fn parse_rrf_call(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
+    let mut args = pair.into_inner();
+    let primary = args
+        .next()
+        .ok_or_else(|| NanoError::Parse("rrf() missing primary rank expression".to_string()))?;
+    let secondary = args
+        .next()
+        .ok_or_else(|| NanoError::Parse("rrf() missing secondary rank expression".to_string()))?;
+    let k = args.next().map(parse_expr).transpose()?.map(Box::new);
+    if args.next().is_some() {
+        return Err(NanoError::Parse(
+            "rrf() accepts at most 3 arguments".to_string(),
+        ));
+    }
+    Ok(Expr::Rrf {
+        primary: Box::new(parse_rank_expr(primary)?),
+        secondary: Box::new(parse_rank_expr(secondary)?),
+        k,
+    })
 }
 
 fn parse_comp_op(pair: pest::iterators::Pair<Rule>) -> Result<CompOp> {
@@ -485,10 +632,52 @@ fn parse_projection(pair: pest::iterators::Pair<Rule>) -> Result<Projection> {
 
 fn parse_ordering(pair: pest::iterators::Pair<Rule>) -> Result<Ordering> {
     let mut inner = pair.into_inner();
-    let expr = parse_expr(inner.next().unwrap())?;
-    let descending = inner.next().map_or(false, |p| p.as_str() == "desc");
+    let first = inner
+        .next()
+        .ok_or_else(|| NanoError::Parse("ordering cannot be empty".to_string()))?;
+    let (expr, descending) = match first.as_rule() {
+        Rule::nearest_ordering => (parse_nearest_ordering(first)?, false),
+        Rule::expr => {
+            let expr = parse_expr(first)?;
+            let descending = inner.next().map_or(false, |p| p.as_str() == "desc");
+            (expr, descending)
+        }
+        other => {
+            return Err(NanoError::Parse(format!(
+                "unexpected ordering rule: {:?}",
+                other
+            )));
+        }
+    };
 
     Ok(Ordering { expr, descending })
+}
+
+fn parse_nearest_ordering(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
+    let mut inner = pair.into_inner();
+    let prop = inner
+        .next()
+        .ok_or_else(|| NanoError::Parse("nearest() missing property".to_string()))?;
+    let mut prop_parts = prop.into_inner();
+    let var = prop_parts
+        .next()
+        .ok_or_else(|| NanoError::Parse("nearest() missing variable".to_string()))?
+        .as_str();
+    let variable = var.strip_prefix('$').unwrap_or(var).to_string();
+    let property = prop_parts
+        .next()
+        .ok_or_else(|| NanoError::Parse("nearest() missing property name".to_string()))?
+        .as_str()
+        .to_string();
+
+    let query = inner
+        .next()
+        .ok_or_else(|| NanoError::Parse("nearest() missing query expression".to_string()))?;
+    Ok(Expr::Nearest {
+        variable,
+        property,
+        query: Box::new(parse_expr(query)?),
+    })
 }
 
 #[cfg(test)]
@@ -915,6 +1104,210 @@ query listy() {
                 other => panic!("expected list literal, got {:?}", other),
             },
             _ => panic!("expected Binding"),
+        }
+    }
+
+    #[test]
+    fn test_parse_nearest_ordering_and_vector_param_type() {
+        let input = r#"
+query similar($q: Vector(3)) {
+    match { $d: Doc }
+    return { $d.id }
+    order { nearest($d.embedding, $q) }
+    limit 5
+}
+"#;
+        let qf = parse_query(input).unwrap();
+        let q = &qf.queries[0];
+        assert_eq!(q.params[0].type_name, "Vector(3)");
+        assert_eq!(q.order_clause.len(), 1);
+        assert!(!q.order_clause[0].descending);
+        match &q.order_clause[0].expr {
+            Expr::Nearest {
+                variable,
+                property,
+                query,
+            } => {
+                assert_eq!(variable, "d");
+                assert_eq!(property, "embedding");
+                assert!(matches!(query.as_ref(), Expr::Variable(v) if v == "q"));
+            }
+            other => panic!("expected nearest ordering, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_nearest_rejects_direction_modifier() {
+        let input = r#"
+query similar($q: Vector(3)) {
+    match { $d: Doc }
+    return { $d.id }
+    order { nearest($d.embedding, $q) desc }
+    limit 5
+}
+"#;
+        assert!(parse_query(input).is_err());
+    }
+
+    #[test]
+    fn test_parse_search_clause_sugar() {
+        let input = r#"
+query q($q: String) {
+    match {
+        $s: Signal
+        search($s.summary, $q)
+    }
+    return { $s.slug }
+}
+"#;
+        let qf = parse_query(input).unwrap();
+        let q = &qf.queries[0];
+        assert_eq!(q.match_clause.len(), 2);
+        match &q.match_clause[1] {
+            Clause::Filter(Filter { left, op, right }) => {
+                assert_eq!(*op, CompOp::Eq);
+                assert!(matches!(right, Expr::Literal(Literal::Bool(true))));
+                match left {
+                    Expr::Search { field, query } => {
+                        assert!(matches!(
+                            field.as_ref(),
+                            Expr::PropAccess { variable, property } if variable == "s" && property == "summary"
+                        ));
+                        assert!(matches!(query.as_ref(), Expr::Variable(v) if v == "q"));
+                    }
+                    other => panic!("expected search expression, got {:?}", other),
+                }
+            }
+            other => panic!("expected filter clause, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_fuzzy_clause_with_max_edits() {
+        let input = r#"
+query q($q: String) {
+    match {
+        $s: Signal
+        fuzzy($s.summary, $q, 2)
+    }
+    return { $s.slug }
+}
+"#;
+        let qf = parse_query(input).unwrap();
+        let q = &qf.queries[0];
+        assert_eq!(q.match_clause.len(), 2);
+        match &q.match_clause[1] {
+            Clause::Filter(Filter { left, op, right }) => {
+                assert_eq!(*op, CompOp::Eq);
+                assert!(matches!(right, Expr::Literal(Literal::Bool(true))));
+                match left {
+                    Expr::Fuzzy {
+                        field,
+                        query,
+                        max_edits,
+                    } => {
+                        assert!(matches!(
+                            field.as_ref(),
+                            Expr::PropAccess { variable, property } if variable == "s" && property == "summary"
+                        ));
+                        assert!(matches!(query.as_ref(), Expr::Variable(v) if v == "q"));
+                        assert!(matches!(
+                            max_edits.as_deref(),
+                            Some(Expr::Literal(Literal::Integer(2)))
+                        ));
+                    }
+                    other => panic!("expected fuzzy expression, got {:?}", other),
+                }
+            }
+            other => panic!("expected filter clause, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_match_text_clause_sugar() {
+        let input = r#"
+query q($q: String) {
+    match {
+        $s: Signal
+        match_text($s.summary, $q)
+    }
+    return { $s.slug }
+}
+"#;
+        let qf = parse_query(input).unwrap();
+        let q = &qf.queries[0];
+        assert_eq!(q.match_clause.len(), 2);
+        match &q.match_clause[1] {
+            Clause::Filter(Filter { left, op, right }) => {
+                assert_eq!(*op, CompOp::Eq);
+                assert!(matches!(right, Expr::Literal(Literal::Bool(true))));
+                match left {
+                    Expr::MatchText { field, query } => {
+                        assert!(matches!(
+                            field.as_ref(),
+                            Expr::PropAccess { variable, property } if variable == "s" && property == "summary"
+                        ));
+                        assert!(matches!(query.as_ref(), Expr::Variable(v) if v == "q"));
+                    }
+                    other => panic!("expected match_text expression, got {:?}", other),
+                }
+            }
+            other => panic!("expected filter clause, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_bm25_expression_in_order() {
+        let input = r#"
+query q($q: String) {
+    match { $s: Signal }
+    return { $s.slug, bm25($s.summary, $q) as score }
+    order { bm25($s.summary, $q) desc }
+    limit 5
+}
+"#;
+        let qf = parse_query(input).unwrap();
+        let q = &qf.queries[0];
+        assert_eq!(q.return_clause.len(), 2);
+        match &q.return_clause[1].expr {
+            Expr::Bm25 { field, query } => {
+                assert!(matches!(
+                    field.as_ref(),
+                    Expr::PropAccess { variable, property } if variable == "s" && property == "summary"
+                ));
+                assert!(matches!(query.as_ref(), Expr::Variable(v) if v == "q"));
+            }
+            other => panic!("expected bm25 expression, got {:?}", other),
+        }
+        assert_eq!(q.order_clause.len(), 1);
+        assert!(q.order_clause[0].descending);
+    }
+
+    #[test]
+    fn test_parse_rrf_ordering_with_nearest_and_bm25() {
+        let input = r#"
+query q($vq: Vector(3), $tq: String) {
+    match { $s: Signal }
+    return { $s.slug }
+    order { rrf(nearest($s.embedding, $vq), bm25($s.summary, $tq), 60) desc }
+    limit 5
+}
+"#;
+        let qf = parse_query(input).unwrap();
+        let q = &qf.queries[0];
+        assert_eq!(q.order_clause.len(), 1);
+        assert!(q.order_clause[0].descending);
+        match &q.order_clause[0].expr {
+            Expr::Rrf {
+                primary,
+                secondary,
+                k,
+            } => {
+                assert!(matches!(primary.as_ref(), Expr::Nearest { .. }));
+                assert!(matches!(secondary.as_ref(), Expr::Bm25 { .. }));
+                assert!(matches!(k.as_deref(), Some(Expr::Literal(Literal::Integer(60)))));
+            }
+            other => panic!("expected rrf expression, got {:?}", other),
         }
     }
 

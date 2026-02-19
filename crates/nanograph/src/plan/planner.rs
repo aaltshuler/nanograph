@@ -2,7 +2,10 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use ahash::{AHashMap, AHashSet};
-use arrow_array::{Array, RecordBatch, StructArray};
+use arrow_array::{
+    Array, BooleanArray, FixedSizeListArray, Float32Array, Float64Array, RecordBatch, StringArray,
+    StructArray,
+};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion_common::Result as DFResult;
 use datafusion_execution::TaskContext;
@@ -10,12 +13,16 @@ use datafusion_physical_expr::EquivalenceProperties;
 use datafusion_physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
+use lance::Dataset;
+use lance_index::DatasetIndexExt;
 
+use crate::embedding::EmbeddingClient;
 use crate::error::{NanoError, Result};
 use crate::ir::*;
 use crate::query::ast::{AggFunc, CompOp, Literal};
 use crate::store::graph::GraphStorage;
 use crate::store::loader::{parse_date32_literal, parse_date64_literal};
+use crate::types::ScalarType;
 use tracing::{debug, info, instrument};
 
 use super::node_scan::{NodeScanExec, NodeScanPredicate};
@@ -35,6 +42,28 @@ pub async fn execute_query(
         .return_exprs
         .iter()
         .any(|p| matches!(&p.expr, IRExpr::Aggregate { .. }));
+
+    if !has_aggregation {
+        if let Some(candidate) = analyze_single_node_nearest_ann_candidate(ir, params) {
+            if let Some(result) = try_execute_single_node_nearest_ann_fast_path(
+                ir,
+                storage.clone(),
+                params,
+                &candidate,
+            )
+            .await?
+            {
+                info!(
+                    result_batches = result.len(),
+                    node_type = %candidate.type_name,
+                    property = %candidate.property,
+                    "query execution complete (nearest ANN fast path)"
+                );
+                return Ok(result);
+            }
+        }
+    }
+
     let single_scan_pushdown = analyze_single_scan_pushdown(&ir.pipeline, params);
     let scan_limit_pushdown = if !has_aggregation && ir.order_by.is_empty() {
         ir.limit.and_then(|v| {
@@ -112,15 +141,382 @@ pub async fn execute_query(
     // Apply return projections
     if has_aggregation {
         let result = apply_aggregation(&ir.return_exprs, &filtered, params)?;
-        let result = apply_order_and_limit(&result, &ir.order_by, ir.limit)?;
+        let result = apply_order_and_limit(&result, &ir.order_by, ir.limit, params)?;
         info!(result_batches = result.len(), "query execution complete");
         Ok(result)
     } else {
-        let projected = apply_projection(&ir.return_exprs, &filtered, params)?;
-        let result = apply_order_and_limit(&projected, &ir.order_by, ir.limit)?;
+        let has_nearest = ir
+            .order_by
+            .iter()
+            .any(|o| matches!(o.expr, IRExpr::Nearest { .. }));
+        let has_alias_order = ir
+            .order_by
+            .iter()
+            .any(|o| matches!(o.expr, IRExpr::AliasRef(_)));
+
+        let result = if has_alias_order && !has_nearest {
+            let projected = apply_projection(&ir.return_exprs, &filtered, params)?;
+            apply_order_and_limit(&projected, &ir.order_by, ir.limit, params)?
+        } else {
+            let ordered = apply_order_and_limit(&filtered, &ir.order_by, ir.limit, params)?;
+            apply_projection(&ir.return_exprs, &ordered, params)?
+        };
         info!(result_batches = result.len(), "query execution complete");
         Ok(result)
     }
+}
+
+#[derive(Debug, Clone)]
+struct SingleNodeNearestAnnCandidate {
+    variable: String,
+    type_name: String,
+    property: String,
+    query: IRExpr,
+    filters: Vec<IRFilter>,
+}
+
+fn analyze_single_node_nearest_ann_candidate(
+    ir: &QueryIR,
+    params: &ParamMap,
+) -> Option<SingleNodeNearestAnnCandidate> {
+    if ir.limit.is_none() || ir.order_by.len() != 1 {
+        return None;
+    }
+
+    let nearest = &ir.order_by[0];
+    let (nearest_var, nearest_prop, nearest_query) = match &nearest.expr {
+        IRExpr::Nearest {
+            variable,
+            property,
+            query,
+        } if !nearest.descending => (variable, property, query.as_ref().clone()),
+        _ => return None,
+    };
+
+    let mut scan: Option<(String, String, Vec<IRFilter>)> = None;
+    let mut explicit_filters = Vec::new();
+
+    for op in &ir.pipeline {
+        match op {
+            IROp::NodeScan {
+                variable,
+                type_name,
+                filters,
+            } => {
+                if scan.is_some() {
+                    return None;
+                }
+                scan = Some((variable.clone(), type_name.clone(), filters.clone()));
+            }
+            IROp::Filter(filter) => explicit_filters.push(filter.clone()),
+            _ => return None,
+        }
+    }
+
+    let (scan_var, scan_type, mut filters) = scan?;
+    if nearest_var != &scan_var {
+        return None;
+    }
+    filters.extend(explicit_filters);
+
+    if filters
+        .iter()
+        .any(|f| pushdown_scan_filter(&scan_var, f, params).is_none())
+    {
+        return None;
+    }
+
+    Some(SingleNodeNearestAnnCandidate {
+        variable: scan_var,
+        type_name: scan_type,
+        property: nearest_prop.clone(),
+        query: nearest_query,
+        filters,
+    })
+}
+
+async fn try_execute_single_node_nearest_ann_fast_path(
+    ir: &QueryIR,
+    storage: Arc<GraphStorage>,
+    params: &ParamMap,
+    candidate: &SingleNodeNearestAnnCandidate,
+) -> Result<Option<Vec<RecordBatch>>> {
+    let limit = ir
+        .limit
+        .ok_or_else(|| NanoError::Execution("nearest ANN fast path requires limit".to_string()))?;
+    let k = usize::try_from(limit)
+        .map_err(|_| NanoError::Execution(format!("limit {} exceeds platform usize", limit)))?;
+    let lim_i64 = i64::try_from(limit)
+        .map_err(|_| NanoError::Execution(format!("limit {} exceeds i64", limit)))?;
+
+    let node_type = match storage.catalog.node_types.get(&candidate.type_name) {
+        Some(node_type) => node_type,
+        None => return Ok(None),
+    };
+    let vector_dim = match node_type.properties.get(&candidate.property) {
+        Some(prop) if !prop.list => match prop.scalar {
+            ScalarType::Vector(dim) if dim > 0 => dim as usize,
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+
+    let dataset_path = match storage
+        .node_dataset_path(&candidate.type_name)
+        .filter(|p| p.exists())
+    {
+        Some(path) => path.to_path_buf(),
+        None => return Ok(None),
+    };
+
+    let query_vec = resolve_nearest_query_vector(&candidate.query, params, vector_dim)?;
+    let query_array = Float32Array::from(query_vec);
+
+    let uri = dataset_path.to_string_lossy().to_string();
+    let dataset = match Dataset::open(&uri).await {
+        Ok(dataset) => dataset,
+        Err(e) => {
+            debug!(
+                node_type = %candidate.type_name,
+                error = %e,
+                "nearest ANN fast path unavailable, falling back to exact path"
+            );
+            return Ok(None);
+        }
+    };
+
+    let field_idx = node_type
+        .arrow_schema
+        .index_of(&candidate.property)
+        .ok()
+        .map(|i| i as i32);
+    let has_index = match field_idx {
+        Some(field_idx) => match dataset.load_indices().await {
+            Ok(indices) => indices.iter().any(|idx| idx.fields.contains(&field_idx)),
+            Err(_) => false,
+        },
+        None => false,
+    };
+    if !has_index {
+        return Ok(None);
+    }
+
+    let scan_projections = analyze_scan_projection_requirements(ir);
+    let struct_fields = select_scan_struct_fields(
+        &candidate.variable,
+        &node_type.arrow_schema,
+        &scan_projections,
+    );
+    let projected_columns: Vec<String> = struct_fields
+        .iter()
+        .map(|field| field.name().clone())
+        .collect();
+
+    let filter_sql = match build_lance_sql_filter_for_pushdown_preds(
+        &candidate.variable,
+        &candidate.filters,
+        params,
+    ) {
+        Ok(sql) => sql,
+        Err(e) => {
+            debug!(
+                node_type = %candidate.type_name,
+                error = %e,
+                "nearest ANN fast path unavailable, falling back to exact path"
+            );
+            return Ok(None);
+        }
+    };
+
+    let mut scanner = dataset.scan();
+    if let Err(e) = scanner.project(&projected_columns) {
+        debug!(
+            node_type = %candidate.type_name,
+            error = %e,
+            "nearest ANN fast path unavailable, falling back to exact path"
+        );
+        return Ok(None);
+    }
+    if let Some(expr) = filter_sql.as_deref() {
+        if let Err(e) = scanner.filter(expr) {
+            debug!(
+                node_type = %candidate.type_name,
+                error = %e,
+                "nearest ANN fast path unavailable, falling back to exact path"
+            );
+            return Ok(None);
+        }
+        scanner.prefilter(true);
+    }
+    if let Err(e) = scanner.nearest(&candidate.property, &query_array, k) {
+        debug!(
+            node_type = %candidate.type_name,
+            property = %candidate.property,
+            error = %e,
+            "nearest ANN fast path unavailable, falling back to exact path"
+        );
+        return Ok(None);
+    }
+    scanner.use_index(true);
+    if let Err(e) = scanner.limit(Some(lim_i64), None) {
+        debug!(
+            node_type = %candidate.type_name,
+            error = %e,
+            "nearest ANN fast path unavailable, falling back to exact path"
+        );
+        return Ok(None);
+    }
+
+    let mut stream = match scanner.try_into_stream().await {
+        Ok(stream) => stream,
+        Err(e) => {
+            debug!(
+                node_type = %candidate.type_name,
+                error = %e,
+                "nearest ANN fast path unavailable, falling back to exact path"
+            );
+            return Ok(None);
+        }
+    };
+
+    use futures::StreamExt;
+    let mut batches = Vec::new();
+    while let Some(batch) = stream.next().await {
+        match batch {
+            Ok(batch) => batches.push(batch),
+            Err(e) => {
+                debug!(
+                    node_type = %candidate.type_name,
+                    error = %e,
+                    "nearest ANN fast path unavailable, falling back to exact path"
+                );
+                return Ok(None);
+            }
+        }
+    }
+
+    if batches.is_empty() {
+        return Ok(Some(vec![]));
+    }
+
+    let merged = if batches.len() == 1 {
+        batches.remove(0)
+    } else {
+        let schema = batches[0].schema();
+        arrow_select::concat::concat_batches(&schema, &batches)
+            .map_err(|e| NanoError::Execution(e.to_string()))?
+    };
+
+    if merged.num_rows() == 0 {
+        return Ok(Some(vec![]));
+    }
+
+    let wrapped = wrap_projected_node_batch(&candidate.variable, &struct_fields, &merged)?;
+    let filtered = apply_ir_filters(&ir.pipeline, &[wrapped], params)?;
+    let ordered = apply_order_and_limit(&filtered, &ir.order_by, ir.limit, params)?;
+    let projected = apply_projection(&ir.return_exprs, &ordered, params)?;
+    Ok(Some(projected))
+}
+
+fn build_lance_sql_filter_for_pushdown_preds(
+    variable: &str,
+    filters: &[IRFilter],
+    params: &ParamMap,
+) -> Result<Option<String>> {
+    if filters.is_empty() {
+        return Ok(None);
+    }
+
+    let mut clauses = Vec::with_capacity(filters.len());
+    for filter in filters {
+        let predicate = pushdown_scan_filter(variable, filter, params).ok_or_else(|| {
+            NanoError::Execution("non-pushdown filter in nearest ANN path".to_string())
+        })?;
+        let lit = literal_to_lance_sql(&predicate.literal).ok_or_else(|| {
+            NanoError::Execution(format!(
+                "unsupported literal in Lance filter pushdown for property {}",
+                predicate.property
+            ))
+        })?;
+        let op = match predicate.op {
+            CompOp::Eq => "=",
+            CompOp::Ne => "!=",
+            CompOp::Gt => ">",
+            CompOp::Lt => "<",
+            CompOp::Ge => ">=",
+            CompOp::Le => "<=",
+        };
+        clauses.push(format!("{} {} {}", predicate.property, op, lit));
+    }
+
+    Ok(Some(clauses.join(" AND ")))
+}
+
+fn literal_to_lance_sql(literal: &Literal) -> Option<String> {
+    match literal {
+        Literal::String(s) => Some(format!("'{}'", s.replace('\'', "''"))),
+        Literal::Integer(v) => Some(v.to_string()),
+        Literal::Float(v) => {
+            if v.is_finite() {
+                Some(v.to_string())
+            } else {
+                None
+            }
+        }
+        Literal::Bool(v) => Some(if *v { "true" } else { "false" }.to_string()),
+        Literal::Date(s) => {
+            let days = parse_date32_literal(s).ok()?;
+            let iso = arrow_array::temporal_conversions::date32_to_datetime(days)?
+                .format("%Y-%m-%d")
+                .to_string();
+            Some(format!("CAST('{}' AS DATE)", iso))
+        }
+        Literal::DateTime(s) => {
+            let ms = parse_date64_literal(s).ok()?;
+            let ts = arrow_array::temporal_conversions::date64_to_datetime(ms)?
+                .format("%Y-%m-%d %H:%M:%S%.3f")
+                .to_string();
+            Some(format!("CAST('{}' AS TIMESTAMP(3))", ts))
+        }
+        Literal::List(_) => None,
+    }
+}
+
+fn wrap_projected_node_batch(
+    variable: &str,
+    struct_fields: &[Field],
+    batch: &RecordBatch,
+) -> Result<RecordBatch> {
+    let mut runtime_fields = Vec::with_capacity(struct_fields.len());
+    let mut struct_columns = Vec::with_capacity(struct_fields.len());
+    for expected in struct_fields {
+        let col = batch
+            .column_by_name(expected.name())
+            .cloned()
+            .ok_or_else(|| {
+                NanoError::Execution(format!(
+                    "column {} missing from Lance nearest result",
+                    expected.name()
+                ))
+            })?;
+        let field = Field::new(
+            expected.name(),
+            col.data_type().clone(),
+            expected.is_nullable() || col.null_count() > 0,
+        );
+        runtime_fields.push(field);
+        struct_columns.push(col);
+    }
+
+    let struct_array = StructArray::new(runtime_fields.clone().into(), struct_columns, None);
+    let output_schema = Arc::new(Schema::new(vec![Field::new(
+        variable,
+        DataType::Struct(runtime_fields.into()),
+        false,
+    )]));
+
+    RecordBatch::try_new(output_schema, vec![Arc::new(struct_array)])
+        .map_err(|e| NanoError::Execution(e.to_string()))
 }
 
 fn build_physical_plan(
@@ -587,6 +983,51 @@ fn collect_expr_projection_requirements(
         IRExpr::Aggregate { arg, .. } => {
             collect_expr_projection_requirements(arg, scan_variables, requirements);
         }
+        IRExpr::Nearest {
+            variable,
+            property,
+            query,
+        } => {
+            if scan_variables.contains(variable) {
+                mark_scan_property(requirements, variable, property);
+                mark_scan_property(requirements, variable, "id");
+            }
+            collect_expr_projection_requirements(query, scan_variables, requirements);
+        }
+        IRExpr::Search { field, query } => {
+            collect_expr_projection_requirements(field, scan_variables, requirements);
+            collect_expr_projection_requirements(query, scan_variables, requirements);
+        }
+        IRExpr::Fuzzy {
+            field,
+            query,
+            max_edits,
+        } => {
+            collect_expr_projection_requirements(field, scan_variables, requirements);
+            collect_expr_projection_requirements(query, scan_variables, requirements);
+            if let Some(expr) = max_edits.as_deref() {
+                collect_expr_projection_requirements(expr, scan_variables, requirements);
+            }
+        }
+        IRExpr::MatchText { field, query } => {
+            collect_expr_projection_requirements(field, scan_variables, requirements);
+            collect_expr_projection_requirements(query, scan_variables, requirements);
+        }
+        IRExpr::Bm25 { field, query } => {
+            collect_expr_projection_requirements(field, scan_variables, requirements);
+            collect_expr_projection_requirements(query, scan_variables, requirements);
+        }
+        IRExpr::Rrf {
+            primary,
+            secondary,
+            k,
+        } => {
+            collect_expr_projection_requirements(primary, scan_variables, requirements);
+            collect_expr_projection_requirements(secondary, scan_variables, requirements);
+            if let Some(expr) = k.as_deref() {
+                collect_expr_projection_requirements(expr, scan_variables, requirements);
+            }
+        }
         _ => {}
     }
 }
@@ -816,19 +1257,545 @@ fn eval_ir_expr(
                 .ok_or_else(|| NanoError::Execution(format!("parameter ${} not provided", name)))?;
             literal_to_array(lit, batch.num_rows())
         }
+        IRExpr::Nearest {
+            variable,
+            property,
+            query,
+        } => compute_nearest_distance_column(batch, variable, property, query, params),
+        IRExpr::Search { field, query } => {
+            let field_arr = eval_ir_expr(field, batch, params)?;
+            let query_arr = eval_ir_expr(query, batch, params)?;
+            evaluate_search_boolean_array(&field_arr, &query_arr)
+        }
+        IRExpr::Fuzzy {
+            field,
+            query,
+            max_edits,
+        } => {
+            let field_arr = eval_ir_expr(field, batch, params)?;
+            let query_arr = eval_ir_expr(query, batch, params)?;
+            let max_edits_arr = max_edits
+                .as_ref()
+                .map(|expr| eval_ir_expr(expr, batch, params))
+                .transpose()?;
+            evaluate_fuzzy_boolean_array(&field_arr, &query_arr, max_edits_arr.as_ref())
+        }
+        IRExpr::MatchText { field, query } => {
+            let field_arr = eval_ir_expr(field, batch, params)?;
+            let query_arr = eval_ir_expr(query, batch, params)?;
+            evaluate_match_text_boolean_array(&field_arr, &query_arr)
+        }
+        IRExpr::Bm25 { field, query } => {
+            let field_arr = eval_ir_expr(field, batch, params)?;
+            let query_arr = eval_ir_expr(query, batch, params)?;
+            evaluate_bm25_score_array(&field_arr, &query_arr)
+        }
+        IRExpr::Rrf {
+            primary,
+            secondary,
+            k,
+        } => evaluate_rrf_score_array(primary, secondary, k.as_deref(), batch, params),
         _ => Err(NanoError::Execution(
             "unsupported expr in filter".to_string(),
         )),
     }
 }
 
+fn evaluate_search_boolean_array(
+    field_arr: &arrow_array::ArrayRef,
+    query_arr: &arrow_array::ArrayRef,
+) -> Result<arrow_array::ArrayRef> {
+    if field_arr.len() != query_arr.len() {
+        return Err(NanoError::Execution(format!(
+            "search() argument length mismatch: field has {}, query has {}",
+            field_arr.len(),
+            query_arr.len()
+        )));
+    }
+
+    let field_utf8 = field_arr
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            NanoError::Execution("search() field expression must evaluate to String".to_string())
+        })?;
+    let query_utf8 = query_arr
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            NanoError::Execution("search() query expression must evaluate to String".to_string())
+        })?;
+
+    let mut out = Vec::with_capacity(field_arr.len());
+    for row in 0..field_arr.len() {
+        if field_utf8.is_null(row) || query_utf8.is_null(row) {
+            out.push(false);
+            continue;
+        }
+        out.push(matches_keyword_search(
+            field_utf8.value(row),
+            query_utf8.value(row),
+        ));
+    }
+    Ok(Arc::new(BooleanArray::from(out)))
+}
+
+fn evaluate_fuzzy_boolean_array(
+    field_arr: &arrow_array::ArrayRef,
+    query_arr: &arrow_array::ArrayRef,
+    max_edits_arr: Option<&arrow_array::ArrayRef>,
+) -> Result<arrow_array::ArrayRef> {
+    if field_arr.len() != query_arr.len() {
+        return Err(NanoError::Execution(format!(
+            "fuzzy() argument length mismatch: field has {}, query has {}",
+            field_arr.len(),
+            query_arr.len()
+        )));
+    }
+    if let Some(max_edits) = max_edits_arr {
+        if max_edits.len() != field_arr.len() {
+            return Err(NanoError::Execution(format!(
+                "fuzzy() max_edits length mismatch: expected {}, got {}",
+                field_arr.len(),
+                max_edits.len()
+            )));
+        }
+    }
+
+    let field_utf8 = field_arr
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            NanoError::Execution("fuzzy() field expression must evaluate to String".to_string())
+        })?;
+    let query_utf8 = query_arr
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            NanoError::Execution("fuzzy() query expression must evaluate to String".to_string())
+        })?;
+
+    let mut out = Vec::with_capacity(field_arr.len());
+    for row in 0..field_arr.len() {
+        if field_utf8.is_null(row) || query_utf8.is_null(row) {
+            out.push(false);
+            continue;
+        }
+        let override_edits = max_edits_arr
+            .map(|arr| array_value_to_optional_non_negative_usize(arr, row))
+            .transpose()?
+            .flatten();
+        out.push(matches_fuzzy_search(
+            field_utf8.value(row),
+            query_utf8.value(row),
+            override_edits,
+        ));
+    }
+    Ok(Arc::new(BooleanArray::from(out)))
+}
+
+fn evaluate_match_text_boolean_array(
+    field_arr: &arrow_array::ArrayRef,
+    query_arr: &arrow_array::ArrayRef,
+) -> Result<arrow_array::ArrayRef> {
+    if field_arr.len() != query_arr.len() {
+        return Err(NanoError::Execution(format!(
+            "match_text() argument length mismatch: field has {}, query has {}",
+            field_arr.len(),
+            query_arr.len()
+        )));
+    }
+
+    let field_utf8 = field_arr
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            NanoError::Execution(
+                "match_text() field expression must evaluate to String".to_string(),
+            )
+        })?;
+    let query_utf8 = query_arr
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            NanoError::Execution(
+                "match_text() query expression must evaluate to String".to_string(),
+            )
+        })?;
+
+    let mut out = Vec::with_capacity(field_arr.len());
+    for row in 0..field_arr.len() {
+        if field_utf8.is_null(row) || query_utf8.is_null(row) {
+            out.push(false);
+            continue;
+        }
+        out.push(matches_keyword_search(
+            field_utf8.value(row),
+            query_utf8.value(row),
+        ));
+    }
+    Ok(Arc::new(BooleanArray::from(out)))
+}
+
+fn evaluate_bm25_score_array(
+    field_arr: &arrow_array::ArrayRef,
+    query_arr: &arrow_array::ArrayRef,
+) -> Result<arrow_array::ArrayRef> {
+    const BM25_K1: f64 = 1.2;
+    const BM25_B: f64 = 0.75;
+
+    if field_arr.len() != query_arr.len() {
+        return Err(NanoError::Execution(format!(
+            "bm25() argument length mismatch: field has {}, query has {}",
+            field_arr.len(),
+            query_arr.len()
+        )));
+    }
+
+    let field_utf8 = field_arr
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            NanoError::Execution("bm25() field expression must evaluate to String".to_string())
+        })?;
+    let query_utf8 = query_arr
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            NanoError::Execution("bm25() query expression must evaluate to String".to_string())
+        })?;
+
+    let mut doc_term_freqs: Vec<Option<AHashMap<String, usize>>> =
+        Vec::with_capacity(field_arr.len());
+    let mut doc_lengths: Vec<f64> = Vec::with_capacity(field_arr.len());
+    let mut doc_freq: AHashMap<String, usize> = AHashMap::new();
+    let mut doc_count = 0usize;
+    let mut total_doc_len = 0.0f64;
+
+    for row in 0..field_arr.len() {
+        if field_utf8.is_null(row) {
+            doc_term_freqs.push(None);
+            doc_lengths.push(0.0);
+            continue;
+        }
+        let tokens = tokenize_search_terms(field_utf8.value(row));
+        let dl = tokens.len() as f64;
+        total_doc_len += dl;
+        doc_count += 1;
+
+        let mut tf: AHashMap<String, usize> = AHashMap::new();
+        let mut seen_in_doc: AHashSet<String> = AHashSet::new();
+        for token in tokens {
+            *tf.entry(token.clone()).or_insert(0) += 1;
+            if seen_in_doc.insert(token.clone()) {
+                *doc_freq.entry(token).or_insert(0) += 1;
+            }
+        }
+        doc_term_freqs.push(Some(tf));
+        doc_lengths.push(dl);
+    }
+
+    let avg_doc_len = if doc_count > 0 {
+        total_doc_len / (doc_count as f64)
+    } else {
+        0.0
+    };
+
+    let mut scores = Vec::with_capacity(field_arr.len());
+    for row in 0..field_arr.len() {
+        if query_utf8.is_null(row) {
+            scores.push(0.0);
+            continue;
+        }
+        let Some(tf) = doc_term_freqs.get(row).and_then(|m| m.as_ref()) else {
+            scores.push(0.0);
+            continue;
+        };
+
+        let query_tokens = tokenize_search_terms(query_utf8.value(row));
+        if query_tokens.is_empty() {
+            scores.push(0.0);
+            continue;
+        }
+
+        let mut query_tf: AHashMap<String, usize> = AHashMap::new();
+        for token in query_tokens {
+            *query_tf.entry(token).or_insert(0) += 1;
+        }
+
+        let dl = doc_lengths[row];
+        let norm = if avg_doc_len > 0.0 {
+            BM25_K1 * (1.0 - BM25_B + BM25_B * (dl / avg_doc_len))
+        } else {
+            BM25_K1
+        };
+
+        let mut score = 0.0f64;
+        for (term, qf) in query_tf {
+            let tf_term = *tf.get(&term).unwrap_or(&0) as f64;
+            if tf_term <= 0.0 {
+                continue;
+            }
+            let df = *doc_freq.get(&term).unwrap_or(&0) as f64;
+            let n = doc_count as f64;
+            let idf = (1.0 + ((n - df + 0.5) / (df + 0.5))).ln();
+            let numerator = tf_term * (BM25_K1 + 1.0);
+            let denom = tf_term + norm;
+            if denom > 0.0 {
+                score += idf * (numerator / denom) * (qf as f64);
+            }
+        }
+        scores.push(score);
+    }
+
+    Ok(Arc::new(Float64Array::from(scores)))
+}
+
+fn evaluate_rrf_score_array(
+    primary_expr: &IRExpr,
+    secondary_expr: &IRExpr,
+    k_expr: Option<&IRExpr>,
+    batch: &RecordBatch,
+    params: &ParamMap,
+) -> Result<arrow_array::ArrayRef> {
+    const DEFAULT_RRF_K: usize = 60;
+
+    let primary_scores = eval_ir_expr(primary_expr, batch, params)?;
+    let secondary_scores = eval_ir_expr(secondary_expr, batch, params)?;
+
+    if primary_scores.len() != secondary_scores.len() {
+        return Err(NanoError::Execution(format!(
+            "rrf() rank input length mismatch: primary has {}, secondary has {}",
+            primary_scores.len(),
+            secondary_scores.len()
+        )));
+    }
+
+    let primary_values = numeric_array_to_optional_f64(&primary_scores)?;
+    let secondary_values = numeric_array_to_optional_f64(&secondary_scores)?;
+
+    let primary_ranks = rank_positions_for_rrf(
+        &primary_values,
+        matches!(primary_expr, IRExpr::Bm25 { .. } | IRExpr::Rrf { .. }),
+    );
+    let secondary_ranks = rank_positions_for_rrf(
+        &secondary_values,
+        matches!(secondary_expr, IRExpr::Bm25 { .. } | IRExpr::Rrf { .. }),
+    );
+
+    let k_values = if let Some(expr) = k_expr {
+        let k_arr = eval_ir_expr(expr, batch, params)?;
+        let mut per_row = Vec::with_capacity(k_arr.len());
+        for row in 0..k_arr.len() {
+            let k = array_value_to_optional_positive_usize(&k_arr, row)?.unwrap_or(DEFAULT_RRF_K);
+            per_row.push(k as f64);
+        }
+        per_row
+    } else {
+        vec![DEFAULT_RRF_K as f64; primary_scores.len()]
+    };
+
+    let mut out = Vec::with_capacity(primary_scores.len());
+    for row in 0..primary_scores.len() {
+        let k = k_values[row];
+        let mut score = 0.0f64;
+        if let Some(rank) = primary_ranks[row] {
+            score += 1.0 / (k + rank as f64);
+        }
+        if let Some(rank) = secondary_ranks[row] {
+            score += 1.0 / (k + rank as f64);
+        }
+        out.push(score);
+    }
+
+    Ok(Arc::new(Float64Array::from(out)))
+}
+
+fn numeric_array_to_optional_f64(arr: &arrow_array::ArrayRef) -> Result<Vec<Option<f64>>> {
+    let mut values = Vec::with_capacity(arr.len());
+    for row in 0..arr.len() {
+        if arr.is_null(row) {
+            values.push(None);
+            continue;
+        }
+        values.push(array_value_to_f64(arr, row));
+    }
+    if values.iter().any(|v| v.is_none()) {
+        return Err(NanoError::Execution(
+            "rrf() rank expressions must evaluate to numeric scores".to_string(),
+        ));
+    }
+    Ok(values)
+}
+
+fn rank_positions_for_rrf(values: &[Option<f64>], descending: bool) -> Vec<Option<usize>> {
+    let mut idx_values: Vec<(usize, f64)> = values
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, value)| value.map(|v| (idx, v)))
+        .collect();
+
+    idx_values.sort_by(|(idx_a, val_a), (idx_b, val_b)| {
+        let ord = val_a.partial_cmp(val_b).unwrap_or(std::cmp::Ordering::Equal);
+        let ord = if descending { ord.reverse() } else { ord };
+        ord.then_with(|| idx_a.cmp(idx_b))
+    });
+
+    let mut out = vec![None; values.len()];
+    for (rank_idx, (row_idx, _)) in idx_values.into_iter().enumerate() {
+        out[row_idx] = Some(rank_idx + 1);
+    }
+    out
+}
+
+fn array_value_to_optional_non_negative_usize(
+    arr: &arrow_array::ArrayRef,
+    row: usize,
+) -> Result<Option<usize>> {
+    if arr.is_null(row) {
+        return Ok(None);
+    }
+    if let Some(values) = arr.as_any().downcast_ref::<arrow_array::Int32Array>() {
+        let value = values.value(row);
+        if value < 0 {
+            return Err(NanoError::Execution(format!(
+                "fuzzy() max_edits must be >= 0, got {}",
+                value
+            )));
+        }
+        return Ok(Some(value as usize));
+    }
+    if let Some(values) = arr.as_any().downcast_ref::<arrow_array::Int64Array>() {
+        let value = values.value(row);
+        if value < 0 {
+            return Err(NanoError::Execution(format!(
+                "fuzzy() max_edits must be >= 0, got {}",
+                value
+            )));
+        }
+        return Ok(Some(value as usize));
+    }
+    if let Some(values) = arr.as_any().downcast_ref::<arrow_array::UInt32Array>() {
+        return Ok(Some(values.value(row) as usize));
+    }
+    if let Some(values) = arr.as_any().downcast_ref::<arrow_array::UInt64Array>() {
+        return Ok(Some(values.value(row) as usize));
+    }
+    Err(NanoError::Execution(
+        "fuzzy() max_edits must evaluate to an integer".to_string(),
+    ))
+}
+
+fn array_value_to_optional_positive_usize(
+    arr: &arrow_array::ArrayRef,
+    row: usize,
+) -> Result<Option<usize>> {
+    let value = array_value_to_optional_non_negative_usize(arr, row)?;
+    if let Some(v) = value {
+        if v == 0 {
+            return Err(NanoError::Execution(
+                "rrf() k must be greater than 0".to_string(),
+            ));
+        }
+    }
+    Ok(value)
+}
+
+fn matches_keyword_search(field: &str, query: &str) -> bool {
+    let field_tokens: AHashSet<String> = tokenize_search_terms(field).into_iter().collect();
+    if field_tokens.is_empty() {
+        return false;
+    }
+    let query_tokens = tokenize_search_terms(query);
+    if query_tokens.is_empty() {
+        return false;
+    }
+    query_tokens
+        .iter()
+        .all(|term| field_tokens.contains(term.as_str()))
+}
+
+fn matches_fuzzy_search(field: &str, query: &str, max_edits_override: Option<usize>) -> bool {
+    let field_tokens = tokenize_search_terms(field);
+    if field_tokens.is_empty() {
+        return false;
+    }
+    let query_tokens = tokenize_search_terms(query);
+    if query_tokens.is_empty() {
+        return false;
+    }
+
+    query_tokens.iter().all(|needle| {
+        let max_edits = max_edits_override.unwrap_or_else(|| default_fuzzy_max_edits(needle));
+        field_tokens
+            .iter()
+            .any(|token| levenshtein_within(token, needle, max_edits))
+    })
+}
+
+fn tokenize_search_terms(input: &str) -> Vec<String> {
+    input
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase())
+        .collect()
+}
+
+fn default_fuzzy_max_edits(term: &str) -> usize {
+    let len = term.chars().count();
+    if len <= 2 {
+        0
+    } else if len <= 5 {
+        1
+    } else {
+        2
+    }
+}
+
+fn levenshtein_within(a: &str, b: &str, max_edits: usize) -> bool {
+    if a == b {
+        return true;
+    }
+    let a_len = a.chars().count();
+    let b_len = b.chars().count();
+    if a_len.abs_diff(b_len) > max_edits {
+        return false;
+    }
+    if max_edits == 0 {
+        return false;
+    }
+
+    let b_chars: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b_chars.len()).collect();
+    let mut curr = vec![0usize; b_chars.len() + 1];
+
+    for (i, a_char) in a.chars().enumerate() {
+        curr[0] = i + 1;
+        let mut row_min = curr[0];
+        for (j, b_char) in b_chars.iter().enumerate() {
+            let cost = usize::from(a_char != *b_char);
+            let insert = curr[j] + 1;
+            let delete = prev[j + 1] + 1;
+            let replace = prev[j] + cost;
+            let value = insert.min(delete).min(replace);
+            curr[j + 1] = value;
+            row_min = row_min.min(value);
+        }
+        if row_min > max_edits {
+            return false;
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+
+    prev[b_chars.len()] <= max_edits
+}
+
 fn literal_to_array(lit: &Literal, num_rows: usize) -> Result<arrow_array::ArrayRef> {
-    use arrow_array::{StringArray, Int64Array, Float64Array, BooleanArray, Date32Array, Date64Array};
+    use arrow_array::{
+        BooleanArray, Date32Array, Date64Array, Float64Array, Int64Array, StringArray,
+    };
     match lit {
-        Literal::String(s) => Ok(Arc::new(StringArray::from(vec![
-            s.as_str();
-            num_rows
-        ]))),
+        Literal::String(s) => Ok(Arc::new(StringArray::from(vec![s.as_str(); num_rows]))),
         Literal::Integer(n) => Ok(Arc::new(Int64Array::from(vec![*n; num_rows]))),
         Literal::Float(f) => Ok(Arc::new(Float64Array::from(vec![*f; num_rows]))),
         Literal::Bool(b) => Ok(Arc::new(BooleanArray::from(vec![*b; num_rows]))),
@@ -971,6 +1938,30 @@ fn infer_projection_field(
         IRExpr::AliasRef(a) => {
             let name = alias.unwrap_or(a).to_string();
             Ok((name, DataType::Int64, true))
+        }
+        IRExpr::Nearest { .. } => {
+            let name = alias.unwrap_or("nearest").to_string();
+            Ok((name, DataType::Float64, true))
+        }
+        IRExpr::Search { .. } => {
+            let name = alias.unwrap_or("search").to_string();
+            Ok((name, DataType::Boolean, false))
+        }
+        IRExpr::Fuzzy { .. } => {
+            let name = alias.unwrap_or("fuzzy").to_string();
+            Ok((name, DataType::Boolean, false))
+        }
+        IRExpr::MatchText { .. } => {
+            let name = alias.unwrap_or("match_text").to_string();
+            Ok((name, DataType::Boolean, false))
+        }
+        IRExpr::Bm25 { .. } => {
+            let name = alias.unwrap_or("bm25").to_string();
+            Ok((name, DataType::Float64, false))
+        }
+        IRExpr::Rrf { .. } => {
+            let name = alias.unwrap_or("rrf").to_string();
+            Ok((name, DataType::Float64, false))
         }
         IRExpr::Aggregate { func, arg } => {
             let name = alias.unwrap_or(&func.to_string()).to_string();
@@ -1192,7 +2183,7 @@ fn array_value_to_f64(arr: &arrow_array::ArrayRef, row: usize) -> Option<f64> {
 }
 
 fn strings_to_array(values: &[String], dt: &DataType) -> arrow_array::ArrayRef {
-    use arrow_array::{StringArray, Int32Array, Int64Array, UInt64Array};
+    use arrow_array::{Int32Array, Int64Array, StringArray, UInt64Array};
     match dt {
         DataType::Utf8 => Arc::new(StringArray::from(
             values.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
@@ -1225,6 +2216,7 @@ fn apply_order_and_limit(
     batches: &[RecordBatch],
     order_by: &[IROrdering],
     limit: Option<u64>,
+    params: &ParamMap,
 ) -> Result<Vec<RecordBatch>> {
     if batches.is_empty() {
         return Ok(vec![]);
@@ -1249,28 +2241,28 @@ fn apply_order_and_limit(
     if !order_by.is_empty() {
         // Build sort columns
         let mut sort_columns = Vec::new();
+        let mut nearest_tie_break_var: Option<String> = None;
         for ord in order_by {
             let col = match &ord.expr {
                 IRExpr::PropAccess { variable, property } => {
-                    let col_idx = result.schema().index_of(variable).ok();
-                    if let Some(idx) = col_idx {
-                        let struct_arr = result.column(idx).as_any().downcast_ref::<StructArray>();
-                        struct_arr.and_then(|s| s.column_by_name(property).cloned())
-                    } else {
-                        // Try as a flat column (post-projection)
-                        result
-                            .schema()
-                            .index_of(property)
-                            .ok()
-                            .map(|i| result.column(i).clone())
-                    }
+                    sort_column_from_prop_or_flat(&result, variable, property)
                 }
                 IRExpr::AliasRef(name) => result
                     .schema()
                     .index_of(name)
                     .ok()
                     .map(|i| result.column(i).clone()),
-                _ => None,
+                IRExpr::Nearest {
+                    variable,
+                    property,
+                    query,
+                } => {
+                    nearest_tie_break_var.get_or_insert_with(|| variable.clone());
+                    Some(compute_nearest_distance_column(
+                        &result, variable, property, query, params,
+                    )?)
+                }
+                _ => eval_ir_expr(&ord.expr, &result, params).ok(),
             };
 
             if let Some(c) = col {
@@ -1278,6 +2270,19 @@ fn apply_order_and_limit(
                     values: c,
                     options: Some(arrow_ord::sort::SortOptions {
                         descending: ord.descending,
+                        nulls_first: false,
+                    }),
+                });
+            }
+        }
+
+        // Deterministic tie-break for nearest: id ascending.
+        if let Some(var) = nearest_tie_break_var {
+            if let Some(id_col) = sort_column_from_prop_or_flat(&result, &var, "id") {
+                sort_columns.push(arrow_ord::sort::SortColumn {
+                    values: id_col,
+                    options: Some(arrow_ord::sort::SortOptions {
+                        descending: false,
                         nulls_first: false,
                     }),
                 });
@@ -1308,6 +2313,198 @@ fn apply_order_and_limit(
     }
 
     Ok(vec![result])
+}
+
+fn sort_column_from_prop_or_flat(
+    batch: &RecordBatch,
+    variable: &str,
+    property: &str,
+) -> Option<arrow_array::ArrayRef> {
+    let col_idx = batch.schema().index_of(variable).ok();
+    if let Some(idx) = col_idx {
+        let struct_arr = batch.column(idx).as_any().downcast_ref::<StructArray>();
+        if let Some(col) = struct_arr.and_then(|s| s.column_by_name(property).cloned()) {
+            return Some(col);
+        }
+    }
+    batch
+        .schema()
+        .index_of(property)
+        .ok()
+        .map(|i| batch.column(i).clone())
+}
+
+fn compute_nearest_distance_column(
+    batch: &RecordBatch,
+    variable: &str,
+    property: &str,
+    query_expr: &IRExpr,
+    params: &ParamMap,
+) -> Result<arrow_array::ArrayRef> {
+    let struct_idx = batch.schema().index_of(variable).map_err(|e| {
+        NanoError::Execution(format!(
+            "nearest() variable `{}` not found in batch schema: {}",
+            variable, e
+        ))
+    })?;
+    let struct_arr = batch
+        .column(struct_idx)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| {
+            NanoError::Execution(format!(
+                "nearest() target `{}` is not a struct column",
+                variable
+            ))
+        })?;
+    let vector_col = struct_arr.column_by_name(property).ok_or_else(|| {
+        NanoError::Execution(format!(
+            "nearest() property `{}` not found on `{}`",
+            property, variable
+        ))
+    })?;
+    let vector_arr = vector_col
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()
+        .ok_or_else(|| {
+            NanoError::Execution(format!(
+                "nearest() property `{}` on `{}` must be Vector(dim)",
+                property, variable
+            ))
+        })?;
+
+    let dim = vector_arr.value_length() as usize;
+    let query = resolve_nearest_query_vector(query_expr, params, dim)?;
+    let query_norm = query
+        .iter()
+        .map(|v| (*v as f64) * (*v as f64))
+        .sum::<f64>()
+        .sqrt();
+
+    let mut distances = Vec::with_capacity(vector_arr.len());
+    for row in 0..vector_arr.len() {
+        if vector_arr.is_null(row) {
+            distances.push(None);
+            continue;
+        }
+        let values = vector_arr.value(row);
+        let vec = values
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .ok_or_else(|| {
+                NanoError::Execution(format!(
+                    "nearest() vector field `{}` is not Float32",
+                    property
+                ))
+            })?;
+        if vec.len() != dim {
+            return Err(NanoError::Execution(format!(
+                "nearest() vector field `{}` dimension mismatch at row {}: expected {}, got {}",
+                property,
+                row,
+                dim,
+                vec.len()
+            )));
+        }
+
+        let mut dot = 0.0f64;
+        let mut vec_norm_sq = 0.0f64;
+        for i in 0..dim {
+            let a = query[i] as f64;
+            let b = vec.value(i) as f64;
+            dot += a * b;
+            vec_norm_sq += b * b;
+        }
+        let denom = query_norm * vec_norm_sq.sqrt();
+        let dist = if denom > f64::EPSILON {
+            1.0 - (dot / denom)
+        } else {
+            f64::INFINITY
+        };
+        distances.push(Some(dist));
+    }
+
+    Ok(Arc::new(Float64Array::from(distances)))
+}
+
+fn resolve_nearest_query_vector(
+    expr: &IRExpr,
+    params: &ParamMap,
+    expected_dim: usize,
+) -> Result<Vec<f32>> {
+    resolve_nearest_query_vector_with_embedder(expr, params, expected_dim, None)
+}
+
+fn resolve_nearest_query_vector_with_embedder(
+    expr: &IRExpr,
+    params: &ParamMap,
+    expected_dim: usize,
+    embedder: Option<&EmbeddingClient>,
+) -> Result<Vec<f32>> {
+    let lit = match expr {
+        IRExpr::Literal(lit) => lit,
+        IRExpr::Param(name) => params
+            .get(name)
+            .ok_or_else(|| NanoError::Execution(format!("parameter `${}` not provided", name)))?,
+        _ => {
+            return Err(NanoError::Execution(
+                "nearest() query must be a Vector or String literal/parameter".to_string(),
+            ));
+        }
+    };
+    literal_to_query_vector(lit, expected_dim, embedder)
+}
+
+fn literal_to_query_vector(
+    lit: &Literal,
+    expected_dim: usize,
+    embedder: Option<&EmbeddingClient>,
+) -> Result<Vec<f32>> {
+    let vec = match lit {
+        Literal::List(items) => literal_list_to_f32_vector(items)?,
+        Literal::String(text) => {
+            if let Some(embedder) = embedder {
+                embedder.embed_text(text, expected_dim)?
+            } else {
+                EmbeddingClient::from_env()?.embed_text(text, expected_dim)?
+            }
+        }
+        _ => {
+            return Err(NanoError::Execution(
+                "nearest() query must be provided as a numeric vector or string".to_string(),
+            ));
+        }
+    };
+    if vec.len() != expected_dim {
+        return Err(NanoError::Execution(format!(
+            "nearest() query dimension mismatch: expected {}, got {}",
+            expected_dim,
+            vec.len()
+        )));
+    }
+    Ok(vec)
+}
+
+fn literal_list_to_f32_vector(items: &[Literal]) -> Result<Vec<f32>> {
+    if items.is_empty() {
+        return Err(NanoError::Execution(
+            "nearest() vector cannot be empty".to_string(),
+        ));
+    }
+
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            Literal::Integer(v) => out.push(*v as f32),
+            Literal::Float(v) => out.push(*v as f32),
+            _ => {
+                return Err(NanoError::Execution(
+                    "nearest() vector elements must be numeric".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// A simple cross-join exec for combining multiple NodeScans
@@ -1737,7 +2934,8 @@ impl ExecutionPlan for AntiJoinExec {
                                     .map(|i| !inner_ids.contains(&id_arr.value(i)))
                                     .collect::<Vec<_>>(),
                             );
-                            let filtered = arrow_select::filter::filter_record_batch(&batch, &mask)?;
+                            let filtered =
+                                arrow_select::filter::filter_record_batch(&batch, &mask)?;
                             if filtered.num_rows() > 0 {
                                 let next_state = AntiJoinState::Running {
                                     outer_stream,
@@ -1766,9 +2964,12 @@ impl ExecutionPlan for AntiJoinExec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Date32Array, Date64Array, RecordBatch};
-    use arrow_schema::{DataType, Schema};
     use crate::query::ast::Literal;
+    use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+    use arrow_array::{
+        ArrayRef, Date32Array, Date64Array, Int64Array, RecordBatch, StringArray, UInt64Array,
+    };
+    use arrow_schema::{DataType, Field, Fields, Schema};
     use std::sync::Arc;
 
     #[test]
@@ -1856,9 +3057,8 @@ mod tests {
 
     #[test]
     fn infer_projection_field_uses_temporal_types_for_temporal_literals() {
-        let batch = RecordBatch::new_empty(Arc::new(Schema::new(
-            Vec::<arrow_schema::Field>::new(),
-        )));
+        let batch =
+            RecordBatch::new_empty(Arc::new(Schema::new(Vec::<arrow_schema::Field>::new())));
 
         let (_, date_ty, _) = infer_projection_field(
             &IRExpr::Literal(Literal::Date("2026-02-14".to_string())),
@@ -1875,5 +3075,227 @@ mod tests {
         )
         .unwrap();
         assert_eq!(dt_ty, DataType::Date64);
+    }
+
+    #[test]
+    fn evaluate_search_boolean_array_matches_all_query_tokens() {
+        let field: ArrayRef = Arc::new(StringArray::from(vec![
+            "billing reconciliation delay due to missing invoice data",
+            "warm referral for analytics migration project",
+        ]));
+        let query: ArrayRef = Arc::new(StringArray::from(vec![
+            "billing missing",
+            "analytics migration",
+        ]));
+
+        let out = evaluate_search_boolean_array(&field, &query).unwrap();
+        let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert_eq!(out.value(0), true);
+        assert_eq!(out.value(1), true);
+    }
+
+    #[test]
+    fn evaluate_match_text_boolean_array_matches_tokens() {
+        let field: ArrayRef = Arc::new(StringArray::from(vec![
+            "enterprise procurement questionnaire backlog",
+            "warm referral for analytics migration project",
+        ]));
+        let query: ArrayRef = Arc::new(StringArray::from(vec![
+            "procurement backlog",
+            "analytics migration",
+        ]));
+
+        let out = evaluate_match_text_boolean_array(&field, &query).unwrap();
+        let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert_eq!(out.value(0), true);
+        assert_eq!(out.value(1), true);
+    }
+
+    #[test]
+    fn evaluate_bm25_score_array_ranks_relevant_document_higher() {
+        let field: ArrayRef = Arc::new(StringArray::from(vec![
+            "billing reconciliation delay due to missing invoice data",
+            "warm referral for analytics migration project",
+            "vendor procurement backlog and mitigation tracking",
+        ]));
+        let query: ArrayRef = Arc::new(StringArray::from(vec![
+            "billing missing invoice",
+            "billing missing invoice",
+            "billing missing invoice",
+        ]));
+
+        let out = evaluate_bm25_score_array(&field, &query).unwrap();
+        let out = out.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert!(out.value(0) > out.value(1));
+        assert!(out.value(0) > out.value(2));
+    }
+
+    #[test]
+    fn evaluate_rrf_score_array_fuses_two_rankings() {
+        let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
+        let text: ArrayRef = Arc::new(StringArray::from(vec![
+            "billing invoice reconciliation delay",
+            "billing invoice for customer account",
+            "warm referral for analytics migration",
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![text]).unwrap();
+
+        let primary = IRExpr::Bm25 {
+            field: Box::new(IRExpr::Variable("text".to_string())),
+            query: Box::new(IRExpr::Literal(Literal::String(
+                "billing invoice".to_string(),
+            ))),
+        };
+        let secondary = IRExpr::Bm25 {
+            field: Box::new(IRExpr::Variable("text".to_string())),
+            query: Box::new(IRExpr::Literal(Literal::String(
+                "reconciliation delay".to_string(),
+            ))),
+        };
+
+        let out = evaluate_rrf_score_array(&primary, &secondary, None, &batch, &ParamMap::new())
+            .unwrap();
+        let out = out.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert!(out.value(0) > out.value(1));
+        assert!(out.value(0) > out.value(2));
+    }
+
+    #[test]
+    fn evaluate_rrf_rejects_zero_k() {
+        let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
+        let text: ArrayRef = Arc::new(StringArray::from(vec!["billing invoice"]));
+        let batch = RecordBatch::try_new(schema, vec![text]).unwrap();
+
+        let primary = IRExpr::Bm25 {
+            field: Box::new(IRExpr::Variable("text".to_string())),
+            query: Box::new(IRExpr::Literal(Literal::String(
+                "billing invoice".to_string(),
+            ))),
+        };
+        let secondary = IRExpr::Bm25 {
+            field: Box::new(IRExpr::Variable("text".to_string())),
+            query: Box::new(IRExpr::Literal(Literal::String(
+                "billing invoice".to_string(),
+            ))),
+        };
+        let k = IRExpr::Literal(Literal::Integer(0));
+
+        let err =
+            evaluate_rrf_score_array(&primary, &secondary, Some(&k), &batch, &ParamMap::new())
+                .unwrap_err();
+        assert!(err.to_string().contains("rrf() k must be greater than 0"));
+    }
+
+    #[test]
+    fn evaluate_fuzzy_boolean_array_handles_typo_and_max_edits() {
+        let field: ArrayRef = Arc::new(StringArray::from(vec![
+            "enterprise procurement questionnaire backlog",
+            "billing reconciliation delay",
+        ]));
+        let query: ArrayRef = Arc::new(StringArray::from(vec![
+            "procuremnt backlog",
+            "reconciliaton",
+        ]));
+
+        let out = evaluate_fuzzy_boolean_array(&field, &query, None).unwrap();
+        let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert_eq!(out.value(0), true);
+        assert_eq!(out.value(1), true);
+
+        let strict_edits: ArrayRef = Arc::new(Int64Array::from(vec![0_i64, 0_i64]));
+        let strict = evaluate_fuzzy_boolean_array(&field, &query, Some(&strict_edits)).unwrap();
+        let strict = strict.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert_eq!(strict.value(0), false);
+        assert_eq!(strict.value(1), false);
+    }
+
+    #[test]
+    fn evaluate_fuzzy_boolean_array_rejects_negative_max_edits() {
+        let field: ArrayRef = Arc::new(StringArray::from(vec!["alpha"]));
+        let query: ArrayRef = Arc::new(StringArray::from(vec!["alpah"]));
+        let max_edits: ArrayRef = Arc::new(Int64Array::from(vec![-1_i64]));
+
+        let err = evaluate_fuzzy_boolean_array(&field, &query, Some(&max_edits)).unwrap_err();
+        assert!(err.to_string().contains("max_edits must be >= 0"));
+    }
+
+    #[test]
+    fn resolve_nearest_query_vector_supports_string_param_with_embedder() {
+        let mut params = ParamMap::new();
+        params.insert("q".to_string(), Literal::String("alpha".to_string()));
+        let query = IRExpr::Param("q".to_string());
+        let embedder = EmbeddingClient::mock_for_tests();
+
+        let vec = resolve_nearest_query_vector_with_embedder(&query, &params, 5, Some(&embedder))
+            .unwrap();
+        assert_eq!(vec.len(), 5);
+    }
+
+    #[test]
+    fn apply_order_and_limit_nearest_tie_breaks_by_id() {
+        let ids: ArrayRef = Arc::new(UInt64Array::from(vec![20_u64, 10_u64, 30_u64]));
+        let mut emb_builder = FixedSizeListBuilder::new(Float32Builder::new(), 2);
+        // id=20 -> cosine distance 1.0 from query [1, 0]
+        emb_builder.values().append_value(0.0);
+        emb_builder.values().append_value(1.0);
+        emb_builder.append(true);
+        // id=10 -> cosine distance 1.0 from query [1, 0]
+        emb_builder.values().append_value(0.0);
+        emb_builder.values().append_value(-1.0);
+        emb_builder.append(true);
+        // id=30 -> cosine distance 0.0 from query [1, 0]
+        emb_builder.values().append_value(1.0);
+        emb_builder.values().append_value(0.0);
+        emb_builder.append(true);
+        let embeddings: ArrayRef = Arc::new(emb_builder.finish());
+
+        let node_fields = Fields::from(vec![
+            Arc::new(Field::new("id", DataType::UInt64, false)),
+            Arc::new(Field::new(
+                "embedding",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+                true,
+            )),
+        ]);
+        let node_struct =
+            Arc::new(StructArray::new(node_fields, vec![ids, embeddings], None)) as ArrayRef;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "n",
+            node_struct.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![node_struct]).unwrap();
+
+        let ordering = vec![IROrdering {
+            expr: IRExpr::Nearest {
+                variable: "n".to_string(),
+                property: "embedding".to_string(),
+                query: Box::new(IRExpr::Literal(Literal::List(vec![
+                    Literal::Float(1.0),
+                    Literal::Float(0.0),
+                ]))),
+            },
+            descending: false,
+        }];
+
+        let out = apply_order_and_limit(&[batch], &ordering, Some(3), &ParamMap::new()).unwrap();
+        let struct_arr = out[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let out_ids = struct_arr
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+
+        // nearest distance asc with deterministic tie-break by id asc for equal distances.
+        assert_eq!(
+            vec![out_ids.value(0), out_ids.value(1), out_ids.value(2)],
+            vec![30, 10, 20]
+        );
     }
 }

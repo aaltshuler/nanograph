@@ -4,17 +4,17 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow_array::{
-    ArrayRef, BooleanArray, Date32Array, Date64Array, Float64Array, Int64Array, RecordBatch,
-    StringArray, StructArray,
+    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, FixedSizeListArray, Float64Array,
+    Int64Array, RecordBatch, StringArray, StructArray,
 };
 use arrow_schema::{DataType, Field, SchemaRef};
-use datafusion_common::{Result, DataFusionError};
+use datafusion_common::{DataFusionError, Result};
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::EquivalenceProperties;
+use datafusion_physical_plan::memory::MemoryStream;
 use datafusion_physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
-use datafusion_physical_plan::memory::MemoryStream;
 use futures::StreamExt;
 use lance::Dataset;
 use tracing::debug;
@@ -182,6 +182,54 @@ impl NodeScanExec {
         }
     }
 
+    fn align_column_to_field(col: &ArrayRef, field: &Field) -> Result<ArrayRef> {
+        if col.data_type() == field.data_type() {
+            return Ok(col.clone());
+        }
+
+        if let (
+            DataType::FixedSizeList(actual, actual_dim),
+            DataType::FixedSizeList(expected, expected_dim),
+        ) = (col.data_type(), field.data_type())
+        {
+            if actual_dim == expected_dim && actual.data_type() == expected.data_type() {
+                let list = col
+                    .as_any()
+                    .downcast_ref::<FixedSizeListArray>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution(
+                            "failed to downcast FixedSizeList column while aligning schema"
+                                .to_string(),
+                        )
+                    })?;
+                let rebuilt = FixedSizeListArray::try_new(
+                    expected.clone(),
+                    *expected_dim,
+                    list.values().clone(),
+                    list.nulls().cloned(),
+                )
+                .map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "failed to align FixedSizeList column '{}': {}",
+                        field.name(),
+                        e
+                    ))
+                })?;
+                return Ok(Arc::new(rebuilt) as ArrayRef);
+            }
+        }
+
+        arrow_cast::cast(col, field.data_type()).map_err(|e| {
+            DataFusionError::Execution(format!(
+                "failed to cast column '{}' from {:?} to {:?}: {}",
+                field.name(),
+                col.data_type(),
+                field.data_type(),
+                e
+            ))
+        })
+    }
+
     fn wrap_struct_batch_for_schema(
         output_schema: &SchemaRef,
         batch: &RecordBatch,
@@ -195,7 +243,7 @@ impl NodeScanExec {
                     field.name()
                 ))
             })?;
-            struct_columns.push(col.clone());
+            struct_columns.push(Self::align_column_to_field(col, field)?);
         }
 
         let struct_array = StructArray::new(struct_fields.into(), struct_columns, None);
@@ -386,12 +434,14 @@ impl ExecutionPlan for NodeScanExec {
                     batches.remove(0)
                 } else {
                     let projected_schema = batches[0].schema();
-                    arrow_select::concat::concat_batches(&projected_schema, &batches).map_err(|e| {
-                        DataFusionError::Execution(format!(
-                            "concat Lance scan batches error: {}",
-                            e
-                        ))
-                    })?
+                    arrow_select::concat::concat_batches(&projected_schema, &batches).map_err(
+                        |e| {
+                            DataFusionError::Execution(format!(
+                                "concat Lance scan batches error: {}",
+                                e
+                            ))
+                        },
+                    )?
                 };
 
                 NodeScanExec::wrap_struct_batch_for_schema(&output_schema, &merged)
@@ -465,6 +515,10 @@ impl NodeScanExec {
 mod tests {
     use super::NodeScanExec;
     use crate::query::ast::Literal;
+    use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+    use arrow_array::{ArrayRef, RecordBatch};
+    use arrow_schema::{DataType, Field, Fields, Schema};
+    use std::sync::Arc;
 
     #[test]
     fn literal_to_lance_sql_formats_temporal_literals_with_typed_casts() {
@@ -488,5 +542,43 @@ mod tests {
         let bad_dt =
             NodeScanExec::literal_to_lance_sql(&Literal::DateTime("not-a-datetime".to_string()));
         assert!(bad_dt.is_none());
+    }
+
+    #[test]
+    fn wrap_struct_batch_normalizes_fixed_size_list_child_nullability() {
+        let mut emb_builder = FixedSizeListBuilder::new(Float32Builder::new(), 2);
+        emb_builder.values().append_value(1.0);
+        emb_builder.values().append_value(0.0);
+        emb_builder.append(true);
+        emb_builder.values().append_value(0.0);
+        emb_builder.values().append_value(1.0);
+        emb_builder.append(true);
+        let embedding: ArrayRef = Arc::new(emb_builder.finish());
+
+        let input_schema = Arc::new(Schema::new(vec![Field::new(
+            "embedding",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+            false,
+        )]));
+        let input_batch = RecordBatch::try_new(input_schema, vec![embedding]).unwrap();
+
+        let output_struct_fields = Fields::from(vec![Arc::new(Field::new(
+            "embedding",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 2),
+            false,
+        ))]);
+        let output_schema = Arc::new(Schema::new(vec![Field::new(
+            "n",
+            DataType::Struct(output_struct_fields.clone()),
+            false,
+        )]));
+
+        let wrapped = NodeScanExec::wrap_struct_batch_for_schema(&output_schema, &input_batch)
+            .expect("expected schema alignment to succeed");
+        assert_eq!(wrapped.num_rows(), 2);
+        assert_eq!(
+            wrapped.schema().field(0).data_type(),
+            &DataType::Struct(output_struct_fields)
+        );
     }
 }

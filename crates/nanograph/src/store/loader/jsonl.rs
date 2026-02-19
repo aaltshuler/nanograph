@@ -2,9 +2,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use arrow_array::builder::{
-    ArrayBuilder, BooleanBuilder, Date32Builder, Date64Builder, Float32Builder, Float64Builder,
-    Int32Builder, Int64Builder, ListBuilder, StringBuilder, UInt32Builder, UInt64Builder,
-    make_builder,
+    ArrayBuilder, BooleanBuilder, Date32Builder, Date64Builder, FixedSizeListBuilder,
+    Float32Builder, Float64Builder, Int32Builder, Int64Builder, ListBuilder, StringBuilder,
+    UInt32Builder, UInt64Builder, make_builder,
 };
 use arrow_array::{
     Array, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int32Array,
@@ -133,10 +133,7 @@ pub(crate) fn load_jsonl_data_with_name_seed(
             .as_any()
             .downcast_ref::<UInt64Array>()
             .ok_or_else(|| {
-                NanoError::Storage(format!(
-                    "node type {} has non-UInt64 id column",
-                    type_name
-                ))
+                NanoError::Storage(format!("node type {} has non-UInt64 id column", type_name))
             })?;
 
         for row in 0..batch.num_rows() {
@@ -187,16 +184,16 @@ pub(crate) fn load_jsonl_data_with_name_seed(
         let to_type = et.to_type.clone();
         let edge_name = et.name.clone();
 
-        let (src_key_prop, dst_key_prop) = match (key_props.get(&from_type), key_props.get(&to_type))
-        {
-            (Some(src), Some(dst)) => (src, dst),
-            _ => {
-                return Err(NanoError::Storage(format!(
-                    "edge '{}' requires @key on source type '{}' and destination type '{}'",
-                    edge_name, from_type, to_type
-                )));
-            }
-        };
+        let (src_key_prop, dst_key_prop) =
+            match (key_props.get(&from_type), key_props.get(&to_type)) {
+                (Some(src), Some(dst)) => (src, dst),
+                _ => {
+                    return Err(NanoError::Storage(format!(
+                        "edge '{}' requires @key on source type '{}' and destination type '{}'",
+                        edge_name, from_type, to_type
+                    )));
+                }
+            };
 
         let from_key_type = storage
             .catalog
@@ -413,6 +410,63 @@ pub(crate) fn json_values_to_array(
                 };
                 for item in items {
                     append_json_to_builder(builder.values(), field.data_type(), item)?;
+                }
+                builder.append(true);
+            }
+            Arc::new(builder.finish())
+        }
+        DataType::FixedSizeList(field, dim) => {
+            if *dim <= 0 {
+                return Err(NanoError::Storage(format!(
+                    "invalid FixedSizeList dimension: {}",
+                    dim
+                )));
+            }
+            if field.data_type() != &DataType::Float32 {
+                return Err(NanoError::Storage(format!(
+                    "unsupported FixedSizeList element type {:?}; expected Float32",
+                    field.data_type()
+                )));
+            }
+
+            let list_len = *dim as usize;
+            let mut builder = FixedSizeListBuilder::with_capacity(
+                Float32Builder::with_capacity(values.len() * list_len),
+                *dim,
+                values.len(),
+            )
+            .with_field(field.clone());
+
+            for value in values {
+                if value.is_null() {
+                    for _ in 0..list_len {
+                        builder.values().append_null();
+                    }
+                    builder.append(false);
+                    continue;
+                }
+                let items = value.as_array().ok_or_else(|| {
+                    NanoError::Storage(format!(
+                        "expected JSON array for FixedSizeList<Float32, {}>, got {}",
+                        dim, value
+                    ))
+                })?;
+                if items.len() != list_len {
+                    return Err(NanoError::Storage(format!(
+                        "FixedSizeList<Float32, {}> length mismatch: got {}",
+                        dim,
+                        items.len()
+                    )));
+                }
+
+                for item in items {
+                    let num = item.as_f64().ok_or_else(|| {
+                        NanoError::Storage(format!(
+                            "expected numeric vector element in FixedSizeList<Float32, {}>, got {}",
+                            dim, item
+                        ))
+                    })?;
+                    builder.values().append_value(num as f32);
                 }
                 builder.append(true);
             }
@@ -811,6 +865,21 @@ edge Knows: Person -> Person
         assert_eq!(first.len(), 2);
         assert_eq!(first.value(0), 1);
         assert_eq!(first.value(1), 2);
+    }
+
+    #[test]
+    fn json_values_to_array_builds_fixed_size_list_vectors() {
+        let values = vec![json!([0.1, 0.2, 0.3]), json!(null), json!([1, 2, 3])];
+        let dt = DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 3);
+        let arr = json_values_to_array(&values, &dt, true).unwrap();
+        let vecs = arr
+            .as_any()
+            .downcast_ref::<arrow_array::FixedSizeListArray>()
+            .unwrap();
+        assert_eq!(vecs.len(), 3);
+        assert!(!vecs.is_null(0));
+        assert!(vecs.is_null(1));
+        assert!(!vecs.is_null(2));
     }
 
     #[test]

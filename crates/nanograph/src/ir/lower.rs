@@ -330,6 +330,27 @@ fn expr_var(expr: &Expr) -> Option<String> {
     match expr {
         Expr::PropAccess { variable, .. } => Some(variable.clone()),
         Expr::Variable(v) => Some(v.clone()),
+        Expr::Nearest {
+            variable, query, ..
+        } => Some(variable.clone()).or_else(|| expr_var(query)),
+        Expr::Search { field, query } => expr_var(field).or_else(|| expr_var(query)),
+        Expr::Fuzzy {
+            field,
+            query,
+            max_edits,
+        } => expr_var(field)
+            .or_else(|| expr_var(query))
+            .or_else(|| max_edits.as_deref().and_then(expr_var)),
+        Expr::MatchText { field, query } => expr_var(field).or_else(|| expr_var(query)),
+        Expr::Bm25 { field, query } => expr_var(field).or_else(|| expr_var(query)),
+        Expr::Rrf {
+            primary,
+            secondary,
+            k,
+        } => expr_var(primary)
+            .or_else(|| expr_var(secondary))
+            .or_else(|| k.as_deref().and_then(expr_var)),
+        Expr::Aggregate { arg, .. } => expr_var(arg),
         _ => None,
     }
 }
@@ -339,6 +360,47 @@ fn lower_expr(expr: &Expr, param_names: &HashSet<String>) -> IRExpr {
         Expr::PropAccess { variable, property } => IRExpr::PropAccess {
             variable: variable.clone(),
             property: property.clone(),
+        },
+        Expr::Nearest {
+            variable,
+            property,
+            query,
+        } => IRExpr::Nearest {
+            variable: variable.clone(),
+            property: property.clone(),
+            query: Box::new(lower_expr(query, param_names)),
+        },
+        Expr::Search { field, query } => IRExpr::Search {
+            field: Box::new(lower_expr(field, param_names)),
+            query: Box::new(lower_expr(query, param_names)),
+        },
+        Expr::Fuzzy {
+            field,
+            query,
+            max_edits,
+        } => IRExpr::Fuzzy {
+            field: Box::new(lower_expr(field, param_names)),
+            query: Box::new(lower_expr(query, param_names)),
+            max_edits: max_edits
+                .as_ref()
+                .map(|expr| Box::new(lower_expr(expr, param_names))),
+        },
+        Expr::MatchText { field, query } => IRExpr::MatchText {
+            field: Box::new(lower_expr(field, param_names)),
+            query: Box::new(lower_expr(query, param_names)),
+        },
+        Expr::Bm25 { field, query } => IRExpr::Bm25 {
+            field: Box::new(lower_expr(field, param_names)),
+            query: Box::new(lower_expr(query, param_names)),
+        },
+        Expr::Rrf {
+            primary,
+            secondary,
+            k,
+        } => IRExpr::Rrf {
+            primary: Box::new(lower_expr(primary, param_names)),
+            secondary: Box::new(lower_expr(secondary, param_names)),
+            k: k.as_ref().map(|expr| Box::new(lower_expr(expr, param_names))),
         },
         Expr::Variable(v) => {
             if param_names.contains(v) {

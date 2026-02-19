@@ -61,6 +61,8 @@ pub struct PropDef {
     pub unique: bool,
     #[serde(default)]
     pub index: bool,
+    #[serde(default)]
+    pub embed_source: Option<String>,
 }
 
 // ── FNV-1a hashing ──────────────────────────────────────────────────────────
@@ -136,6 +138,11 @@ pub fn build_schema_ir(schema: &SchemaFile) -> Result<SchemaIR> {
                             unique: p.annotations.iter().any(|a| a.name == "unique"),
                             index: p.annotations.iter().any(|a| a.name == "key")
                                 || p.annotations.iter().any(|a| a.name == "index"),
+                            embed_source: p
+                                .annotations
+                                .iter()
+                                .find(|a| a.name == "embed")
+                                .and_then(|a| a.value.clone()),
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -191,6 +198,7 @@ pub fn build_schema_ir(schema: &SchemaFile) -> Result<SchemaIR> {
                             key: false,
                             unique: false,
                             index: false,
+                            embed_source: None,
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -244,7 +252,7 @@ pub fn build_catalog_from_ir(ir: &SchemaIR) -> Result<Catalog> {
                         },
                     };
                     properties.insert(prop.name.clone(), prop_type.clone());
-                    if prop.index {
+                    if prop.index && !prop.list && !matches!(scalar, ScalarType::Vector(_)) {
                         indexed_properties.insert(prop.name.clone());
                     }
                     fields.push(Field::new(&prop.name, prop_type.to_arrow(), prop.nullable));
@@ -404,6 +412,8 @@ node Person {
     id: U64 @key
     email: String @unique
     handle: String @index
+    title: String
+    embedding: Vector(3) @embed(title)
     age: I32?
 }
 "#,
@@ -422,20 +432,30 @@ node Person {
             .iter()
             .find(|p| p.name == "handle")
             .unwrap();
+        let embedding_prop = person
+            .properties
+            .iter()
+            .find(|p| p.name == "embedding")
+            .unwrap();
         let age_prop = person.properties.iter().find(|p| p.name == "age").unwrap();
 
         assert!(id_prop.key);
         assert!(!id_prop.unique);
         assert!(id_prop.index);
+        assert!(id_prop.embed_source.is_none());
         assert!(!email_prop.key);
         assert!(email_prop.unique);
         assert!(!email_prop.index);
+        assert!(email_prop.embed_source.is_none());
         assert!(!handle_prop.key);
         assert!(!handle_prop.unique);
         assert!(handle_prop.index);
+        assert!(handle_prop.embed_source.is_none());
+        assert_eq!(embedding_prop.embed_source.as_deref(), Some("title"));
         assert!(!age_prop.key);
         assert!(!age_prop.unique);
         assert!(!age_prop.index);
+        assert!(age_prop.embed_source.is_none());
     }
 
     #[test]
@@ -508,6 +528,7 @@ node Person {
         assert!(!prop.key);
         assert!(!prop.unique);
         assert!(!prop.index);
+        assert!(prop.embed_source.is_none());
     }
 
     #[test]

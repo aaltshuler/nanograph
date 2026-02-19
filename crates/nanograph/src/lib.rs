@@ -1,4 +1,5 @@
 mod catalog;
+mod embedding;
 pub mod error;
 mod ir;
 mod plan;

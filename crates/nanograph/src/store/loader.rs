@@ -7,6 +7,7 @@ use super::database::LoadMode;
 use super::graph::GraphStorage;
 
 mod constraints;
+mod embeddings;
 mod jsonl;
 mod merge;
 
@@ -36,17 +37,18 @@ pub(crate) async fn build_next_storage_for_load(
             "load mode 'merge' requires at least one node @key property in schema".to_string(),
         ));
     }
+    let data_source = embeddings::materialize_embeddings_for_load(db_path, schema_ir, data_source)?;
 
     let mut incoming_storage = GraphStorage::new(existing.catalog.clone());
     match mode {
         LoadMode::Overwrite => {
-            load_jsonl_data(&mut incoming_storage, data_source, &key_props)?;
+            load_jsonl_data(&mut incoming_storage, data_source.as_ref(), &key_props)?;
         }
         LoadMode::Merge => {
             let key_seed = constraints::build_name_seed_for_keyed_load(existing, &key_props)?;
             load_jsonl_data_with_name_seed(
                 &mut incoming_storage,
-                data_source,
+                data_source.as_ref(),
                 &key_props,
                 Some(&key_seed),
             )?;
@@ -55,7 +57,7 @@ pub(crate) async fn build_next_storage_for_load(
             let key_seed = constraints::build_name_seed_for_append(existing, &key_props)?;
             load_jsonl_data_with_name_seed(
                 &mut incoming_storage,
-                data_source,
+                data_source.as_ref(),
                 &key_props,
                 Some(&key_seed),
             )?;

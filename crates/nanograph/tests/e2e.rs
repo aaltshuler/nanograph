@@ -1,7 +1,10 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow_array::{Array, Int32Array, Int64Array, RecordBatch, StringArray, UInt64Array};
+use arrow_array::{
+    Array, FixedSizeListArray, Float32Array, Int32Array, Int64Array, RecordBatch, StringArray,
+    UInt64Array,
+};
 use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use lance_index::DatasetIndexExt;
@@ -13,7 +16,7 @@ use nanograph::schema_ir::SchemaIR;
 use nanograph::store::database::Database;
 use nanograph::store::manifest::GraphManifest;
 use nanograph::store::txlog::read_visible_cdc_entries;
-use nanograph::store::{GraphStorage, scalar_index_name};
+use nanograph::store::{GraphStorage, scalar_index_name, vector_index_name};
 use nanograph::{
     MutationExecResult, ParamMap, build_catalog, execute_mutation, execute_query,
     lower_mutation_query, lower_query,
@@ -47,6 +50,41 @@ node Person {
 fn indexed_test_data() -> &'static str {
     r#"{"type":"Person","data":{"name":"Alice","email":"alice@example.com"}}
 {"type":"Person","data":{"name":"Bob","email":"bob@example.com"}}
+"#
+}
+
+fn vector_test_schema() -> &'static str {
+    r#"
+node Doc {
+    slug: String @key
+    title: String
+    embedding: Vector(4) @index
+}
+"#
+}
+
+fn vector_test_data() -> &'static str {
+    r#"{"type":"Doc","data":{"slug":"a","title":"A","embedding":[1.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"b","title":"B","embedding":[0.0,1.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"c","title":"C","embedding":[-1.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"d","title":"D","embedding":[0.7,0.7,0.0,0.0]}}
+"#
+}
+
+fn vector_filtered_test_schema() -> &'static str {
+    r#"
+node Doc {
+    slug: String @key
+    topic: String
+    embedding: Vector(4) @index
+}
+"#
+}
+
+fn vector_filtered_test_data() -> &'static str {
+    r#"{"type":"Doc","data":{"slug":"a","topic":"x","embedding":[1.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"b","topic":"y","embedding":[0.0,1.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"c","topic":"y","embedding":[-1.0,0.0,0.0,0.0]}}
 "#
 }
 
@@ -444,6 +482,160 @@ query q($email: String) {
 }
 
 #[tokio::test]
+async fn test_nearest_query_on_indexed_vectors() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+
+    let mut db = Database::init(&db_path, vector_test_schema())
+        .await
+        .unwrap();
+    db.load(vector_test_data()).await.unwrap();
+
+    let doc = db.schema_ir.node_types().find(|n| n.name == "Doc").unwrap();
+    let dataset_path = db_path.join("nodes").join(SchemaIR::dir_name(doc.type_id));
+    let dataset = Dataset::open(dataset_path.to_string_lossy().as_ref())
+        .await
+        .unwrap();
+    let index_names: HashSet<String> = dataset
+        .load_indices()
+        .await
+        .unwrap()
+        .iter()
+        .map(|idx| idx.name.clone())
+        .collect();
+    let expected_index = vector_index_name(doc.type_id, "embedding");
+    assert!(index_names.contains(&expected_index));
+
+    let mut params = ParamMap::new();
+    params.insert(
+        "q".to_string(),
+        nanograph::query::ast::Literal::List(vec![
+            nanograph::query::ast::Literal::Float(1.0),
+            nanograph::query::ast::Literal::Float(0.0),
+            nanograph::query::ast::Literal::Float(0.0),
+            nanograph::query::ast::Literal::Float(0.0),
+        ]),
+    );
+
+    let results = run_db_query_test_with_params(
+        r#"
+query q($q: Vector(4)) {
+    match {
+        $d: Doc
+    }
+    return { $d.slug as slug }
+    order { nearest($d.embedding, $q) }
+    limit 2
+}
+"#,
+        &db,
+        &params,
+    )
+    .await;
+
+    let slugs = extract_string_column(&results, "slug");
+    assert_eq!(slugs, vec!["a", "d"]);
+}
+
+#[tokio::test]
+async fn test_vector_projection_on_lance_scan_does_not_panic() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+
+    let mut db = Database::init(&db_path, vector_test_schema())
+        .await
+        .unwrap();
+    db.load(vector_test_data()).await.unwrap();
+
+    let mut params = ParamMap::new();
+    params.insert(
+        "slug".to_string(),
+        nanograph::query::ast::Literal::String("a".to_string()),
+    );
+
+    let results = run_db_query_test_with_params(
+        r#"
+query q($slug: String) {
+    match {
+        $d: Doc { slug: $slug }
+    }
+    return { $d.slug as slug, $d.embedding as embedding }
+    limit 1
+}
+"#,
+        &db,
+        &params,
+    )
+    .await;
+
+    let slugs = extract_string_column(&results, "slug");
+    assert_eq!(slugs, vec!["a"]);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].num_rows(), 1);
+
+    let emb_idx = results[0].schema().index_of("embedding").unwrap();
+    let emb = results[0]
+        .column(emb_idx)
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()
+        .expect("embedding should be a FixedSizeListArray");
+    assert_eq!(emb.len(), 1);
+
+    let first_embedding = emb.value(0);
+    let values = first_embedding
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .expect("embedding values should be Float32");
+    assert_eq!(values.len(), 4);
+    assert_eq!(values.value(0), 1.0);
+}
+
+#[tokio::test]
+async fn test_nearest_filter_prefilter_returns_filtered_result_with_small_limit() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+
+    let mut db = Database::init(&db_path, vector_filtered_test_schema())
+        .await
+        .unwrap();
+    db.load(vector_filtered_test_data()).await.unwrap();
+
+    let mut params = ParamMap::new();
+    params.insert(
+        "topic".to_string(),
+        nanograph::query::ast::Literal::String("y".to_string()),
+    );
+    params.insert(
+        "q".to_string(),
+        nanograph::query::ast::Literal::List(vec![
+            nanograph::query::ast::Literal::Float(1.0),
+            nanograph::query::ast::Literal::Float(0.0),
+            nanograph::query::ast::Literal::Float(0.0),
+            nanograph::query::ast::Literal::Float(0.0),
+        ]),
+    );
+
+    let results = run_db_query_test_with_params(
+        r#"
+query q($topic: String, $q: Vector(4)) {
+    match {
+        $d: Doc { topic: $topic }
+    }
+    return { $d.slug as slug }
+    order { nearest($d.embedding, $q) }
+    limit 1
+}
+"#,
+        &db,
+        &params,
+    )
+    .await;
+
+    let slugs = extract_string_column(&results, "slug");
+    assert_eq!(slugs, vec!["b"]);
+}
+
+#[tokio::test]
 async fn test_orphan_edge_destination_fails_execution() {
     let schema = parse_schema(test_schema()).unwrap();
     let catalog = build_catalog(&schema).unwrap();
@@ -656,7 +848,10 @@ query q() {
 
     let mut pairs = names.into_iter().zip(friends).collect::<Vec<_>>();
     pairs.sort_by(|a, b| a.0.cmp(&b.0));
-    assert_eq!(pairs, vec![("Alice".to_string(), 2), ("Bob".to_string(), 1)]);
+    assert_eq!(
+        pairs,
+        vec![("Alice".to_string(), 2), ("Bob".to_string(), 1)]
+    );
 }
 
 #[tokio::test]

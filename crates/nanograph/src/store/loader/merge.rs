@@ -2,11 +2,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
+use arrow_array::builder::UInt64Builder;
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array,
     Int32Array, Int64Array, ListArray, RecordBatch, StringArray, UInt32Array, UInt64Array,
 };
-use arrow_array::builder::UInt64Builder;
 use arrow_schema::DataType;
 
 use crate::catalog::schema_ir::SchemaIR;
@@ -664,7 +664,9 @@ fn array_value_to_json(array: &ArrayRef, row: usize) -> serde_json::Value {
             .map(|a| {
                 let ms = a.value(row);
                 arrow_array::temporal_conversions::date64_to_datetime(ms)
-                    .map(|dt| serde_json::Value::String(dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()))
+                    .map(|dt| {
+                        serde_json::Value::String(dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+                    })
                     .unwrap_or_else(|| serde_json::Value::Number(ms.into()))
             })
             .unwrap_or(serde_json::Value::Null),

@@ -291,19 +291,21 @@ fn append_jsonl_row<T: Serialize>(path: &Path, row: &T) -> Result<(u64, u64)> {
 
 fn rewrite_jsonl_rows<T: Serialize>(path: &Path, rows: &[T]) -> Result<()> {
     let tmp_path = path.with_extension("tmp");
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&tmp_path)?;
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)?;
 
-    for row in rows {
-        let json = serde_json::to_vec(row)
-            .map_err(|e| NanoError::Manifest(format!("serialize JSONL row: {}", e)))?;
-        file.write_all(&json)?;
-        file.write_all(b"\n")?;
+        for row in rows {
+            let json = serde_json::to_vec(row)
+                .map_err(|e| NanoError::Manifest(format!("serialize JSONL row: {}", e)))?;
+            file.write_all(&json)?;
+            file.write_all(b"\n")?;
+        }
+        file.sync_all()?;
     }
-    file.sync_all()?;
     std::fs::rename(&tmp_path, path)?;
     Ok(())
 }

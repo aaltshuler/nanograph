@@ -59,9 +59,11 @@ impl GraphManifest {
 
         std::fs::write(&tmp_path, json.as_bytes())?;
 
-        // fsync the file
-        let file = std::fs::File::open(&tmp_path)?;
-        file.sync_all()?;
+        // fsync the file, then drop the handle before rename (Windows requires this)
+        {
+            let file = std::fs::File::open(&tmp_path)?;
+            file.sync_all()?;
+        }
 
         std::fs::rename(&tmp_path, &path)?;
         Ok(())

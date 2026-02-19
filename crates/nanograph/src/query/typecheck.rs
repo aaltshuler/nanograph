@@ -72,6 +72,20 @@ pub fn typecheck_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeConte
     typecheck_read_query(catalog, query)
 }
 
+fn parse_declared_param_types(params: &[Param]) -> Result<HashMap<String, PropType>> {
+    let mut out = HashMap::with_capacity(params.len());
+    for p in params {
+        let scalar = ScalarType::from_str_name(&p.type_name).ok_or_else(|| {
+            NanoError::Type(format!(
+                "unknown parameter type `{}` for `${}`",
+                p.type_name, p.name
+            ))
+        })?;
+        out.insert(p.name.clone(), PropType::scalar(scalar, p.nullable));
+    }
+    Ok(out)
+}
+
 fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeContext> {
     let mut ctx = TypeContext {
         bindings: HashMap::new(),
@@ -79,14 +93,7 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeCont
         traversals: Vec::new(),
     };
 
-    let params: HashMap<String, PropType> = query
-        .params
-        .iter()
-        .filter_map(|p| {
-            ScalarType::from_str_name(&p.type_name)
-                .map(|s| (p.name.clone(), PropType::scalar(s, p.nullable)))
-        })
-        .collect();
+    let params = parse_declared_param_types(&query.params)?;
 
     // Typecheck match clauses
     typecheck_clauses(catalog, &query.match_clause, &mut ctx, &params, false)?;
@@ -104,17 +111,41 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeCont
         resolve_expr_type(catalog, &ord.expr, &ctx, &params)?;
     }
 
+    let has_nearest = query
+        .order_clause
+        .iter()
+        .any(|ord| expr_contains_nearest(&ord.expr));
+    let has_rrf = query
+        .order_clause
+        .iter()
+        .any(|ord| expr_contains_rrf(&ord.expr));
+    if has_rrf && query.limit.is_none() {
+        return Err(NanoError::Type(
+            "T21: rrf ordering requires a limit clause".to_string(),
+        ));
+    }
+    if has_nearest && query.limit.is_none() {
+        return Err(NanoError::Type(
+            "T17: nearest ordering requires a limit clause".to_string(),
+        ));
+    }
+    if has_nearest
+        && query
+            .order_clause
+            .iter()
+            .any(|ord| matches!(ord.expr, Expr::AliasRef(_)))
+    {
+        return Err(NanoError::Type(
+            "T18: alias-based ordering is not supported together with nearest in phase 1"
+                .to_string(),
+        ));
+    }
+
     Ok(ctx)
 }
 
 fn typecheck_mutation(catalog: &Catalog, mutation: &Mutation, params: &[Param]) -> Result<String> {
-    let param_types: HashMap<String, PropType> = params
-        .iter()
-        .filter_map(|p| {
-            ScalarType::from_str_name(&p.type_name)
-                .map(|s| (p.name.clone(), PropType::scalar(s, p.nullable)))
-        })
-        .collect();
+    let param_types = parse_declared_param_types(params)?;
 
     match mutation {
         Mutation::Insert(insert) => {
@@ -650,6 +681,13 @@ fn typecheck_filter(
                     "T7: list comparisons in filters are not supported".to_string(),
                 ));
             }
+            if matches!(l.scalar, ScalarType::Vector(_))
+                || matches!(r.scalar, ScalarType::Vector(_))
+            {
+                return Err(NanoError::Type(
+                    "T7: vector comparisons in filters are not supported".to_string(),
+                ));
+            }
             if !types_compatible(l, r) {
                 return Err(NanoError::Type(format!(
                     "T7: cannot compare {} with {}",
@@ -689,6 +727,360 @@ fn resolve_expr_type(
             })?;
 
             Ok(ResolvedType::Scalar(prop.clone()))
+        }
+        Expr::Nearest {
+            variable,
+            property,
+            query,
+        } => {
+            let node_binding = ctx.bindings.get(variable).ok_or_else(|| {
+                NanoError::Type(format!("T15: variable `${}` is not bound", variable))
+            })?;
+            let node_type = catalog
+                .node_types
+                .get(&node_binding.type_name)
+                .ok_or_else(|| {
+                    NanoError::Type(format!(
+                        "T15: type `{}` not found in catalog",
+                        node_binding.type_name
+                    ))
+                })?;
+            let prop_type = node_type.properties.get(property).ok_or_else(|| {
+                NanoError::Type(format!(
+                    "T15: type `{}` has no property `{}`",
+                    node_binding.type_name, property
+                ))
+            })?;
+            let vector_dim = match prop_type.scalar {
+                ScalarType::Vector(dim) => dim,
+                _ => {
+                    return Err(NanoError::Type(format!(
+                        "T15: nearest requires a Vector property, got {}.{}: {}",
+                        node_binding.type_name,
+                        property,
+                        prop_type.display_name()
+                    )));
+                }
+            };
+            if prop_type.list {
+                return Err(NanoError::Type(
+                    "T15: nearest does not support list-wrapped vectors".to_string(),
+                ));
+            }
+
+            if let Expr::Literal(lit) = query.as_ref() {
+                if let Some(dim) = numeric_vector_literal_dim(lit) {
+                    if dim != vector_dim {
+                        return Err(NanoError::Type(format!(
+                            "T15: nearest vector dimension mismatch: property is Vector({}), query literal has {} elements",
+                            vector_dim, dim
+                        )));
+                    }
+                    return Ok(ResolvedType::Scalar(PropType::scalar(
+                        ScalarType::F64,
+                        false,
+                    )));
+                }
+            }
+
+            let query_type = resolve_expr_type(catalog, query, ctx, params)?;
+            match query_type {
+                ResolvedType::Scalar(s) if matches!(s.scalar, ScalarType::Vector(_)) && !s.list => {
+                    let qdim = match s.scalar {
+                        ScalarType::Vector(dim) => dim,
+                        _ => unreachable!(),
+                    };
+                    if qdim != vector_dim {
+                        return Err(NanoError::Type(format!(
+                            "T15: nearest vector dimension mismatch: property is Vector({}), query is Vector({})",
+                            vector_dim, qdim
+                        )));
+                    }
+                }
+                ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {
+                    // query-time string embedding is supported in phase 3
+                }
+                ResolvedType::Scalar(s) => {
+                    return Err(NanoError::Type(format!(
+                        "T15: nearest query must be Vector({}) or String, got {}",
+                        vector_dim,
+                        s.display_name()
+                    )));
+                }
+                _ => {
+                    return Err(NanoError::Type(
+                        "T15: nearest query must be a scalar expression".to_string(),
+                    ));
+                }
+            }
+
+            Ok(ResolvedType::Scalar(PropType::scalar(
+                ScalarType::F64,
+                false,
+            )))
+        }
+        Expr::Search { field, query } => {
+            let field_type = resolve_expr_type(catalog, field, ctx, params)?;
+            match field_type {
+                ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
+                ResolvedType::Scalar(s) => {
+                    return Err(NanoError::Type(format!(
+                        "T19: search field must be String, got {}",
+                        s.display_name()
+                    )));
+                }
+                _ => {
+                    return Err(NanoError::Type(
+                        "T19: search field must be a scalar String expression".to_string(),
+                    ));
+                }
+            }
+
+            let query_type = resolve_expr_type(catalog, query, ctx, params)?;
+            match query_type {
+                ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
+                ResolvedType::Scalar(s) => {
+                    return Err(NanoError::Type(format!(
+                        "T19: search query must be String, got {}",
+                        s.display_name()
+                    )));
+                }
+                _ => {
+                    return Err(NanoError::Type(
+                        "T19: search query must be a scalar String expression".to_string(),
+                    ));
+                }
+            }
+
+            Ok(ResolvedType::Scalar(PropType::scalar(
+                ScalarType::Bool,
+                false,
+            )))
+        }
+        Expr::Fuzzy {
+            field,
+            query,
+            max_edits,
+        } => {
+            let field_type = resolve_expr_type(catalog, field, ctx, params)?;
+            match field_type {
+                ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
+                ResolvedType::Scalar(s) => {
+                    return Err(NanoError::Type(format!(
+                        "T19: fuzzy field must be String, got {}",
+                        s.display_name()
+                    )));
+                }
+                _ => {
+                    return Err(NanoError::Type(
+                        "T19: fuzzy field must be a scalar String expression".to_string(),
+                    ));
+                }
+            }
+
+            let query_type = resolve_expr_type(catalog, query, ctx, params)?;
+            match query_type {
+                ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
+                ResolvedType::Scalar(s) => {
+                    return Err(NanoError::Type(format!(
+                        "T19: fuzzy query must be String, got {}",
+                        s.display_name()
+                    )));
+                }
+                _ => {
+                    return Err(NanoError::Type(
+                        "T19: fuzzy query must be a scalar String expression".to_string(),
+                    ));
+                }
+            }
+
+            if let Some(max_edits_expr) = max_edits {
+                let max_edits_type = resolve_expr_type(catalog, max_edits_expr, ctx, params)?;
+                match max_edits_type {
+                    ResolvedType::Scalar(s)
+                        if !s.list
+                            && matches!(
+                                s.scalar,
+                                ScalarType::I32
+                                    | ScalarType::I64
+                                    | ScalarType::U32
+                                    | ScalarType::U64
+                            ) => {}
+                    ResolvedType::Scalar(s) => {
+                        return Err(NanoError::Type(format!(
+                            "T19: fuzzy max_edits must be an integer scalar, got {}",
+                            s.display_name()
+                        )));
+                    }
+                    _ => {
+                        return Err(NanoError::Type(
+                            "T19: fuzzy max_edits must be an integer scalar expression".to_string(),
+                        ));
+                    }
+                }
+            }
+
+            Ok(ResolvedType::Scalar(PropType::scalar(
+                ScalarType::Bool,
+                false,
+            )))
+        }
+        Expr::MatchText { field, query } => {
+            let field_type = resolve_expr_type(catalog, field, ctx, params)?;
+            match field_type {
+                ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
+                ResolvedType::Scalar(s) => {
+                    return Err(NanoError::Type(format!(
+                        "T20: match_text field must be String, got {}",
+                        s.display_name()
+                    )));
+                }
+                _ => {
+                    return Err(NanoError::Type(
+                        "T20: match_text field must be a scalar String expression".to_string(),
+                    ));
+                }
+            }
+
+            let query_type = resolve_expr_type(catalog, query, ctx, params)?;
+            match query_type {
+                ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
+                ResolvedType::Scalar(s) => {
+                    return Err(NanoError::Type(format!(
+                        "T20: match_text query must be String, got {}",
+                        s.display_name()
+                    )));
+                }
+                _ => {
+                    return Err(NanoError::Type(
+                        "T20: match_text query must be a scalar String expression".to_string(),
+                    ));
+                }
+            }
+
+            Ok(ResolvedType::Scalar(PropType::scalar(
+                ScalarType::Bool,
+                false,
+            )))
+        }
+        Expr::Bm25 { field, query } => {
+            let field_type = resolve_expr_type(catalog, field, ctx, params)?;
+            match field_type {
+                ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
+                ResolvedType::Scalar(s) => {
+                    return Err(NanoError::Type(format!(
+                        "T20: bm25 field must be String, got {}",
+                        s.display_name()
+                    )));
+                }
+                _ => {
+                    return Err(NanoError::Type(
+                        "T20: bm25 field must be a scalar String expression".to_string(),
+                    ));
+                }
+            }
+
+            let query_type = resolve_expr_type(catalog, query, ctx, params)?;
+            match query_type {
+                ResolvedType::Scalar(s) if s.scalar == ScalarType::String && !s.list => {}
+                ResolvedType::Scalar(s) => {
+                    return Err(NanoError::Type(format!(
+                        "T20: bm25 query must be String, got {}",
+                        s.display_name()
+                    )));
+                }
+                _ => {
+                    return Err(NanoError::Type(
+                        "T20: bm25 query must be a scalar String expression".to_string(),
+                    ));
+                }
+            }
+
+            Ok(ResolvedType::Scalar(PropType::scalar(
+                ScalarType::F64,
+                false,
+            )))
+        }
+        Expr::Rrf {
+            primary,
+            secondary,
+            k,
+        } => {
+            if !matches!(
+                primary.as_ref(),
+                Expr::Nearest { .. } | Expr::Bm25 { .. }
+            ) {
+                return Err(NanoError::Type(
+                    "T21: rrf primary expression must be nearest(...) or bm25(...)".to_string(),
+                ));
+            }
+            if !matches!(
+                secondary.as_ref(),
+                Expr::Nearest { .. } | Expr::Bm25 { .. }
+            ) {
+                return Err(NanoError::Type(
+                    "T21: rrf secondary expression must be nearest(...) or bm25(...)".to_string(),
+                ));
+            }
+
+            let primary_ty = resolve_expr_type(catalog, primary, ctx, params)?;
+            let secondary_ty = resolve_expr_type(catalog, secondary, ctx, params)?;
+
+            for ty in [primary_ty, secondary_ty] {
+                match ty {
+                    ResolvedType::Scalar(s) if s.scalar == ScalarType::F64 && !s.list => {}
+                    ResolvedType::Scalar(s) => {
+                        return Err(NanoError::Type(format!(
+                            "T21: rrf rank expressions must evaluate to F64, got {}",
+                            s.display_name()
+                        )));
+                    }
+                    _ => {
+                        return Err(NanoError::Type(
+                            "T21: rrf rank expressions must be scalar numeric expressions"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+
+            if let Some(k_expr) = k {
+                let k_type = resolve_expr_type(catalog, k_expr, ctx, params)?;
+                match k_type {
+                    ResolvedType::Scalar(s)
+                        if !s.list
+                            && matches!(
+                                s.scalar,
+                                ScalarType::I32
+                                    | ScalarType::I64
+                                    | ScalarType::U32
+                                    | ScalarType::U64
+                            ) => {}
+                    ResolvedType::Scalar(s) => {
+                        return Err(NanoError::Type(format!(
+                            "T21: rrf k must be an integer scalar, got {}",
+                            s.display_name()
+                        )));
+                    }
+                    _ => {
+                        return Err(NanoError::Type(
+                            "T21: rrf k must be an integer scalar expression".to_string(),
+                        ));
+                    }
+                }
+                if let Expr::Literal(Literal::Integer(v)) = k_expr.as_ref() {
+                    if *v <= 0 {
+                        return Err(NanoError::Type(
+                            "T21: rrf k must be greater than 0".to_string(),
+                        ));
+                    }
+                }
+            }
+
+            Ok(ResolvedType::Scalar(PropType::scalar(
+                ScalarType::F64,
+                false,
+            )))
         }
         Expr::Variable(name) => {
             // Could be a query parameter or a bound variable
@@ -769,6 +1161,20 @@ fn literal_type(lit: &Literal) -> Result<PropType> {
 }
 
 fn check_literal_type(lit: &Literal, expected: &PropType, prop_name: &str) -> Result<()> {
+    if !expected.list {
+        if let ScalarType::Vector(expected_dim) = expected.scalar {
+            if let Some(actual_dim) = numeric_vector_literal_dim(lit) {
+                if actual_dim == expected_dim {
+                    return Ok(());
+                }
+                return Err(NanoError::Type(format!(
+                    "T3: property `{}` has type Vector({}) but got vector literal with {} elements",
+                    prop_name, expected_dim, actual_dim
+                )));
+            }
+        }
+    }
+
     let lit_type = literal_type(lit)?;
     if !types_compatible(&lit_type, expected) {
         return Err(NanoError::Type(format!(
@@ -827,11 +1233,114 @@ fn types_compatible(a: &PropType, b: &PropType) -> bool {
     false
 }
 
+fn numeric_vector_literal_dim(lit: &Literal) -> Option<u32> {
+    let items = match lit {
+        Literal::List(items) => items,
+        _ => return None,
+    };
+    if items.is_empty() {
+        return None;
+    }
+    if items
+        .iter()
+        .all(|v| matches!(v, Literal::Integer(_) | Literal::Float(_)))
+    {
+        Some(items.len() as u32)
+    } else {
+        None
+    }
+}
+
 fn expr_references_any(expr: &Expr, vars: &[String]) -> bool {
     match expr {
         Expr::PropAccess { variable, .. } => vars.contains(variable),
+        Expr::Nearest {
+            variable, query, ..
+        } => vars.contains(variable) || expr_references_any(query, vars),
+        Expr::Search { field, query } => {
+            expr_references_any(field, vars) || expr_references_any(query, vars)
+        }
+        Expr::Fuzzy {
+            field,
+            query,
+            max_edits,
+        } => {
+            expr_references_any(field, vars)
+                || expr_references_any(query, vars)
+                || max_edits
+                    .as_deref()
+                    .is_some_and(|m| expr_references_any(m, vars))
+        }
+        Expr::MatchText { field, query } => {
+            expr_references_any(field, vars) || expr_references_any(query, vars)
+        }
+        Expr::Bm25 { field, query } => {
+            expr_references_any(field, vars) || expr_references_any(query, vars)
+        }
+        Expr::Rrf {
+            primary,
+            secondary,
+            k,
+        } => {
+            expr_references_any(primary, vars)
+                || expr_references_any(secondary, vars)
+                || k.as_deref().is_some_and(|expr| expr_references_any(expr, vars))
+        }
         Expr::Variable(v) => vars.contains(v),
         Expr::Aggregate { arg, .. } => expr_references_any(arg, vars),
+        _ => false,
+    }
+}
+
+fn expr_contains_nearest(expr: &Expr) -> bool {
+    match expr {
+        Expr::Nearest { .. } => true,
+        Expr::Aggregate { arg, .. } => expr_contains_nearest(arg),
+        Expr::Search { field, query }
+        | Expr::MatchText { field, query }
+        | Expr::Bm25 { field, query } => {
+            expr_contains_nearest(field) || expr_contains_nearest(query)
+        }
+        Expr::Fuzzy {
+            field,
+            query,
+            max_edits,
+        } => {
+            expr_contains_nearest(field)
+                || expr_contains_nearest(query)
+                || max_edits
+                    .as_deref()
+                    .is_some_and(expr_contains_nearest)
+        }
+        Expr::Rrf {
+            primary,
+            secondary,
+            k,
+        } => {
+            expr_contains_nearest(primary)
+                || expr_contains_nearest(secondary)
+                || k.as_deref().is_some_and(expr_contains_nearest)
+        }
+        _ => false,
+    }
+}
+
+fn expr_contains_rrf(expr: &Expr) -> bool {
+    match expr {
+        Expr::Rrf { .. } => true,
+        Expr::Aggregate { arg, .. } => expr_contains_rrf(arg),
+        Expr::Search { field, query }
+        | Expr::MatchText { field, query }
+        | Expr::Bm25 { field, query } => expr_contains_rrf(field) || expr_contains_rrf(query),
+        Expr::Fuzzy {
+            field,
+            query,
+            max_edits,
+        } => {
+            expr_contains_rrf(field)
+                || expr_contains_rrf(query)
+                || max_edits.as_deref().is_some_and(expr_contains_rrf)
+        }
         _ => false,
     }
 }
@@ -858,6 +1367,19 @@ edge Knows: Person -> Person {
 }
 edge WorksAt: Person -> Company {
     title: String?
+}
+"#,
+        )
+        .unwrap();
+        build_catalog(&schema).unwrap()
+    }
+
+    fn setup_vector() -> Catalog {
+        let schema = parse_schema(
+            r#"
+node Doc {
+    id_str: String
+    embedding: Vector(3)
 }
 "#,
         )
@@ -1003,6 +1525,254 @@ query q() {
         .unwrap();
         let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
         assert!(err.to_string().contains("T7"));
+    }
+
+    #[test]
+    fn test_nearest_requires_limit() {
+        let catalog = setup_vector();
+        let qf = parse_query(
+            r#"
+query q($q: Vector(3)) {
+    match { $d: Doc }
+    return { $d.id_str }
+    order { nearest($d.embedding, $q) }
+}
+"#,
+        )
+        .unwrap();
+        let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+        assert!(err.to_string().contains("T17"));
+    }
+
+    #[test]
+    fn test_nearest_vector_dim_mismatch() {
+        let catalog = setup_vector();
+        let qf = parse_query(
+            r#"
+query q($q: Vector(2)) {
+    match { $d: Doc }
+    return { $d.id_str }
+    order { nearest($d.embedding, $q) }
+    limit 3
+}
+"#,
+        )
+        .unwrap();
+        let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+        assert!(err.to_string().contains("T15"));
+    }
+
+    #[test]
+    fn test_nearest_vector_param_ok() {
+        let catalog = setup_vector();
+        let qf = parse_query(
+            r#"
+query q($q: Vector(3)) {
+    match { $d: Doc }
+    return { $d.id_str }
+    order { nearest($d.embedding, $q) }
+    limit 3
+}
+"#,
+        )
+        .unwrap();
+        let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        assert!(ctx.bindings.contains_key("d"));
+    }
+
+    #[test]
+    fn test_nearest_string_param_ok() {
+        let catalog = setup_vector();
+        let qf = parse_query(
+            r#"
+query q($q: String) {
+    match { $d: Doc }
+    return { $d.id_str }
+    order { nearest($d.embedding, $q) }
+    limit 3
+}
+"#,
+        )
+        .unwrap();
+        let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        assert!(ctx.bindings.contains_key("d"));
+    }
+
+    #[test]
+    fn test_search_string_param_ok() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q($q: String) {
+    match {
+        $p: Person
+        search($p.name, $q)
+    }
+    return { $p.name }
+}
+"#,
+        )
+        .unwrap();
+        let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        assert!(ctx.bindings.contains_key("p"));
+    }
+
+    #[test]
+    fn test_fuzzy_max_edits_param_ok() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q($q: String, $m: I64) {
+    match {
+        $p: Person
+        fuzzy($p.name, $q, $m)
+    }
+    return { $p.name }
+}
+"#,
+        )
+        .unwrap();
+        let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        assert!(ctx.bindings.contains_key("p"));
+    }
+
+    #[test]
+    fn test_fuzzy_rejects_non_integer_max_edits() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q($q: String, $m: F64) {
+    match {
+        $p: Person
+        fuzzy($p.name, $q, $m)
+    }
+    return { $p.name }
+}
+"#,
+        )
+        .unwrap();
+        let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+        assert!(err.to_string().contains("T19"));
+    }
+
+    #[test]
+    fn test_match_text_string_param_ok() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q($q: String) {
+    match {
+        $p: Person
+        match_text($p.name, $q)
+    }
+    return { $p.name }
+}
+"#,
+        )
+        .unwrap();
+        let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        assert!(ctx.bindings.contains_key("p"));
+    }
+
+    #[test]
+    fn test_bm25_string_param_ok() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q($q: String) {
+    match { $p: Person }
+    return { $p.name, bm25($p.name, $q) as score }
+    order { bm25($p.name, $q) desc }
+}
+"#,
+        )
+        .unwrap();
+        let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        assert!(ctx.bindings.contains_key("p"));
+    }
+
+    #[test]
+    fn test_bm25_rejects_non_string_query() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query q($q: I64) {
+    match { $p: Person }
+    return { bm25($p.name, $q) as score }
+}
+"#,
+        )
+        .unwrap();
+        let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+        assert!(err.to_string().contains("T20"));
+    }
+
+    #[test]
+    fn test_rrf_requires_limit_in_order() {
+        let catalog = setup_vector();
+        let qf = parse_query(
+            r#"
+query q($vq: Vector(3), $tq: String) {
+    match { $d: Doc }
+    return { $d.id_str }
+    order { rrf(nearest($d.embedding, $vq), bm25($d.id_str, $tq), 60) desc }
+}
+"#,
+        )
+        .unwrap();
+        let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+        assert!(err.to_string().contains("T21"));
+    }
+
+    #[test]
+    fn test_rrf_ordering_ok_with_limit() {
+        let catalog = setup_vector();
+        let qf = parse_query(
+            r#"
+query q($vq: Vector(3), $tq: String) {
+    match { $d: Doc }
+    return { $d.id_str }
+    order { rrf(nearest($d.embedding, $vq), bm25($d.id_str, $tq), 60) desc }
+    limit 5
+}
+"#,
+        )
+        .unwrap();
+        let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        assert!(ctx.bindings.contains_key("d"));
+    }
+
+    #[test]
+    fn test_rrf_rejects_non_rank_expression_argument() {
+        let parse = parse_query(
+            r#"
+query q($q: String) {
+    match { $d: Doc }
+    return { $d.id_str }
+    order { rrf(bm25($d.id_str, $q), search($d.id_str, $q), 60) desc }
+    limit 5
+}
+"#,
+        );
+        assert!(parse.is_err());
+    }
+
+    #[test]
+    fn test_rrf_rejects_non_positive_k_literal() {
+        let catalog = setup_vector();
+        let qf = parse_query(
+            r#"
+query q($vq: Vector(3), $tq: String) {
+    match { $d: Doc }
+    return { $d.id_str }
+    order { rrf(nearest($d.embedding, $vq), bm25($d.id_str, $tq), 0) desc }
+    limit 5
+}
+"#,
+        )
+        .unwrap();
+        let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+        assert!(err.to_string().contains("T21"));
     }
 
     #[test]

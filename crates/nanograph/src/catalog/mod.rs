@@ -7,7 +7,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
 use crate::error::{NanoError, Result};
 use crate::schema::ast::{SchemaDecl, SchemaFile};
-use crate::types::PropType;
+use crate::types::{PropType, ScalarType};
 
 #[derive(Debug, Clone)]
 pub struct Catalog {
@@ -65,10 +65,13 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
             let mut indexed_properties = HashSet::new();
             for prop in &node.properties {
                 properties.insert(prop.name.clone(), prop.prop_type.clone());
-                if prop
-                    .annotations
-                    .iter()
-                    .any(|a| a.name == "key" || a.name == "index")
+                let scalar_index_eligible =
+                    !prop.prop_type.list && !matches!(prop.prop_type.scalar, ScalarType::Vector(_));
+                if scalar_index_eligible
+                    && prop
+                        .annotations
+                        .iter()
+                        .any(|a| a.name == "key" || a.name == "index")
                 {
                     indexed_properties.insert(prop.name.clone());
                 }

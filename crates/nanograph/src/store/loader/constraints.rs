@@ -138,18 +138,12 @@ pub(crate) fn build_name_seed_for_keyed_load(
             .as_any()
             .downcast_ref::<UInt64Array>()
             .ok_or_else(|| {
-                NanoError::Storage(format!(
-                    "node type {} has non-UInt64 id column",
-                    type_name
-                ))
+                NanoError::Storage(format!("node type {} has non-UInt64 id column", type_name))
             })?;
 
         for row in 0..batch.num_rows() {
             let key = key_value_string(&key_arr, row, key_prop)?;
-            seed.insert(
-                (type_name.clone(), key),
-                id_arr.value(row),
-            );
+            seed.insert((type_name.clone(), key), id_arr.value(row));
         }
     }
 
