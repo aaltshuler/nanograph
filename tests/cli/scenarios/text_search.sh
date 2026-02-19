@@ -100,7 +100,7 @@ KEYWORD_TOP=$(json_field "$KEYWORD_RESULTS" "signal_slug")
 assert_str_eq "$KEYWORD_TOP" "sig-billing-delay" "search(field, query) returns expected signal"
 
 info "Validating match_text lexical search..."
-MATCH_TEXT_RESULTS=$(run_jsonl match_text_signals --param "q=billing missing")
+MATCH_TEXT_RESULTS=$(run_jsonl match_text_signals --param "q=missing invoice")
 MATCH_TEXT_TOP=$(json_field "$MATCH_TEXT_RESULTS" "signal_slug")
 assert_str_eq "$MATCH_TEXT_TOP" "sig-billing-delay" "match_text(field, query) returns expected signal"
 
@@ -113,6 +113,8 @@ info "Validating bm25 relevance ranking..."
 BM25_RESULTS=$(run_jsonl bm25_signals --param "q=billing missing invoice")
 BM25_TOP=$(json_field "$BM25_RESULTS" "signal_slug")
 assert_str_eq "$BM25_TOP" "sig-billing-delay" "bm25(field, query) ranks expected signal first"
+BM25_COUNT=$(run_query_count "$DB" "$QUERY_FILE" bm25_signals --param "q=billing missing invoice")
+assert_int_ge "$BM25_COUNT" 2 "bm25(field, query) returns multiple ranked rows"
 
 info "Validating strict fuzzy threshold..."
 STRICT_COUNT=$(run_query_count "$DB" "$QUERY_FILE" fuzzy_signals_strict --param "q=reconciliaton delay" --param "m=0")

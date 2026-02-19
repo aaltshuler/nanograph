@@ -132,9 +132,27 @@ fn parse_param(pair: pest::iterators::Pair<Rule>) -> Result<Param> {
     let var = inner.next().unwrap().as_str();
     let name = var.strip_prefix('$').unwrap_or(var).to_string();
     let type_ref = inner.next().unwrap();
-    let type_str = type_ref.as_str();
-    let nullable = type_str.ends_with('?');
-    let base = type_ref.into_inner().next().unwrap().as_str().to_string();
+    let nullable = type_ref.as_str().trim_end().ends_with('?');
+    let mut type_inner = type_ref.into_inner();
+    let core = type_inner
+        .next()
+        .ok_or_else(|| NanoError::Parse("parameter type is missing".to_string()))?;
+    let base = match core.as_rule() {
+        Rule::base_type => core.as_str().to_string(),
+        Rule::vector_type => {
+            let vector = core
+                .into_inner()
+                .next()
+                .ok_or_else(|| NanoError::Parse("Vector type missing dimension".to_string()))?;
+            format!("Vector({})", vector.as_str().trim())
+        }
+        other => {
+            return Err(NanoError::Parse(format!(
+                "unexpected param type rule: {:?}",
+                other
+            )));
+        }
+    };
 
     Ok(Param {
         name,
@@ -615,11 +633,10 @@ fn parse_literal(pair: pest::iterators::Pair<Rule>) -> Result<Literal> {
 }
 
 fn parse_string_lit(raw: &str) -> String {
-    if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
-        raw[1..raw.len() - 1].to_string()
-    } else {
-        raw.to_string()
-    }
+    raw.strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .unwrap_or(raw)
+        .to_string()
 }
 
 fn parse_projection(pair: pest::iterators::Pair<Rule>) -> Result<Projection> {
@@ -1137,6 +1154,22 @@ query similar($q: Vector(3)) {
     }
 
     #[test]
+    fn test_parse_nearest_with_spaced_vector_param_type() {
+        let input = r#"
+query similar($q: Vector( 3 ) ?) {
+    match { $d: Doc }
+    return { $d.id }
+    order { nearest($d.embedding, $q) }
+    limit 5
+}
+"#;
+        let qf = parse_query(input).unwrap();
+        let q = &qf.queries[0];
+        assert_eq!(q.params[0].type_name, "Vector(3)");
+        assert!(q.params[0].nullable);
+    }
+
+    #[test]
     fn test_parse_nearest_rejects_direction_modifier() {
         let input = r#"
 query similar($q: Vector(3)) {
@@ -1305,7 +1338,10 @@ query q($vq: Vector(3), $tq: String) {
             } => {
                 assert!(matches!(primary.as_ref(), Expr::Nearest { .. }));
                 assert!(matches!(secondary.as_ref(), Expr::Bm25 { .. }));
-                assert!(matches!(k.as_deref(), Some(Expr::Literal(Literal::Integer(60)))));
+                assert!(matches!(
+                    k.as_deref(),
+                    Some(Expr::Literal(Literal::Integer(60)))
+                ));
             }
             other => panic!("expected rrf expression, got {:?}", other),
         }

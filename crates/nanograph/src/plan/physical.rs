@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array,
     Int32Array, Int64Array, ListArray, RecordBatch, StringArray, StructArray, UInt32Array,
@@ -406,7 +406,7 @@ fn collect_bounded_neighbors(
     }
 
     let mut frontier = vec![src_id];
-    let mut emitted = std::collections::HashSet::new();
+    let mut emitted = AHashSet::new();
     let mut out = Vec::new();
 
     for depth in 1..=max_hops {
@@ -415,7 +415,7 @@ fn collect_bounded_neighbors(
         }
 
         let mut next = Vec::new();
-        let mut next_seen = std::collections::HashSet::new();
+        let mut next_seen = AHashSet::new();
         for node in &frontier {
             for &neighbor in csr.neighbors(*node) {
                 if next_seen.insert(neighbor) {
@@ -443,7 +443,7 @@ fn collect_bounded_neighbors(
 
 fn collect_unbounded_neighbors(csr: &CsrIndex, src_id: u64, min_hops: u32) -> Vec<u64> {
     let mut frontier = vec![src_id];
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = AHashSet::new();
     let mut out = Vec::new();
     let mut depth = 0u32;
 

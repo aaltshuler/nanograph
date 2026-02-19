@@ -330,9 +330,7 @@ fn expr_var(expr: &Expr) -> Option<String> {
     match expr {
         Expr::PropAccess { variable, .. } => Some(variable.clone()),
         Expr::Variable(v) => Some(v.clone()),
-        Expr::Nearest {
-            variable, query, ..
-        } => Some(variable.clone()).or_else(|| expr_var(query)),
+        Expr::Nearest { variable, .. } => Some(variable.clone()),
         Expr::Search { field, query } => expr_var(field).or_else(|| expr_var(query)),
         Expr::Fuzzy {
             field,
@@ -400,7 +398,8 @@ fn lower_expr(expr: &Expr, param_names: &HashSet<String>) -> IRExpr {
         } => IRExpr::Rrf {
             primary: Box::new(lower_expr(primary, param_names)),
             secondary: Box::new(lower_expr(secondary, param_names)),
-            k: k.as_ref().map(|expr| Box::new(lower_expr(expr, param_names))),
+            k: k.as_ref()
+                .map(|expr| Box::new(lower_expr(expr, param_names))),
         },
         Expr::Variable(v) => {
             if param_names.contains(v) {
@@ -493,7 +492,7 @@ query q() {
         let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
 
         assert_eq!(ir.pipeline.len(), 2); // NodeScan + AntiJoin
-        matches!(&ir.pipeline[1], IROp::AntiJoin { .. });
+        assert!(matches!(&ir.pipeline[1], IROp::AntiJoin { .. }));
     }
 
     #[test]

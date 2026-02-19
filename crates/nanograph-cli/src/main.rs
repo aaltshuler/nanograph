@@ -556,6 +556,7 @@ fn build_describe_payload(
                     "key": prop.key,
                     "unique": prop.unique,
                     "index": prop.index,
+                    "embed_source": prop.embed_source,
                 })
             })
             .collect::<Vec<_>>();
@@ -662,15 +663,18 @@ fn print_describe_table(payload: &serde_json::Value) {
             );
             if let Some(props) = node["properties"].as_array() {
                 for prop in props {
-                    let mut anns = Vec::new();
+                    let mut anns: Vec<String> = Vec::new();
                     if prop["key"].as_bool().unwrap_or(false) {
-                        anns.push("@key");
+                        anns.push("@key".to_string());
                     }
                     if prop["unique"].as_bool().unwrap_or(false) {
-                        anns.push("@unique");
+                        anns.push("@unique".to_string());
                     }
                     if prop["index"].as_bool().unwrap_or(false) {
-                        anns.push("@index");
+                        anns.push("@index".to_string());
+                    }
+                    if let Some(source) = prop["embed_source"].as_str() {
+                        anns.push(format!("@embed({})", source));
                     }
                     let ann_suffix = if anns.is_empty() {
                         String::new()
@@ -1882,14 +1886,20 @@ fn parse_param(s: &str) -> std::result::Result<(String, String), String> {
     let key = s[..pos].to_string();
     let value = s[pos + 1..].to_string();
     // Strip surrounding quotes from value if present
-    let value = if (value.starts_with('"') && value.ends_with('"'))
-        || (value.starts_with('\'') && value.ends_with('\''))
-    {
-        value[1..value.len() - 1].to_string()
-    } else {
-        value
-    };
+    let value = strip_matching_quotes(&value).to_string();
     Ok((key, value))
+}
+
+fn strip_matching_quotes(input: &str) -> &str {
+    if input.len() >= 2 {
+        let bytes = input.as_bytes();
+        let first = bytes[0];
+        let last = bytes[input.len() - 1];
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return &input[1..input.len() - 1];
+        }
+    }
+    input
 }
 
 fn parse_delete_predicate(input: &str) -> Result<DeletePredicate> {
@@ -1913,13 +1923,7 @@ fn parse_delete_predicate(input: &str) -> Result<DeletePredicate> {
                 ));
             }
 
-            let value = if (raw_value.starts_with('"') && raw_value.ends_with('"'))
-                || (raw_value.starts_with('\'') && raw_value.ends_with('\''))
-            {
-                raw_value[1..raw_value.len() - 1].to_string()
-            } else {
-                raw_value.to_string()
-            };
+            let value = strip_matching_quotes(raw_value).to_string();
 
             return Ok(DeletePredicate {
                 property: property.to_string(),
@@ -1951,6 +1955,34 @@ fn build_param_map(
                     let n: i64 = value
                         .parse()
                         .map_err(|_| eyre!("param '{}': expected integer, got '{}'", key, value))?;
+                    Literal::Integer(n)
+                }
+                "U32" => {
+                    let n: u32 = value.parse().map_err(|_| {
+                        eyre!(
+                            "param '{}': expected unsigned integer, got '{}'",
+                            key,
+                            value
+                        )
+                    })?;
+                    Literal::Integer(i64::from(n))
+                }
+                "U64" => {
+                    let n: u64 = value.parse().map_err(|_| {
+                        eyre!(
+                            "param '{}': expected unsigned integer, got '{}'",
+                            key,
+                            value
+                        )
+                    })?;
+                    let n = i64::try_from(n).map_err(|_| {
+                        eyre!(
+                            "param '{}': value '{}' exceeds supported range for numeric literals (max {})",
+                            key,
+                            value,
+                            i64::MAX
+                        )
+                    })?;
                     Literal::Integer(n)
                 }
                 "F32" | "F64" => {
@@ -2442,6 +2474,59 @@ mod tests {
     }
 
     #[test]
+    fn build_param_map_parses_u32_and_u64_types() {
+        let query_params = vec![
+            nanograph::query::ast::Param {
+                name: "u32v".to_string(),
+                type_name: "U32".to_string(),
+                nullable: false,
+            },
+            nanograph::query::ast::Param {
+                name: "u64v".to_string(),
+                type_name: "U64".to_string(),
+                nullable: false,
+            },
+        ];
+        let raw = vec![
+            ("u32v".to_string(), "42".to_string()),
+            ("u64v".to_string(), "9001".to_string()),
+        ];
+
+        let params = build_param_map(&query_params, &raw).unwrap();
+        assert!(matches!(params.get("u32v"), Some(Literal::Integer(42))));
+        assert!(matches!(params.get("u64v"), Some(Literal::Integer(9001))));
+    }
+
+    #[test]
+    fn build_param_map_rejects_u64_values_outside_literal_range() {
+        let query_params = vec![nanograph::query::ast::Param {
+            name: "u64v".to_string(),
+            type_name: "U64".to_string(),
+            nullable: false,
+        }];
+        let too_large = format!("{}", (i64::MAX as u128) + 1);
+        let raw = vec![("u64v".to_string(), too_large)];
+
+        let err = build_param_map(&query_params, &raw).unwrap_err();
+        assert!(err.to_string().contains("exceeds supported range"));
+    }
+
+    #[test]
+    fn parse_param_single_quote_value_does_not_panic() {
+        let (key, value) = parse_param("x='").unwrap();
+        assert_eq!(key, "x");
+        assert_eq!(value, "'");
+    }
+
+    #[test]
+    fn parse_delete_predicate_single_quote_value_does_not_panic() {
+        let pred = parse_delete_predicate("slug='").unwrap();
+        assert_eq!(pred.property, "slug");
+        assert_eq!(pred.op, DeleteOp::Eq);
+        assert_eq!(pred.value, "'");
+    }
+
+    #[test]
     fn cli_array_value_to_json_formats_temporal_types_as_iso_strings() {
         let date: ArrayRef = Arc::new(Date32Array::from(vec![Some(20498)]));
         let dt: ArrayRef = Arc::new(Date64Array::from(vec![Some(1771063200000)]));
@@ -2562,13 +2647,15 @@ query add_person($name: String, $age: I32) {
             &schema_path,
             r#"node Person {
     name: String @key
+    summary: String
+    embedding: Vector(3) @embed(summary)
 }
 edge Knows: Person -> Person"#,
         );
         write_file(
             &data_path,
-            r#"{"type":"Person","data":{"name":"Alice"}}
-{"type":"Person","data":{"name":"Bob"}}
+            r#"{"type":"Person","data":{"name":"Alice","summary":"Alpha","embedding":[1.0,0.0,0.0]}}
+{"type":"Person","data":{"name":"Bob","summary":"Beta","embedding":[0.0,1.0,0.0]}}
 {"edge":"Knows","from":"Alice","to":"Bob"}"#,
         );
 
@@ -2596,6 +2683,13 @@ edge Knows: Person -> Person"#,
         assert_eq!(describe["edges"].as_array().unwrap().len(), 1);
         assert_eq!(describe["nodes"][0]["rows"].as_u64(), Some(2));
         assert_eq!(describe["edges"][0]["rows"].as_u64(), Some(1));
+        let embedding_prop = describe["nodes"][0]["properties"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == "embedding")
+            .expect("embedding property present in describe payload");
+        assert_eq!(embedding_prop["embed_source"].as_str(), Some("summary"));
 
         let rows = build_export_rows(&db).unwrap();
         assert_eq!(rows.len(), 3);

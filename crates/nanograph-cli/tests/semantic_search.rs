@@ -8,6 +8,8 @@ fn write_file(path: &Path, content: &str) {
 fn run_nanograph(cwd: &Path, args: &[&str]) -> String {
     let output = Command::new(env!("CARGO_BIN_EXE_nanograph"))
         .current_dir(cwd)
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("OPENAI_BASE_URL")
         .args(args)
         .output()
         .unwrap();

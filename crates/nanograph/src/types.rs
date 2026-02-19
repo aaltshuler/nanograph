@@ -2,6 +2,7 @@ use arrow_schema::DataType;
 
 pub type NodeId = u64;
 pub type EdgeId = u64;
+const MAX_VECTOR_DIM: u32 = i32::MAX as u32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ScalarType {
@@ -22,7 +23,7 @@ impl ScalarType {
     pub fn from_str_name(s: &str) -> Option<Self> {
         if let Some(inner) = s.strip_prefix("Vector(").and_then(|t| t.strip_suffix(')')) {
             let dim = inner.parse::<u32>().ok()?;
-            if dim == 0 {
+            if dim == 0 || dim > MAX_VECTOR_DIM {
                 return None;
             }
             return Some(Self::Vector(dim));
@@ -55,10 +56,14 @@ impl ScalarType {
             Self::F64 => DataType::Float64,
             Self::Date => DataType::Date32,
             Self::DateTime => DataType::Date64,
-            Self::Vector(dim) => DataType::FixedSizeList(
-                std::sync::Arc::new(arrow_schema::Field::new("item", DataType::Float32, false)),
-                *dim as i32,
-            ),
+            Self::Vector(dim) => {
+                let dim = i32::try_from(*dim)
+                    .expect("vector dimension exceeds Arrow FixedSizeList i32 bound");
+                DataType::FixedSizeList(
+                    std::sync::Arc::new(arrow_schema::Field::new("item", DataType::Float32, false)),
+                    dim,
+                )
+            }
         }
     }
 
@@ -165,4 +170,19 @@ impl PropType {
 pub enum Direction {
     Out,
     In,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scalar_type_from_str_name_rejects_vector_dimensions_outside_arrow_bounds() {
+        let too_large = format!("Vector({})", (i32::MAX as u64) + 1);
+        assert!(ScalarType::from_str_name(&too_large).is_none());
+        assert_eq!(
+            ScalarType::from_str_name("Vector(2147483647)"),
+            Some(ScalarType::Vector(2147483647))
+        );
+    }
 }

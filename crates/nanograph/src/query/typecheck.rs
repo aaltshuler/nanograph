@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::catalog::Catalog;
 use crate::error::{NanoError, Result};
@@ -92,6 +92,7 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeCont
         aliases: HashMap::new(),
         traversals: Vec::new(),
     };
+    let mut alias_exprs: HashMap<String, &Expr> = HashMap::new();
 
     let params = parse_declared_param_types(&query.params)?;
 
@@ -103,6 +104,7 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeCont
         let resolved = resolve_expr_type(catalog, &proj.expr, &ctx, &params)?;
         if let Some(alias) = &proj.alias {
             ctx.aliases.insert(alias.clone(), resolved);
+            alias_exprs.insert(alias.clone(), &proj.expr);
         }
     }
 
@@ -111,25 +113,25 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeCont
         resolve_expr_type(catalog, &ord.expr, &ctx, &params)?;
     }
 
-    let has_nearest = query
+    let has_standalone_nearest = query
         .order_clause
         .iter()
-        .any(|ord| expr_contains_nearest(&ord.expr));
+        .any(|ord| expr_contains_standalone_nearest_with_aliases(&ord.expr, &alias_exprs));
     let has_rrf = query
         .order_clause
         .iter()
-        .any(|ord| expr_contains_rrf(&ord.expr));
+        .any(|ord| expr_contains_rrf_with_aliases(&ord.expr, &alias_exprs));
     if has_rrf && query.limit.is_none() {
         return Err(NanoError::Type(
             "T21: rrf ordering requires a limit clause".to_string(),
         ));
     }
-    if has_nearest && query.limit.is_none() {
+    if has_standalone_nearest && query.limit.is_none() {
         return Err(NanoError::Type(
             "T17: nearest ordering requires a limit clause".to_string(),
         ));
     }
-    if has_nearest
+    if has_standalone_nearest
         && query
             .order_clause
             .iter()
@@ -1006,18 +1008,12 @@ fn resolve_expr_type(
             secondary,
             k,
         } => {
-            if !matches!(
-                primary.as_ref(),
-                Expr::Nearest { .. } | Expr::Bm25 { .. }
-            ) {
+            if !matches!(primary.as_ref(), Expr::Nearest { .. } | Expr::Bm25 { .. }) {
                 return Err(NanoError::Type(
                     "T21: rrf primary expression must be nearest(...) or bm25(...)".to_string(),
                 ));
             }
-            if !matches!(
-                secondary.as_ref(),
-                Expr::Nearest { .. } | Expr::Bm25 { .. }
-            ) {
+            if !matches!(secondary.as_ref(), Expr::Nearest { .. } | Expr::Bm25 { .. }) {
                 return Err(NanoError::Type(
                     "T21: rrf secondary expression must be nearest(...) or bm25(...)".to_string(),
                 ));
@@ -1284,7 +1280,8 @@ fn expr_references_any(expr: &Expr, vars: &[String]) -> bool {
         } => {
             expr_references_any(primary, vars)
                 || expr_references_any(secondary, vars)
-                || k.as_deref().is_some_and(|expr| expr_references_any(expr, vars))
+                || k.as_deref()
+                    .is_some_and(|expr| expr_references_any(expr, vars))
         }
         Expr::Variable(v) => vars.contains(v),
         Expr::Aggregate { arg, .. } => expr_references_any(arg, vars),
@@ -1292,54 +1289,94 @@ fn expr_references_any(expr: &Expr, vars: &[String]) -> bool {
     }
 }
 
-fn expr_contains_nearest(expr: &Expr) -> bool {
+fn expr_contains_standalone_nearest_with_aliases(
+    expr: &Expr,
+    alias_exprs: &HashMap<String, &Expr>,
+) -> bool {
+    expr_contains_standalone_nearest_inner(expr, alias_exprs, &mut HashSet::new())
+}
+
+fn expr_contains_standalone_nearest_inner(
+    expr: &Expr,
+    alias_exprs: &HashMap<String, &Expr>,
+    seen_aliases: &mut HashSet<String>,
+) -> bool {
     match expr {
         Expr::Nearest { .. } => true,
-        Expr::Aggregate { arg, .. } => expr_contains_nearest(arg),
+        Expr::Aggregate { arg, .. } => {
+            expr_contains_standalone_nearest_inner(arg, alias_exprs, seen_aliases)
+        }
         Expr::Search { field, query }
         | Expr::MatchText { field, query }
         | Expr::Bm25 { field, query } => {
-            expr_contains_nearest(field) || expr_contains_nearest(query)
+            expr_contains_standalone_nearest_inner(field, alias_exprs, seen_aliases)
+                || expr_contains_standalone_nearest_inner(query, alias_exprs, seen_aliases)
         }
         Expr::Fuzzy {
             field,
             query,
             max_edits,
         } => {
-            expr_contains_nearest(field)
-                || expr_contains_nearest(query)
-                || max_edits
-                    .as_deref()
-                    .is_some_and(expr_contains_nearest)
+            expr_contains_standalone_nearest_inner(field, alias_exprs, seen_aliases)
+                || expr_contains_standalone_nearest_inner(query, alias_exprs, seen_aliases)
+                || max_edits.as_deref().is_some_and(|expr| {
+                    expr_contains_standalone_nearest_inner(expr, alias_exprs, seen_aliases)
+                })
         }
-        Expr::Rrf {
-            primary,
-            secondary,
-            k,
-        } => {
-            expr_contains_nearest(primary)
-                || expr_contains_nearest(secondary)
-                || k.as_deref().is_some_and(expr_contains_nearest)
+        Expr::AliasRef(name) => {
+            if !seen_aliases.insert(name.clone()) {
+                return false;
+            }
+            let found = alias_exprs.get(name).is_some_and(|expr| {
+                expr_contains_standalone_nearest_inner(expr, alias_exprs, seen_aliases)
+            });
+            seen_aliases.remove(name);
+            found
         }
+        // nearest() nested under rrf() is handled by T21 and should not trigger T17/T18 checks.
+        Expr::Rrf { .. } => false,
         _ => false,
     }
 }
 
-fn expr_contains_rrf(expr: &Expr) -> bool {
+fn expr_contains_rrf_with_aliases(expr: &Expr, alias_exprs: &HashMap<String, &Expr>) -> bool {
+    expr_contains_rrf_inner(expr, alias_exprs, &mut HashSet::new())
+}
+
+fn expr_contains_rrf_inner(
+    expr: &Expr,
+    alias_exprs: &HashMap<String, &Expr>,
+    seen_aliases: &mut HashSet<String>,
+) -> bool {
     match expr {
         Expr::Rrf { .. } => true,
-        Expr::Aggregate { arg, .. } => expr_contains_rrf(arg),
+        Expr::Aggregate { arg, .. } => expr_contains_rrf_inner(arg, alias_exprs, seen_aliases),
         Expr::Search { field, query }
         | Expr::MatchText { field, query }
-        | Expr::Bm25 { field, query } => expr_contains_rrf(field) || expr_contains_rrf(query),
+        | Expr::Bm25 { field, query } => {
+            expr_contains_rrf_inner(field, alias_exprs, seen_aliases)
+                || expr_contains_rrf_inner(query, alias_exprs, seen_aliases)
+        }
         Expr::Fuzzy {
             field,
             query,
             max_edits,
         } => {
-            expr_contains_rrf(field)
-                || expr_contains_rrf(query)
-                || max_edits.as_deref().is_some_and(expr_contains_rrf)
+            expr_contains_rrf_inner(field, alias_exprs, seen_aliases)
+                || expr_contains_rrf_inner(query, alias_exprs, seen_aliases)
+                || max_edits
+                    .as_deref()
+                    .is_some_and(|expr| expr_contains_rrf_inner(expr, alias_exprs, seen_aliases))
+        }
+        Expr::AliasRef(name) => {
+            if !seen_aliases.insert(name.clone()) {
+                return false;
+            }
+            let found = alias_exprs
+                .get(name)
+                .is_some_and(|expr| expr_contains_rrf_inner(expr, alias_exprs, seen_aliases));
+            seen_aliases.remove(name);
+            found
         }
         _ => false,
     }
@@ -1740,6 +1777,94 @@ query q($vq: Vector(3), $tq: String) {
         .unwrap();
         let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
         assert!(ctx.bindings.contains_key("d"));
+    }
+
+    #[test]
+    fn test_rrf_with_nearest_allows_alias_ordering() {
+        let catalog = setup_vector();
+        let qf = parse_query(
+            r#"
+query q($vq: Vector(3), $tq: String) {
+    match { $d: Doc }
+    return {
+        $d.id_str,
+        rrf(nearest($d.embedding, $vq), bm25($d.id_str, $tq), 60) as score
+    }
+    order {
+        rrf(nearest($d.embedding, $vq), bm25($d.id_str, $tq), 60) desc,
+        score desc
+    }
+    limit 5
+}
+"#,
+        )
+        .unwrap();
+        let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        assert!(ctx.bindings.contains_key("d"));
+    }
+
+    #[test]
+    fn test_rrf_alias_ordering_requires_limit() {
+        let catalog = setup_vector();
+        let qf = parse_query(
+            r#"
+query q($vq: Vector(3), $tq: String) {
+    match { $d: Doc }
+    return {
+        $d.id_str,
+        rrf(nearest($d.embedding, $vq), bm25($d.id_str, $tq), 60) as score
+    }
+    order { score desc }
+}
+"#,
+        )
+        .unwrap();
+        let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+        assert!(err.to_string().contains("T21"));
+    }
+
+    #[test]
+    fn test_rrf_alias_ordering_with_limit_is_valid() {
+        let catalog = setup_vector();
+        let qf = parse_query(
+            r#"
+query q($vq: Vector(3), $tq: String) {
+    match { $d: Doc }
+    return {
+        $d.id_str,
+        rrf(nearest($d.embedding, $vq), bm25($d.id_str, $tq), 60) as score
+    }
+    order { score desc }
+    limit 5
+}
+"#,
+        )
+        .unwrap();
+        let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        assert!(ctx.bindings.contains_key("d"));
+    }
+
+    #[test]
+    fn test_standalone_nearest_with_alias_ordering_still_rejected() {
+        let catalog = setup_vector();
+        let qf = parse_query(
+            r#"
+query q($vq: Vector(3)) {
+    match { $d: Doc }
+    return {
+        $d.id_str as score
+    }
+    order {
+        nearest($d.embedding, $vq),
+        score desc
+    }
+    limit 5
+}
+"#,
+        )
+        .unwrap();
+        let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+        assert!(err.to_string().contains("T18"));
     }
 
     #[test]

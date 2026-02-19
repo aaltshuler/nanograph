@@ -172,6 +172,13 @@ fn parse_type_ref(pair: pest::iterators::Pair<Rule>) -> Result<PropType> {
                     "Vector dimension must be greater than zero".to_string(),
                 ));
             }
+            if dim > i32::MAX as u32 {
+                return Err(NanoError::Parse(format!(
+                    "Vector dimension {} exceeds maximum supported {}",
+                    dim,
+                    i32::MAX
+                )));
+            }
             Ok(PropType::scalar(ScalarType::Vector(dim), nullable))
         }
         Rule::list_type => {
@@ -218,11 +225,10 @@ fn parse_annotation(pair: pest::iterators::Pair<Rule>) -> Result<Annotation> {
     let name = inner.next().unwrap().as_str().to_string();
     let value = inner.next().map(|p| {
         let s = p.as_str();
-        if s.starts_with('"') && s.ends_with('"') {
-            s[1..s.len() - 1].to_string()
-        } else {
-            s.to_string()
-        }
+        s.strip_prefix('"')
+            .and_then(|inner| inner.strip_suffix('"'))
+            .unwrap_or(s)
+            .to_string()
     });
 
     Ok(Annotation { name, value })
@@ -325,12 +331,6 @@ fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
                             if !is_vector {
                                 return Err(NanoError::Parse(format!(
                                     "@embed is only supported on vector properties ({}.{})",
-                                    node.name, prop.name
-                                )));
-                            }
-                            if prop.prop_type.list {
-                                return Err(NanoError::Parse(format!(
-                                    "@embed is not supported on list-wrapped vectors ({}.{})",
                                     node.name, prop.name
                                 )));
                             }
@@ -812,6 +812,17 @@ node Doc {
 "#;
         let err = parse_schema(input).unwrap_err();
         assert!(err.to_string().contains("Vector dimension"));
+    }
+
+    #[test]
+    fn test_reject_vector_dimension_larger_than_arrow_bound() {
+        let input = r#"
+node Doc {
+    embedding: Vector(2147483648)
+}
+"#;
+        let err = parse_schema(input).unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum supported"));
     }
 
     #[test]

@@ -313,6 +313,10 @@ TRAVERSAL_CONSTRAINT_RESULTS=$(run_jsonl semantic_signals_for_client \
     --param "q=$QUERY_TEXT")
 TRAVERSAL_CONSTRAINT_TOP=$(json_field "$TRAVERSAL_CONSTRAINT_RESULTS" "signal_slug")
 assert_str_eq "$TRAVERSAL_CONSTRAINT_TOP" "sig-referral-analytics" "traversal constraint limits nearest results to connected client signals"
+TRAVERSAL_CONSTRAINT_COUNT=$(run_query_count "$DB" "$QUERY_FILE" semantic_signals_for_client \
+    --param "client=cli-jamie-lee" \
+    --param "q=$QUERY_TEXT")
+assert_int_eq "$TRAVERSAL_CONSTRAINT_COUNT" 1 "traversal constraint excludes unrelated signals for cli-jamie-lee"
 
 info "Validating several combined traversal + semantic query shapes..."
 TRAVERSAL_VECTOR_RESULTS=$(run_jsonl semantic_signals_for_client_by_vector \
@@ -360,7 +364,7 @@ assert_str_eq "$KEYWORD_TOP" "sig-billing-delay" "search(field, query) works wit
 
 MATCH_TEXT_RESULTS=$(run_jsonl match_text_signals_for_client \
     --param "client=cli-priya-shah" \
-    --param "q=billing missing")
+    --param "q=missing invoice")
 MATCH_TEXT_TOP=$(json_field "$MATCH_TEXT_RESULTS" "signal_slug")
 assert_str_eq "$MATCH_TEXT_TOP" "sig-billing-delay" "match_text(field, query) works with graph traversal constraints"
 
@@ -382,12 +386,20 @@ BM25_RESULTS=$(run_jsonl bm25_signals_for_client \
     --param "q=billing missing invoice")
 BM25_TOP=$(json_field "$BM25_RESULTS" "signal_slug")
 assert_str_eq "$BM25_TOP" "sig-billing-delay" "bm25(field, query) ranks expected signal first under traversal constraints"
+BM25_COUNT=$(run_query_count "$DB" "$QUERY_FILE" bm25_signals_for_client \
+    --param "client=cli-priya-shah" \
+    --param "q=billing missing invoice")
+assert_int_ge "$BM25_COUNT" 2 "bm25(field, query) returns multiple ranked rows under traversal constraints"
 
 HYBRID_RESULTS=$(run_jsonl hybrid_signals_for_client \
     --param "client=cli-priya-shah" \
     --param "q=$QUERY_TEXT")
 HYBRID_TOP=$(json_field "$HYBRID_RESULTS" "signal_slug")
 assert_str_eq "$HYBRID_TOP" "sig-billing-delay" "hybrid rrf(nearest,bm25,k) ranks expected signal first"
+HYBRID_COUNT=$(run_query_count "$DB" "$QUERY_FILE" hybrid_signals_for_client \
+    --param "client=cli-priya-shah" \
+    --param "q=$QUERY_TEXT")
+assert_int_ge "$HYBRID_COUNT" 2 "hybrid rrf(nearest,bm25,k) returns multiple ranked rows"
 
 HYBRID_DEFAULT_RESULTS=$(run_jsonl hybrid_signals_for_client_default_k \
     --param "client=cli-priya-shah" \

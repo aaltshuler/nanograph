@@ -883,6 +883,14 @@ edge Knows: Person -> Person
     }
 
     #[test]
+    fn json_values_to_array_rejects_fixed_size_list_length_mismatch() {
+        let values = vec![json!([0.1, 0.2])];
+        let dt = DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 3);
+        let err = json_values_to_array(&values, &dt, true).unwrap_err();
+        assert!(err.to_string().contains("length mismatch"));
+    }
+
+    #[test]
     fn load_jsonl_with_name_seed_resolves_edges_to_existing_nodes() {
         let mut existing = build_storage(test_schema());
         load_jsonl_data(

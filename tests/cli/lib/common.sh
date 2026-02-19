@@ -133,7 +133,8 @@ run_query_count() {
 json_field() {
     local jsonl="$1"
     local field="$2"
-    echo "$jsonl" | sed -n '/^{/p' | head -n 1 | perl -MJSON::PP -e '
+    local row_index="${3:-1}"
+    echo "$jsonl" | sed -n '/^{/p' | sed -n "${row_index}p" | perl -MJSON::PP -e '
 use strict;
 use warnings;
 

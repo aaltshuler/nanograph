@@ -74,8 +74,8 @@ edge_decl       = "edge" , type_name , ":" ,
 
 prop_decl       = ident , ":" , type_ref , { annotation } ;
 
-type_ref        = base_type , [ "?" ] ;
-
+vector_type     = "Vector" , "(" , integer , ")" ;
+type_ref        = ( base_type | vector_type ) , [ "?" ] ;
 base_type       = "String" | "Bool"
                 | "I32" | "I64" | "U32" | "U64"
                 | "F32" | "F64"
@@ -475,4 +475,56 @@ BLOCK_COMMENT   = "/*" , { (* any *) } , "*/" ;
 (* T12. Bounded expansion {n,m}: n >= 1, m >= n, m is finite.       *)
 (*       No {0,...} (would require optional matching).               *)
 (*       No {n,} (unbounded = recursion, not supported in v1).       *)
+(* ================================================================ *)
+
+
+(* ================================================================ *)
+(* 8. SEARCH + VECTOR EXTENSIONS (IMPLEMENTED)                       *)
+(*                                                                    *)
+(* The following syntax extensions are implemented in the runtime    *)
+(* parser/typechecker and are part of the current search feature set.*)
+(*                                                                    *)
+(* Parameter types                                                     *)
+(*   type_ref      = (base_type | vector_type) [ "?" ] ;             *)
+(*   vector_type   = "Vector" "(" integer ")" ;                      *)
+(*                                                                    *)
+(* Search clauses in `match`                                          *)
+(*   text_search_clause = search_call | fuzzy_call | match_text_call ;*)
+(*   search_call       = "search" "(" expr "," expr ")" ;            *)
+(*   fuzzy_call        = "fuzzy" "(" expr "," expr [ "," expr ] ")" ;*)
+(*   match_text_call   = "match_text" "(" expr "," expr ")" ;        *)
+(*                                                                    *)
+(* Ranking expressions in `order`                                     *)
+(*   nearest_ordering = "nearest" "(" prop_access "," expr ")" ;     *)
+(*   bm25_call        = "bm25" "(" expr "," expr ")" ;               *)
+(*   rank_expr        = nearest_ordering | bm25_call ;                *)
+(*   rrf_call         = "rrf" "(" rank_expr "," rank_expr             *)
+(*                              [ "," expr ] ")" ;                    *)
+(*                                                                    *)
+(* Additional compile-time rules                                      *)
+(*                                                                    *)
+(* T15. nearest(...) typing:                                          *)
+(*      - first arg must be a Vector(dim) property                    *)
+(*      - query arg must be Vector(dim) or String                     *)
+(*      - vector dimensions must match exactly                        *)
+(*                                                                    *)
+(* T16. nearest(...) direction:                                       *)
+(*      nearest() in `order` is ascending-distance only; explicit     *)
+(*      asc/desc modifiers on nearest() are rejected.                 *)
+(*                                                                    *)
+(* T17. nearest(...) ordering requires a limit clause.                *)
+(*                                                                    *)
+(* T18. In phase-1 exact nearest ordering, alias-based ordering is    *)
+(*      rejected when standalone nearest() appears in order keys.     *)
+(*                                                                    *)
+(* T19. Text search typing (`search`, `fuzzy`, `match_text`):         *)
+(*      - field and query args must be String                         *)
+(*      - fuzzy max_edits, when provided, must be integer             *)
+(*                                                                    *)
+(* T20. bm25(...) typing: both arguments must be String.              *)
+(*                                                                    *)
+(* T21. rrf(...) typing + planning constraints:                       *)
+(*      - primary/secondary args must each be nearest(...) or bm25(...) *)
+(*      - optional k arg must be integer > 0                          *)
+(*      - rrf(...) in ordering requires a limit clause                *)
 (* ================================================================ *)

@@ -37,18 +37,34 @@ pub(crate) async fn build_next_storage_for_load(
             "load mode 'merge' requires at least one node @key property in schema".to_string(),
         ));
     }
-    let data_source = embeddings::materialize_embeddings_for_load(db_path, schema_ir, data_source)?;
+    let materialized_data = if embeddings::has_embedding_specs(schema_ir) {
+        // Embedding requests are synchronous today; run materialization off the async runtime
+        // worker thread to avoid blocking unrelated async work.
+        let db_path = db_path.to_path_buf();
+        let schema_ir = schema_ir.clone();
+        let data_source = data_source.to_string();
+        tokio::task::spawn_blocking(move || {
+            embeddings::materialize_embeddings_for_load(&db_path, &schema_ir, &data_source)
+                .map(|cow| cow.into_owned())
+        })
+        .await
+        .map_err(|e| {
+            NanoError::Storage(format!("embedding materialization task failed: {}", e))
+        })??
+    } else {
+        data_source.to_string()
+    };
 
     let mut incoming_storage = GraphStorage::new(existing.catalog.clone());
     match mode {
         LoadMode::Overwrite => {
-            load_jsonl_data(&mut incoming_storage, data_source.as_ref(), &key_props)?;
+            load_jsonl_data(&mut incoming_storage, &materialized_data, &key_props)?;
         }
         LoadMode::Merge => {
             let key_seed = constraints::build_name_seed_for_keyed_load(existing, &key_props)?;
             load_jsonl_data_with_name_seed(
                 &mut incoming_storage,
-                data_source.as_ref(),
+                &materialized_data,
                 &key_props,
                 Some(&key_seed),
             )?;
@@ -57,7 +73,7 @@ pub(crate) async fn build_next_storage_for_load(
             let key_seed = constraints::build_name_seed_for_append(existing, &key_props)?;
             load_jsonl_data_with_name_seed(
                 &mut incoming_storage,
-                data_source.as_ref(),
+                &materialized_data,
                 &key_props,
                 Some(&key_seed),
             )?;

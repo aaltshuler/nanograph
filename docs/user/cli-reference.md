@@ -227,6 +227,8 @@ When using `@embed(...)` fields or `nearest(..., $q: String)`, these environment
 | `OPENAI_API_KEY` | OpenAI API key (required only when real embedding calls are needed) | unset |
 | `NANOGRAPH_EMBED_MODEL` | Embedding model name | `text-embedding-3-small` |
 | `NANOGRAPH_EMBED_BATCH_SIZE` | Max texts per embedding API batch | `64` |
+| `NANOGRAPH_EMBED_CACHE_MAX_ENTRIES` | Max unique embedding cache entries retained on disk (LRU-like, newest kept) | `50000` |
+| `NANOGRAPH_EMBED_CACHE_LOCK_STALE_SECS` | Reclaim stale embedding cache lock files older than this many seconds | `60` |
 | `NANOGRAPH_EMBED_CHUNK_CHARS` | Per-text chunk size in characters for large source strings (`0` disables chunking) | `0` |
 | `NANOGRAPH_EMBED_CHUNK_OVERLAP_CHARS` | Character overlap between chunks (used only when chunking is enabled) | `128` |
 

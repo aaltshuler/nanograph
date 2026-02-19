@@ -1,7 +1,8 @@
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -15,6 +16,10 @@ const EMBEDDING_CACHE_FILENAME: &str = "_embedding_cache.jsonl";
 const DEFAULT_EMBED_BATCH_SIZE: usize = 64;
 const DEFAULT_EMBED_CHUNK_CHARS: usize = 0;
 const DEFAULT_EMBED_CHUNK_OVERLAP_CHARS: usize = 128;
+const DEFAULT_EMBED_CACHE_MAX_ENTRIES: usize = 50_000;
+const DEFAULT_EMBED_CACHE_LOCK_STALE_SECS: usize = 60;
+const EMBEDDING_CACHE_LOCK_RETRIES: usize = 200;
+const EMBEDDING_CACHE_LOCK_RETRY_DELAY_MS: u64 = 10;
 
 #[derive(Debug, Clone)]
 struct EmbedSpec {
@@ -112,6 +117,14 @@ fn materialize_embeddings_for_load_inner<'a>(
         client_override,
         EmbedChunkingConfig::from_env(),
     )
+}
+
+pub(crate) fn has_embedding_specs(schema_ir: &SchemaIR) -> bool {
+    schema_ir.node_types().any(|node| {
+        node.properties
+            .iter()
+            .any(|prop| prop.embed_source.is_some())
+    })
 }
 
 fn materialize_embeddings_for_load_inner_with_chunking<'a>(
@@ -552,11 +565,49 @@ fn collect_embed_specs(schema_ir: &SchemaIR) -> Result<HashMap<String, Vec<Embed
 }
 
 fn load_embedding_cache(path: &Path) -> Result<HashMap<CacheKey, Vec<f32>>> {
-    if !path.exists() {
-        return Ok(HashMap::new());
-    }
+    let records = load_embedding_cache_records(path)?;
     let mut cache = HashMap::new();
+    for record in records {
+        let key = cache_key_from_record(&record);
+        cache.insert(key, record.vector);
+    }
+    Ok(cache)
+}
+
+fn append_embedding_cache(path: &Path, records: &[CacheRecord]) -> Result<()> {
+    let max_entries = parse_env_usize(
+        "NANOGRAPH_EMBED_CACHE_MAX_ENTRIES",
+        DEFAULT_EMBED_CACHE_MAX_ENTRIES,
+    );
+    append_embedding_cache_with_limit(path, records, max_entries)
+}
+
+fn append_embedding_cache_with_limit(
+    path: &Path,
+    records: &[CacheRecord],
+    max_entries: usize,
+) -> Result<()> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    let _lock = acquire_embedding_cache_lock(path)?;
+    let mut merged = load_embedding_cache_records(path)?;
+    merged.extend(records.iter().cloned());
+    let compacted = compact_embedding_cache_records(merged, max_entries);
+    write_embedding_cache_records(path, &compacted)?;
+    Ok(())
+}
+
+fn load_embedding_cache_records(path: &Path) -> Result<Vec<CacheRecord>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
     let data = std::fs::read_to_string(path)?;
+    parse_embedding_cache_records(path, &data)
+}
+
+fn parse_embedding_cache_records(path: &Path, data: &str) -> Result<Vec<CacheRecord>> {
+    let mut records = Vec::new();
     for (line_no, line) in data.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -579,38 +630,158 @@ fn load_embedding_cache(path: &Path) -> Result<HashMap<CacheKey, Vec<f32>>> {
                 record.dim
             )));
         }
-        let key = CacheKey {
-            model: record.model,
-            dim: record.dim,
-            content_hash: record.content_hash,
-            chunk_chars: record.chunk_chars,
-            chunk_overlap_chars: record.chunk_overlap_chars,
-        };
-        cache.insert(key, record.vector);
+        records.push(record);
     }
-    Ok(cache)
+    Ok(records)
 }
 
-fn append_embedding_cache(path: &Path, records: &[CacheRecord]) -> Result<()> {
-    if records.is_empty() {
-        return Ok(());
-    }
+fn write_embedding_cache_records(path: &Path, records: &[CacheRecord]) -> Result<()> {
     let mut file = std::fs::OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
+        .truncate(true)
         .open(path)?;
     for record in records {
-        serde_json::to_writer(&mut file, record).map_err(|e| {
+        let mut line = serde_json::to_vec(record).map_err(|e| {
             NanoError::Storage(format!(
-                "failed to append embedding cache {}: {}",
+                "failed to write embedding cache {}: {}",
                 path.display(),
                 e
             ))
         })?;
-        file.write_all(b"\n")?;
+        line.push(b'\n');
+        file.write_all(&line)?;
     }
     file.flush()?;
     Ok(())
+}
+
+fn compact_embedding_cache_records(
+    records: Vec<CacheRecord>,
+    max_entries: usize,
+) -> Vec<CacheRecord> {
+    let max_entries = max_entries.max(1);
+    let mut seen = HashSet::new();
+    let mut compacted_rev = Vec::with_capacity(records.len().min(max_entries));
+    for record in records.into_iter().rev() {
+        if seen.insert(cache_key_from_record(&record)) {
+            compacted_rev.push(record);
+            if compacted_rev.len() == max_entries {
+                break;
+            }
+        }
+    }
+    compacted_rev.reverse();
+    compacted_rev
+}
+
+fn cache_key_from_record(record: &CacheRecord) -> CacheKey {
+    CacheKey {
+        model: record.model.clone(),
+        dim: record.dim,
+        content_hash: record.content_hash.clone(),
+        chunk_chars: record.chunk_chars,
+        chunk_overlap_chars: record.chunk_overlap_chars,
+    }
+}
+
+struct EmbeddingCacheLock {
+    path: PathBuf,
+    _file: std::fs::File,
+}
+
+impl Drop for EmbeddingCacheLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn embedding_cache_lock_path(path: &Path) -> PathBuf {
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    PathBuf::from(lock_path)
+}
+
+fn acquire_embedding_cache_lock(path: &Path) -> Result<EmbeddingCacheLock> {
+    let stale_after_secs = parse_env_usize(
+        "NANOGRAPH_EMBED_CACHE_LOCK_STALE_SECS",
+        DEFAULT_EMBED_CACHE_LOCK_STALE_SECS,
+    );
+    let stale_after = Duration::from_secs(stale_after_secs as u64);
+    acquire_embedding_cache_lock_with_stale_after(path, stale_after)
+}
+
+fn acquire_embedding_cache_lock_with_stale_after(
+    path: &Path,
+    stale_after: Duration,
+) -> Result<EmbeddingCacheLock> {
+    let lock_path = embedding_cache_lock_path(path);
+    for attempt in 0..EMBEDDING_CACHE_LOCK_RETRIES {
+        match std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&lock_path)
+        {
+            Ok(file) => {
+                return Ok(EmbeddingCacheLock {
+                    path: lock_path,
+                    _file: file,
+                });
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                if lock_file_is_stale(&lock_path, stale_after) {
+                    match std::fs::remove_file(&lock_path) {
+                        Ok(()) => continue,
+                        Err(remove_err) if remove_err.kind() == std::io::ErrorKind::NotFound => {
+                            continue;
+                        }
+                        Err(remove_err) => {
+                            return Err(NanoError::Storage(format!(
+                                "failed to remove stale embedding cache lock {}: {}",
+                                lock_path.display(),
+                                remove_err
+                            )));
+                        }
+                    }
+                }
+                if attempt + 1 == EMBEDDING_CACHE_LOCK_RETRIES {
+                    return Err(NanoError::Storage(format!(
+                        "embedding cache lock timed out for {} (lock file: {})",
+                        path.display(),
+                        lock_path.display()
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(EMBEDDING_CACHE_LOCK_RETRY_DELAY_MS));
+            }
+            Err(err) => {
+                return Err(NanoError::Storage(format!(
+                    "failed to acquire embedding cache lock {}: {}",
+                    lock_path.display(),
+                    err
+                )));
+            }
+        }
+    }
+
+    Err(NanoError::Storage(format!(
+        "embedding cache lock acquisition failed for {}",
+        path.display()
+    )))
+}
+
+fn lock_file_is_stale(lock_path: &Path, stale_after: Duration) -> bool {
+    let metadata = match std::fs::metadata(lock_path) {
+        Ok(meta) => meta,
+        Err(_) => return false,
+    };
+    let timestamp = metadata.modified().ok().or_else(|| metadata.created().ok());
+    let Some(timestamp) = timestamp else {
+        return false;
+    };
+    match timestamp.elapsed() {
+        Ok(age) => age >= stale_after,
+        Err(_) => false,
+    }
 }
 
 fn parse_env_usize(name: &str, default: usize) -> usize {
@@ -623,6 +794,9 @@ fn parse_env_usize(name: &str, default: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+    use std::sync::{Arc, Barrier};
+
     use tempfile::TempDir;
 
     use crate::catalog::schema_ir::build_schema_ir;
@@ -685,6 +859,117 @@ node Doc {
     fn split_text_into_chunks_respects_overlap() {
         let chunks = split_text_into_chunks("abcdefghij", 4, 1);
         assert_eq!(chunks, vec!["abcd", "defg", "ghij"]);
+    }
+
+    #[test]
+    fn append_embedding_cache_handles_concurrent_writers() {
+        let temp = TempDir::new().unwrap();
+        let cache_path = temp.path().join(EMBEDDING_CACHE_FILENAME);
+        let writer_count = 8usize;
+        let barrier = Arc::new(Barrier::new(writer_count));
+        let mut threads = Vec::new();
+
+        for idx in 0..writer_count {
+            let path = cache_path.clone();
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                let record = CacheRecord {
+                    model: "test-model".to_string(),
+                    dim: 3,
+                    content_hash: format!("hash-{}", idx),
+                    vector: vec![idx as f32, 1.0, 2.0],
+                    chunk_chars: 0,
+                    chunk_overlap_chars: 0,
+                };
+                barrier.wait();
+                append_embedding_cache(&path, &[record]).unwrap();
+            }));
+        }
+
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        let file = std::fs::read_to_string(&cache_path).unwrap();
+        let lines: Vec<&str> = file
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+        assert_eq!(lines.len(), writer_count);
+
+        let mut seen = HashSet::new();
+        for line in lines {
+            let record: CacheRecord = serde_json::from_str(line).unwrap();
+            assert!(seen.insert(record.content_hash));
+        }
+    }
+
+    #[test]
+    fn append_embedding_cache_with_limit_compacts_and_deduplicates() {
+        let temp = TempDir::new().unwrap();
+        let cache_path = temp.path().join(EMBEDDING_CACHE_FILENAME);
+
+        let record = |hash: &str, marker: f32| CacheRecord {
+            model: "test-model".to_string(),
+            dim: 3,
+            content_hash: hash.to_string(),
+            vector: vec![marker, 1.0, 2.0],
+            chunk_chars: 0,
+            chunk_overlap_chars: 0,
+        };
+
+        append_embedding_cache_with_limit(
+            &cache_path,
+            &[record("a", 1.0), record("b", 2.0), record("c", 3.0)],
+            3,
+        )
+        .unwrap();
+        append_embedding_cache_with_limit(&cache_path, &[record("d", 4.0), record("b", 20.0)], 3)
+            .unwrap();
+
+        let cache = load_embedding_cache(&cache_path).unwrap();
+        assert_eq!(cache.len(), 3);
+
+        let key_b = CacheKey {
+            model: "test-model".to_string(),
+            dim: 3,
+            content_hash: "b".to_string(),
+            chunk_chars: 0,
+            chunk_overlap_chars: 0,
+        };
+        let key_c = CacheKey {
+            content_hash: "c".to_string(),
+            ..key_b.clone()
+        };
+        let key_d = CacheKey {
+            content_hash: "d".to_string(),
+            ..key_b.clone()
+        };
+
+        assert_eq!(cache.get(&key_b).unwrap()[0], 20.0);
+        assert!(cache.contains_key(&key_c));
+        assert!(cache.contains_key(&key_d));
+    }
+
+    #[test]
+    fn acquire_embedding_cache_lock_reclaims_stale_lock_file() {
+        let temp = TempDir::new().unwrap();
+        let cache_path = temp.path().join(EMBEDDING_CACHE_FILENAME);
+        let lock_path = embedding_cache_lock_path(&cache_path);
+
+        std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        std::thread::sleep(Duration::from_secs(2));
+
+        let lock =
+            acquire_embedding_cache_lock_with_stale_after(&cache_path, Duration::from_secs(1))
+                .unwrap();
+        drop(lock);
+
+        assert!(!lock_path.exists());
     }
 
     #[test]

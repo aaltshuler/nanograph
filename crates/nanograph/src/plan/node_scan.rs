@@ -3,10 +3,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use arrow_array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, FixedSizeListArray, Float64Array,
-    Int64Array, RecordBatch, StringArray, StructArray,
-};
+use arrow_array::{Array, ArrayRef, BooleanArray, FixedSizeListArray, RecordBatch, StructArray};
 use arrow_schema::{DataType, Field, SchemaRef};
 use datafusion_common::{DataFusionError, Result};
 use datafusion_execution::TaskContext;
@@ -19,9 +16,9 @@ use futures::StreamExt;
 use lance::Dataset;
 use tracing::debug;
 
+use crate::plan::literal_utils;
 use crate::query::ast::{CompOp, Literal};
 use crate::store::graph::GraphStorage;
-use crate::store::loader::{parse_date32_literal, parse_date64_literal};
 
 #[derive(Debug, Clone)]
 pub(crate) struct NodeScanPredicate {
@@ -71,51 +68,7 @@ impl NodeScanExec {
     }
 
     fn literal_to_array(literal: &Literal, num_rows: usize) -> Result<ArrayRef> {
-        match literal {
-            Literal::String(s) => Ok(Arc::new(StringArray::from(vec![s.as_str(); num_rows]))),
-            Literal::Integer(v) => Ok(Arc::new(Int64Array::from(vec![*v; num_rows]))),
-            Literal::Float(v) => Ok(Arc::new(Float64Array::from(vec![*v; num_rows]))),
-            Literal::Bool(v) => Ok(Arc::new(BooleanArray::from(vec![*v; num_rows]))),
-            Literal::Date(s) => {
-                let days = parse_date32_literal(s)
-                    .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-                Ok(Arc::new(Date32Array::from(vec![days; num_rows])))
-            }
-            Literal::DateTime(s) => {
-                let ms = parse_date64_literal(s)
-                    .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-                Ok(Arc::new(Date64Array::from(vec![ms; num_rows])))
-            }
-            Literal::List(items) => {
-                let rendered = serde_json::Value::Array(
-                    items
-                        .iter()
-                        .map(Self::literal_to_json_value_for_display)
-                        .collect::<Vec<_>>(),
-                )
-                .to_string();
-                Ok(Arc::new(StringArray::from(vec![rendered; num_rows])))
-            }
-        }
-    }
-
-    fn literal_to_json_value_for_display(lit: &Literal) -> serde_json::Value {
-        match lit {
-            Literal::String(v) => serde_json::Value::String(v.clone()),
-            Literal::Integer(v) => serde_json::Value::Number((*v).into()),
-            Literal::Float(v) => serde_json::Number::from_f64(*v)
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null),
-            Literal::Bool(v) => serde_json::Value::Bool(*v),
-            Literal::Date(v) => serde_json::Value::String(v.clone()),
-            Literal::DateTime(v) => serde_json::Value::String(v.clone()),
-            Literal::List(values) => serde_json::Value::Array(
-                values
-                    .iter()
-                    .map(Self::literal_to_json_value_for_display)
-                    .collect(),
-            ),
-        }
+        literal_utils::literal_to_array(literal, num_rows).map_err(DataFusionError::Execution)
     }
 
     fn compare_arrays(left: &ArrayRef, right: &ArrayRef, op: CompOp) -> Result<BooleanArray> {
@@ -266,33 +219,7 @@ impl NodeScanExec {
     }
 
     fn literal_to_lance_sql(literal: &Literal) -> Option<String> {
-        match literal {
-            Literal::String(s) => Some(format!("'{}'", s.replace('\'', "''"))),
-            Literal::Integer(v) => Some(v.to_string()),
-            Literal::Float(v) => {
-                if v.is_finite() {
-                    Some(v.to_string())
-                } else {
-                    None
-                }
-            }
-            Literal::Bool(v) => Some(if *v { "true" } else { "false" }.to_string()),
-            Literal::Date(s) => {
-                let days = parse_date32_literal(s).ok()?;
-                let iso = arrow_array::temporal_conversions::date32_to_datetime(days)?
-                    .format("%Y-%m-%d")
-                    .to_string();
-                Some(format!("CAST('{}' AS DATE)", iso))
-            }
-            Literal::DateTime(s) => {
-                let ms = parse_date64_literal(s).ok()?;
-                let ts = arrow_array::temporal_conversions::date64_to_datetime(ms)?
-                    .format("%Y-%m-%d %H:%M:%S%.3f")
-                    .to_string();
-                Some(format!("CAST('{}' AS TIMESTAMP(3))", ts))
-            }
-            Literal::List(_) => None,
-        }
+        literal_utils::literal_to_lance_sql(literal)
     }
 
     fn lance_filter_sql(&self) -> std::result::Result<Option<String>, String> {

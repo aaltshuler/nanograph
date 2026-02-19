@@ -19,7 +19,7 @@ use crate::schema::ast::{Annotation, PropDecl, SchemaDecl, SchemaFile};
 use crate::schema::parser::parse_schema;
 use crate::store::database::Database;
 use crate::store::graph::GraphStorage;
-use crate::store::indexing::rebuild_node_scalar_indexes;
+use crate::store::indexing::{rebuild_node_scalar_indexes, rebuild_node_vector_indexes};
 use crate::store::manifest::{DatasetEntry, GraphManifest, hash_string};
 use crate::store::txlog::commit_manifest_and_logs;
 use crate::types::ScalarType;
@@ -1541,6 +1541,7 @@ async fn write_staged_db(
             let dataset_path = path.join(&dataset_rel_path);
             let dataset_version = write_lance_batch(&dataset_path, batch).await?;
             rebuild_node_scalar_indexes(&dataset_path, node_def).await?;
+            rebuild_node_vector_indexes(&dataset_path, node_def).await?;
             dataset_entries.push(DatasetEntry {
                 type_id: node_def.type_id,
                 type_name: node_def.name.clone(),

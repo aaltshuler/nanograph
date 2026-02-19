@@ -46,6 +46,14 @@ impl Catalog {
     }
 }
 
+fn lowercase_first_char(name: &str) -> String {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    first.to_lowercase().chain(chars).collect()
+}
+
 pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
     let mut node_types = HashMap::new();
     let mut edge_types = HashMap::new();
@@ -127,7 +135,7 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
                 properties.insert(prop.name.clone(), prop.prop_type.clone());
             }
 
-            let lowercase_name = edge.name[..1].to_lowercase() + &edge.name[1..];
+            let lowercase_name = lowercase_first_char(&edge.name);
             edge_name_index.insert(lowercase_name, edge.name.clone());
 
             edge_types.insert(
@@ -152,7 +160,9 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::ast::{EdgeDecl, NodeDecl};
     use crate::schema::parser::parse_schema;
+    use crate::types::PropType;
 
     fn test_schema() -> &'static str {
         r#"
@@ -217,5 +227,32 @@ edge Knows: Person -> Alien
 "#;
         let schema = parse_schema(input).unwrap();
         assert!(build_catalog(&schema).is_err());
+    }
+
+    #[test]
+    fn test_edge_lookup_handles_non_ascii_leading_character() {
+        let schema = SchemaFile {
+            declarations: vec![
+                SchemaDecl::Node(NodeDecl {
+                    name: "Person".to_string(),
+                    annotations: vec![],
+                    parent: None,
+                    properties: vec![crate::schema::ast::PropDecl {
+                        name: "name".to_string(),
+                        prop_type: PropType::scalar(ScalarType::String, false),
+                        annotations: vec![],
+                    }],
+                }),
+                SchemaDecl::Edge(EdgeDecl {
+                    name: "Édges".to_string(),
+                    from_type: "Person".to_string(),
+                    to_type: "Person".to_string(),
+                    annotations: vec![],
+                    properties: vec![],
+                }),
+            ],
+        };
+        let catalog = build_catalog(&schema).unwrap();
+        assert!(catalog.lookup_edge_by_name("édges").is_some());
     }
 }

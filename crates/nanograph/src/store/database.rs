@@ -5,9 +5,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow_array::builder::BooleanBuilder;
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array,
-    Int32Array, Int64Array, ListArray, RecordBatch, RecordBatchIterator, StringArray, UInt32Array,
-    UInt64Array,
+    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, FixedSizeListArray, Float32Array,
+    Float64Array, Int32Array, Int64Array, ListArray, RecordBatch, RecordBatchIterator, StringArray,
+    UInt32Array, UInt64Array,
 };
 use arrow_schema::DataType;
 use futures::StreamExt;
@@ -1343,11 +1343,15 @@ fn parse_predicate_array(value: &str, dt: &DataType, num_rows: usize) -> Result<
 }
 
 fn trim_surrounding_quotes(s: &str) -> &str {
-    if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
-        &s[1..s.len().saturating_sub(1)]
-    } else {
-        s
+    if s.len() >= 2 {
+        let bytes = s.as_bytes();
+        let first = bytes[0];
+        let last = bytes[s.len() - 1];
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return &s[1..s.len() - 1];
+        }
     }
+    s
 }
 
 fn compare_for_delete(left: &ArrayRef, right: &ArrayRef, op: DeleteOp) -> Result<BooleanArray> {
@@ -1583,6 +1587,18 @@ fn cdc_array_value_to_json(array: &ArrayRef, row: usize) -> serde_json::Value {
         DataType::List(_) => array
             .as_any()
             .downcast_ref::<ListArray>()
+            .map(|a| {
+                let values = a.value(row);
+                serde_json::Value::Array(
+                    (0..values.len())
+                        .map(|idx| cdc_array_value_to_json(&values, idx))
+                        .collect(),
+                )
+            })
+            .unwrap_or(serde_json::Value::Null),
+        DataType::FixedSizeList(_, _) => array
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
             .map(|a| {
                 let values = a.value(row);
                 serde_json::Value::Array(
@@ -2182,6 +2198,7 @@ fn next_schema_identity_counters(ir: &SchemaIR) -> (u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::migration::{MigrationStatus, execute_schema_migration};
     use crate::store::txlog::{
         append_tx_catalog_entry, read_tx_catalog_entries, read_visible_cdc_entries,
     };
@@ -2337,6 +2354,16 @@ edge Knows: Person -> Person
 "#
     }
 
+    fn vector_indexed_schema_v2_src() -> &'static str {
+        r#"node Doc {
+    slug: String @key
+    embedding: Vector(4) @index
+    title: String
+    category: String?
+}
+"#
+    }
+
     fn vector_indexed_data_src() -> &'static str {
         r#"{"type": "Doc", "data": {"slug": "a", "embedding": [1.0, 0.0, 0.0, 0.0], "title": "A"}}
 {"type": "Doc", "data": {"slug": "b", "embedding": [0.0, 1.0, 0.0, 0.0], "title": "B"}}
@@ -2419,6 +2446,12 @@ edge Knows: Person -> Person
             .prefix(&format!("nanograph_{}_", name))
             .tempdir()
             .unwrap()
+    }
+
+    #[test]
+    fn trim_surrounding_quotes_single_quote_does_not_panic() {
+        assert_eq!(trim_surrounding_quotes("'"), "'");
+        assert_eq!(trim_surrounding_quotes("\""), "\"");
     }
 
     fn dataset_version_for(manifest: &GraphManifest, kind: &str, type_name: &str) -> u64 {
@@ -2537,6 +2570,34 @@ edge Knows: Person -> Person
         assert!(
             cdc.iter()
                 .any(|e| e.entity_kind == "edge" && e.type_name == "Knows")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cdc_payload_preserves_vector_as_json_array() {
+        let dir = test_dir("cdc_vector_payload");
+        let path = dir.path();
+
+        let mut db = Database::init(path, vector_indexed_schema_src())
+            .await
+            .unwrap();
+        db.load_with_mode(vector_indexed_data_src(), LoadMode::Overwrite)
+            .await
+            .unwrap();
+
+        let cdc = read_visible_cdc_entries(path, 0, None).unwrap();
+        let insert = cdc
+            .iter()
+            .find(|e| e.op == "insert" && e.entity_kind == "node" && e.type_name == "Doc")
+            .expect("expected Doc insert CDC event");
+        let embedding = insert
+            .payload
+            .get("embedding")
+            .expect("embedding field present in CDC payload");
+        assert!(
+            embedding.is_array(),
+            "expected embedding to be serialized as JSON array, got {}",
+            embedding
         );
     }
 
@@ -2993,6 +3054,47 @@ edge Knows: Person -> Person
         assert!(
             reopened_names.contains(&expected_index_name),
             "expected vector index {} after reopen",
+            expected_index_name
+        );
+    }
+
+    #[tokio::test]
+    async fn test_migration_rebuilds_vector_indexes_for_indexed_vector_properties() {
+        let dir = test_dir("migration_vector_indexed_props");
+        let path = dir.path();
+
+        let mut db = Database::init(path, vector_indexed_schema_src())
+            .await
+            .unwrap();
+        db.load(vector_indexed_data_src()).await.unwrap();
+        drop(db);
+
+        std::fs::write(path.join("schema.pg"), vector_indexed_schema_v2_src()).unwrap();
+        let result = execute_schema_migration(path, false, true).await.unwrap();
+        assert_eq!(result.status, MigrationStatus::Applied);
+
+        let db = Database::open(path).await.unwrap();
+        let doc = db
+            .schema_ir
+            .node_types()
+            .find(|n| n.name == "Doc")
+            .expect("doc node type");
+        let expected_index_name =
+            crate::store::indexing::vector_index_name(doc.type_id, "embedding");
+        let dataset_path = path.join("nodes").join(SchemaIR::dir_name(doc.type_id));
+
+        let uri = dataset_path.to_string_lossy().to_string();
+        let dataset = Dataset::open(&uri).await.unwrap();
+        let index_names: HashSet<String> = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .map(|idx| idx.name.clone())
+            .collect();
+        assert!(
+            index_names.contains(&expected_index_name),
+            "expected vector index {} after migration",
             expected_index_name
         );
     }

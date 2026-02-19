@@ -21,10 +21,10 @@ use crate::error::{NanoError, Result};
 use crate::ir::*;
 use crate::query::ast::{AggFunc, CompOp, Literal};
 use crate::store::graph::GraphStorage;
-use crate::store::loader::{parse_date32_literal, parse_date64_literal};
 use crate::types::ScalarType;
 use tracing::{debug, info, instrument};
 
+use super::literal_utils;
 use super::node_scan::{NodeScanExec, NodeScanPredicate};
 use super::physical::ExpandExec;
 
@@ -453,33 +453,7 @@ fn build_lance_sql_filter_for_pushdown_preds(
 }
 
 fn literal_to_lance_sql(literal: &Literal) -> Option<String> {
-    match literal {
-        Literal::String(s) => Some(format!("'{}'", s.replace('\'', "''"))),
-        Literal::Integer(v) => Some(v.to_string()),
-        Literal::Float(v) => {
-            if v.is_finite() {
-                Some(v.to_string())
-            } else {
-                None
-            }
-        }
-        Literal::Bool(v) => Some(if *v { "true" } else { "false" }.to_string()),
-        Literal::Date(s) => {
-            let days = parse_date32_literal(s).ok()?;
-            let iso = arrow_array::temporal_conversions::date32_to_datetime(days)?
-                .format("%Y-%m-%d")
-                .to_string();
-            Some(format!("CAST('{}' AS DATE)", iso))
-        }
-        Literal::DateTime(s) => {
-            let ms = parse_date64_literal(s).ok()?;
-            let ts = arrow_array::temporal_conversions::date64_to_datetime(ms)?
-                .format("%Y-%m-%d %H:%M:%S%.3f")
-                .to_string();
-            Some(format!("CAST('{}' AS TIMESTAMP(3))", ts))
-        }
-        Literal::List(_) => None,
-    }
+    literal_utils::literal_to_lance_sql(literal)
 }
 
 fn wrap_projected_node_batch(
@@ -1429,7 +1403,7 @@ fn evaluate_match_text_boolean_array(
             out.push(false);
             continue;
         }
-        out.push(matches_keyword_search(
+        out.push(matches_match_text(
             field_utf8.value(row),
             query_utf8.value(row),
         ));
@@ -1501,6 +1475,24 @@ fn evaluate_bm25_score_array(
         0.0
     };
 
+    // Optimize broadcast query expressions (e.g. bm25($doc, $q) with scalar $q):
+    // tokenize and count query terms once instead of per row.
+    let mut broadcast_query_tf: Option<AHashMap<String, usize>> = None;
+    if query_utf8.len() > 0 && !query_utf8.is_null(0) {
+        let first_query = query_utf8.value(0);
+        let is_broadcast = (1..query_utf8.len())
+            .all(|row| !query_utf8.is_null(row) && query_utf8.value(row) == first_query);
+        if is_broadcast {
+            let mut tf = AHashMap::new();
+            for token in tokenize_search_terms(first_query) {
+                *tf.entry(token).or_insert(0) += 1;
+            }
+            if !tf.is_empty() {
+                broadcast_query_tf = Some(tf);
+            }
+        }
+    }
+
     let mut scores = Vec::with_capacity(field_arr.len());
     for row in 0..field_arr.len() {
         if query_utf8.is_null(row) {
@@ -1512,6 +1504,20 @@ fn evaluate_bm25_score_array(
             continue;
         };
 
+        let dl = doc_lengths[row];
+        let norm = if avg_doc_len > 0.0 {
+            BM25_K1 * (1.0 - BM25_B + BM25_B * (dl / avg_doc_len))
+        } else {
+            BM25_K1
+        };
+
+        if let Some(query_tf) = broadcast_query_tf.as_ref() {
+            scores.push(score_bm25_terms(
+                tf, query_tf, &doc_freq, doc_count, norm, BM25_K1,
+            ));
+            continue;
+        }
+
         let query_tokens = tokenize_search_terms(query_utf8.value(row));
         if query_tokens.is_empty() {
             scores.push(0.0);
@@ -1522,33 +1528,38 @@ fn evaluate_bm25_score_array(
         for token in query_tokens {
             *query_tf.entry(token).or_insert(0) += 1;
         }
-
-        let dl = doc_lengths[row];
-        let norm = if avg_doc_len > 0.0 {
-            BM25_K1 * (1.0 - BM25_B + BM25_B * (dl / avg_doc_len))
-        } else {
-            BM25_K1
-        };
-
-        let mut score = 0.0f64;
-        for (term, qf) in query_tf {
-            let tf_term = *tf.get(&term).unwrap_or(&0) as f64;
-            if tf_term <= 0.0 {
-                continue;
-            }
-            let df = *doc_freq.get(&term).unwrap_or(&0) as f64;
-            let n = doc_count as f64;
-            let idf = (1.0 + ((n - df + 0.5) / (df + 0.5))).ln();
-            let numerator = tf_term * (BM25_K1 + 1.0);
-            let denom = tf_term + norm;
-            if denom > 0.0 {
-                score += idf * (numerator / denom) * (qf as f64);
-            }
-        }
-        scores.push(score);
+        scores.push(score_bm25_terms(
+            tf, &query_tf, &doc_freq, doc_count, norm, BM25_K1,
+        ));
     }
 
     Ok(Arc::new(Float64Array::from(scores)))
+}
+
+fn score_bm25_terms(
+    doc_tf: &AHashMap<String, usize>,
+    query_tf: &AHashMap<String, usize>,
+    doc_freq: &AHashMap<String, usize>,
+    doc_count: usize,
+    norm: f64,
+    k1: f64,
+) -> f64 {
+    let mut score = 0.0f64;
+    for (term, qf) in query_tf {
+        let tf_term = *doc_tf.get(term).unwrap_or(&0) as f64;
+        if tf_term <= 0.0 {
+            continue;
+        }
+        let df = *doc_freq.get(term).unwrap_or(&0) as f64;
+        let n = doc_count as f64;
+        let idf = (1.0 + ((n - df + 0.5) / (df + 0.5))).ln();
+        let numerator = tf_term * (k1 + 1.0);
+        let denom = tf_term + norm;
+        if denom > 0.0 {
+            score += idf * (numerator / denom) * (*qf as f64);
+        }
+    }
+    score
 }
 
 fn evaluate_rrf_score_array(
@@ -1636,7 +1647,9 @@ fn rank_positions_for_rrf(values: &[Option<f64>], descending: bool) -> Vec<Optio
         .collect();
 
     idx_values.sort_by(|(idx_a, val_a), (idx_b, val_b)| {
-        let ord = val_a.partial_cmp(val_b).unwrap_or(std::cmp::Ordering::Equal);
+        let ord = val_a
+            .partial_cmp(val_b)
+            .unwrap_or(std::cmp::Ordering::Equal);
         let ord = if descending { ord.reverse() } else { ord };
         ord.then_with(|| idx_a.cmp(idx_b))
     });
@@ -1715,6 +1728,24 @@ fn matches_keyword_search(field: &str, query: &str) -> bool {
         .all(|term| field_tokens.contains(term.as_str()))
 }
 
+fn matches_match_text(field: &str, query: &str) -> bool {
+    let field_tokens = tokenize_search_terms(field);
+    if field_tokens.is_empty() {
+        return false;
+    }
+    let query_tokens = tokenize_search_terms(query);
+    if query_tokens.is_empty() {
+        return false;
+    }
+    if query_tokens.len() > field_tokens.len() {
+        return false;
+    }
+
+    field_tokens
+        .windows(query_tokens.len())
+        .any(|window| window == query_tokens.as_slice())
+}
+
 fn matches_fuzzy_search(field: &str, query: &str, max_edits_override: Option<usize>) -> bool {
     let field_tokens = tokenize_search_terms(field);
     if field_tokens.is_empty() {
@@ -1791,52 +1822,7 @@ fn levenshtein_within(a: &str, b: &str, max_edits: usize) -> bool {
 }
 
 fn literal_to_array(lit: &Literal, num_rows: usize) -> Result<arrow_array::ArrayRef> {
-    use arrow_array::{
-        BooleanArray, Date32Array, Date64Array, Float64Array, Int64Array, StringArray,
-    };
-    match lit {
-        Literal::String(s) => Ok(Arc::new(StringArray::from(vec![s.as_str(); num_rows]))),
-        Literal::Integer(n) => Ok(Arc::new(Int64Array::from(vec![*n; num_rows]))),
-        Literal::Float(f) => Ok(Arc::new(Float64Array::from(vec![*f; num_rows]))),
-        Literal::Bool(b) => Ok(Arc::new(BooleanArray::from(vec![*b; num_rows]))),
-        Literal::Date(s) => {
-            let days = parse_date32_literal(s).map_err(|e| NanoError::Execution(e.to_string()))?;
-            Ok(Arc::new(Date32Array::from(vec![days; num_rows])))
-        }
-        Literal::DateTime(s) => {
-            let ms = parse_date64_literal(s).map_err(|e| NanoError::Execution(e.to_string()))?;
-            Ok(Arc::new(Date64Array::from(vec![ms; num_rows])))
-        }
-        Literal::List(items) => {
-            let rendered = serde_json::Value::Array(
-                items
-                    .iter()
-                    .map(literal_to_json_value_for_display)
-                    .collect::<Vec<_>>(),
-            )
-            .to_string();
-            Ok(Arc::new(StringArray::from(vec![rendered; num_rows])))
-        }
-    }
-}
-
-fn literal_to_json_value_for_display(lit: &Literal) -> serde_json::Value {
-    match lit {
-        Literal::String(v) => serde_json::Value::String(v.clone()),
-        Literal::Integer(v) => serde_json::Value::Number((*v).into()),
-        Literal::Float(v) => serde_json::Number::from_f64(*v)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null),
-        Literal::Bool(v) => serde_json::Value::Bool(*v),
-        Literal::Date(v) => serde_json::Value::String(v.clone()),
-        Literal::DateTime(v) => serde_json::Value::String(v.clone()),
-        Literal::List(values) => serde_json::Value::Array(
-            values
-                .iter()
-                .map(literal_to_json_value_for_display)
-                .collect(),
-        ),
-    }
+    literal_utils::literal_to_array(lit, num_rows).map_err(NanoError::Execution)
 }
 
 fn compare_arrays(
@@ -2415,8 +2401,9 @@ fn compute_nearest_distance_column(
             dot += a * b;
             vec_norm_sq += b * b;
         }
+        // Float32 vector inputs can produce small unstable norms above machine epsilon.
         let denom = query_norm * vec_norm_sq.sqrt();
-        let dist = if denom > f64::EPSILON {
+        let dist = if denom > 1e-10 {
             1.0 - (dot / denom)
         } else {
             f64::INFINITY
@@ -3095,7 +3082,7 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_match_text_boolean_array_matches_tokens() {
+    fn evaluate_match_text_boolean_array_matches_contiguous_token_phrase() {
         let field: ArrayRef = Arc::new(StringArray::from(vec![
             "enterprise procurement questionnaire backlog",
             "warm referral for analytics migration project",
@@ -3107,8 +3094,24 @@ mod tests {
 
         let out = evaluate_match_text_boolean_array(&field, &query).unwrap();
         let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert_eq!(out.value(0), true);
+        assert_eq!(out.value(0), false);
         assert_eq!(out.value(1), true);
+    }
+
+    #[test]
+    fn evaluate_match_text_and_search_have_distinct_semantics() {
+        let field: ArrayRef = Arc::new(StringArray::from(vec![
+            "enterprise procurement questionnaire backlog",
+        ]));
+        let query: ArrayRef = Arc::new(StringArray::from(vec!["procurement backlog"]));
+
+        let search = evaluate_search_boolean_array(&field, &query).unwrap();
+        let search = search.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert_eq!(search.value(0), true);
+
+        let match_text = evaluate_match_text_boolean_array(&field, &query).unwrap();
+        let match_text = match_text.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert_eq!(match_text.value(0), false);
     }
 
     #[test]
@@ -3153,8 +3156,8 @@ mod tests {
             ))),
         };
 
-        let out = evaluate_rrf_score_array(&primary, &secondary, None, &batch, &ParamMap::new())
-            .unwrap();
+        let out =
+            evaluate_rrf_score_array(&primary, &secondary, None, &batch, &ParamMap::new()).unwrap();
         let out = out.as_any().downcast_ref::<Float64Array>().unwrap();
         assert!(out.value(0) > out.value(1));
         assert!(out.value(0) > out.value(2));
@@ -3297,5 +3300,52 @@ mod tests {
             vec![out_ids.value(0), out_ids.value(1), out_ids.value(2)],
             vec![30, 10, 20]
         );
+    }
+
+    #[test]
+    fn compute_nearest_distance_column_preserves_null_vectors() {
+        let ids: ArrayRef = Arc::new(UInt64Array::from(vec![1_u64, 2_u64]));
+        let mut emb_builder = FixedSizeListBuilder::new(Float32Builder::new(), 2);
+        emb_builder.values().append_null();
+        emb_builder.values().append_null();
+        emb_builder.append(false);
+        emb_builder.values().append_value(1.0);
+        emb_builder.values().append_value(0.0);
+        emb_builder.append(true);
+        let embeddings: ArrayRef = Arc::new(emb_builder.finish());
+
+        let node_fields = Fields::from(vec![
+            Arc::new(Field::new("id", DataType::UInt64, false)),
+            Arc::new(Field::new(
+                "embedding",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+                true,
+            )),
+        ]);
+        let node_struct =
+            Arc::new(StructArray::new(node_fields, vec![ids, embeddings], None)) as ArrayRef;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "n",
+            node_struct.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![node_struct]).unwrap();
+
+        let distances = compute_nearest_distance_column(
+            &batch,
+            "n",
+            "embedding",
+            &IRExpr::Literal(Literal::List(vec![
+                Literal::Float(1.0),
+                Literal::Float(0.0),
+            ])),
+            &ParamMap::new(),
+        )
+        .unwrap();
+
+        let distances = distances.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert!(distances.is_null(0));
+        assert!((distances.value(1) - 0.0).abs() < 1e-9);
     }
 }

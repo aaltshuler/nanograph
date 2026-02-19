@@ -289,7 +289,7 @@ pub fn build_catalog_from_ir(ir: &SchemaIR) -> Result<Catalog> {
                     );
                 }
 
-                let lowercase_name = e.name[..1].to_lowercase() + &e.name[1..];
+                let lowercase_name = lowercase_first_char(&e.name);
                 edge_name_index.insert(lowercase_name, e.name.clone());
 
                 edge_types.insert(
@@ -310,6 +310,14 @@ pub fn build_catalog_from_ir(ir: &SchemaIR) -> Result<Catalog> {
         edge_types,
         edge_name_index,
     })
+}
+
+fn lowercase_first_char(name: &str) -> String {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    first.to_lowercase().chain(chars).collect()
 }
 
 /// Verify a schema.pg matches an existing IR.
@@ -589,5 +597,31 @@ node Person {
 
         let dir = SchemaIR::dir_name(pid);
         assert_eq!(dir.len(), 8);
+    }
+
+    #[test]
+    fn test_catalog_from_ir_handles_non_ascii_leading_edge_name() {
+        let ir = SchemaIR {
+            ir_version: 1,
+            types: vec![
+                TypeDef::Node(NodeTypeDef {
+                    name: "Person".to_string(),
+                    type_id: 100,
+                    properties: vec![],
+                }),
+                TypeDef::Edge(EdgeTypeDef {
+                    name: "Édges".to_string(),
+                    type_id: 200,
+                    src_type_id: 100,
+                    dst_type_id: 100,
+                    src_type_name: "Person".to_string(),
+                    dst_type_name: "Person".to_string(),
+                    properties: vec![],
+                }),
+            ],
+        };
+
+        let catalog = build_catalog_from_ir(&ir).unwrap();
+        assert!(catalog.lookup_edge_by_name("édges").is_some());
     }
 }
