@@ -38,19 +38,7 @@ pub(crate) async fn build_next_storage_for_load(
         ));
     }
     let materialized_data = if embeddings::has_embedding_specs(schema_ir) {
-        // Embedding requests are synchronous today; run materialization off the async runtime
-        // worker thread to avoid blocking unrelated async work.
-        let db_path = db_path.to_path_buf();
-        let schema_ir = schema_ir.clone();
-        let data_source = data_source.to_string();
-        tokio::task::spawn_blocking(move || {
-            embeddings::materialize_embeddings_for_load(&db_path, &schema_ir, &data_source)
-                .map(|cow| cow.into_owned())
-        })
-        .await
-        .map_err(|e| {
-            NanoError::Storage(format!("embedding materialization task failed: {}", e))
-        })??
+        embeddings::materialize_embeddings_for_load(db_path, schema_ir, data_source).await?
     } else {
         data_source.to_string()
     };

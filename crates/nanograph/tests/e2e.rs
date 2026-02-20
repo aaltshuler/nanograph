@@ -2,8 +2,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, FixedSizeListArray, Float32Array, Int32Array, Int64Array, RecordBatch, StringArray,
-    UInt64Array,
+    Array, FixedSizeListArray, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch,
+    StringArray, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
@@ -307,6 +307,24 @@ fn extract_u64_column(batches: &[RecordBatch], col_name: &str) -> Vec<u64> {
     result
 }
 
+fn extract_f64_column(batches: &[RecordBatch], col_name: &str) -> Vec<f64> {
+    let mut result = Vec::new();
+    for batch in batches {
+        let col_idx = batch.schema().index_of(col_name).unwrap();
+        let col = batch.column(col_idx);
+        let arr = col
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("expected Float64 column");
+        for i in 0..arr.len() {
+            if !arr.is_null(i) {
+                result.push(arr.value(i));
+            }
+        }
+    }
+    result
+}
+
 #[tokio::test]
 async fn test_bind_by_property() {
     let storage = setup_storage();
@@ -523,7 +541,7 @@ query q($q: Vector(4)) {
     match {
         $d: Doc
     }
-    return { $d.slug as slug }
+    return { $d.slug as slug, nearest($d.embedding, $q) as score }
     order { nearest($d.embedding, $q) }
     limit 2
 }
@@ -535,6 +553,10 @@ query q($q: Vector(4)) {
 
     let slugs = extract_string_column(&results, "slug");
     assert_eq!(slugs, vec!["a", "d"]);
+    let scores = extract_f64_column(&results, "score");
+    assert_eq!(scores.len(), 2);
+    assert!(scores[0] <= scores[1]);
+    assert!(scores[0].abs() < 1e-9);
 }
 
 #[tokio::test]

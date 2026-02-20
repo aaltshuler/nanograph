@@ -2,7 +2,7 @@
 
 Personal CRM and decision trace system. Demonstrates the complete physics of execution: from intelligence capture through enrichment, screening, decision-making, and execution.
 
-**Design docs:** [Use Cases & Diagrams](../../docs/user/revops-case.md) | [Graph Schema Spec](../../docs/user/revops-graph-schema.md)
+**Design docs:** [Context Graph Example](../../docs/user/context-graph-example.md)
 
 ## Files
 
@@ -131,7 +131,7 @@ Output formats: `table` (default), `csv`, `jsonl`, `json`.
 
 ## Seed Data: Stripe Migration Trace
 
-The seed data implements the complete three-phase trace from the [use case doc](../../docs/user/revops-case.md):
+The seed data implements the complete three-phase trace from the [context graph example](../../docs/user/context-graph-example.md):
 
 1. **Intelligence** — Jamie's coffee chat produces a Signal ("Priya hates her vendor"). The Signal surfaces the Stripe Migration opportunity.
 2. **Enrichment & Screening** — Andrew decides to make a proposal. The agent builds an Enrichment Profile from the Screening Policy criteria. The decision passes screening.

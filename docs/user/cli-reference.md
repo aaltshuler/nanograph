@@ -60,7 +60,7 @@ nanograph load <db_path> --data <data.jsonl> --mode <overwrite|append|merge>
 
 | Mode | Behavior |
 |------|----------|
-| `overwrite` | Replace all data for types present in the file |
+| `overwrite` | Replace the entire current graph snapshot with the loaded data |
 | `append` | Add rows without deduplication |
 | `merge` | Upsert by `@key` — update existing rows, insert new ones |
 
@@ -182,28 +182,21 @@ Migration steps have safety levels:
 
 Use `@rename_from("old_name")` in the schema to track type/property renames.
 
-## Schema annotations
-
-| Annotation | Description |
-|------------|-------------|
-| `@key` | Primary key for merge/upsert. One per node type. Auto-indexed. |
-| `@unique` | Uniqueness constraint. Enforced on load. Multiple per type. |
-| `@index` | Creates a Lance scalar index for faster filtering. |
-| `@rename_from("old")` | Tracks renames for schema migration. |
-
 ## Data format
 
-JSONL with one record per line.
+JSONL with one record per line. **Nodes and edges use different key names** — mixing them up is a common error.
 
-Nodes:
+Nodes use `"type"` + `"data"`:
 ```json
 {"type": "Person", "data": {"name": "Alice", "age": 30}}
 ```
 
-Edges (matched by node `@key` value within source/destination types):
+Edges use `"edge"` + `"from"` + `"to"` (matched by node `@key` value within source/destination types):
 ```json
 {"edge": "Knows", "from": "Alice", "to": "Bob"}
 ```
+
+> **Common mistake:** Using `{"type": "Knows", "src": "Alice", "dst": "Bob"}` for edges. This is parsed as a node record and will fail with "unknown node type".
 
 For each edge endpoint type, `@key` is required so `from`/`to` can be resolved.
 
@@ -218,24 +211,8 @@ Edges with properties:
 RUST_LOG=debug nanograph run --db mydb.nano --query q.gq --name my_query
 ```
 
-## Embedding env vars
+## See also
 
-When using `@embed(...)` fields or `nearest(..., $q: String)`, these environment variables control embedding behavior:
-
-| Env var | Description | Default |
-|--------|-------------|---------|
-| `OPENAI_API_KEY` | OpenAI API key (required only when real embedding calls are needed) | unset |
-| `NANOGRAPH_EMBED_MODEL` | Embedding model name | `text-embedding-3-small` |
-| `NANOGRAPH_EMBED_BATCH_SIZE` | Max texts per embedding API batch | `64` |
-| `NANOGRAPH_EMBED_CACHE_MAX_ENTRIES` | Max unique embedding cache entries retained on disk (LRU-like, newest kept) | `50000` |
-| `NANOGRAPH_EMBED_CACHE_LOCK_STALE_SECS` | Reclaim stale embedding cache lock files older than this many seconds | `60` |
-| `NANOGRAPH_EMBED_CHUNK_CHARS` | Per-text chunk size in characters for large source strings (`0` disables chunking) | `0` |
-| `NANOGRAPH_EMBED_CHUNK_OVERLAP_CHARS` | Character overlap between chunks (used only when chunking is enabled) | `128` |
-
-Example:
-
-```bash
-NANOGRAPH_EMBED_CHUNK_CHARS=1500 \
-NANOGRAPH_EMBED_CHUNK_OVERLAP_CHARS=200 \
-nanograph load my.nano --data docs.jsonl --mode overwrite
-```
+- [Schema Language Reference](schema.md) — types, annotations, naming conventions
+- [Query Language Reference](queries.md) — match, return, traversal, mutations
+- [Search Guide](search.md) — text search, vector search, embedding env vars

@@ -37,16 +37,17 @@ pub async fn execute_query(
     storage: Arc<GraphStorage>,
     params: &ParamMap,
 ) -> Result<Vec<RecordBatch>> {
+    let resolved_ir = resolve_nearest_query_embeddings(ir, storage.as_ref(), params).await?;
     info!("executing query");
-    let has_aggregation = ir
+    let has_aggregation = resolved_ir
         .return_exprs
         .iter()
         .any(|p| matches!(&p.expr, IRExpr::Aggregate { .. }));
 
     if !has_aggregation {
-        if let Some(candidate) = analyze_single_node_nearest_ann_candidate(ir, params) {
+        if let Some(candidate) = analyze_single_node_nearest_ann_candidate(&resolved_ir, params) {
             if let Some(result) = try_execute_single_node_nearest_ann_fast_path(
-                ir,
+                &resolved_ir,
                 storage.clone(),
                 params,
                 &candidate,
@@ -64,9 +65,9 @@ pub async fn execute_query(
         }
     }
 
-    let single_scan_pushdown = analyze_single_scan_pushdown(&ir.pipeline, params);
-    let scan_limit_pushdown = if !has_aggregation && ir.order_by.is_empty() {
-        ir.limit.and_then(|v| {
+    let single_scan_pushdown = analyze_single_scan_pushdown(&resolved_ir.pipeline, params);
+    let scan_limit_pushdown = if !has_aggregation && resolved_ir.order_by.is_empty() {
+        resolved_ir.limit.and_then(|v| {
             single_scan_pushdown
                 .as_ref()
                 .filter(|info| info.all_filters_pushdown)
@@ -75,10 +76,10 @@ pub async fn execute_query(
     } else {
         None
     };
-    let scan_projections = analyze_scan_projection_requirements(ir);
+    let scan_projections = analyze_scan_projection_requirements(&resolved_ir);
     // Build the physical plan from IR
     let plan = build_physical_plan(
-        &ir.pipeline,
+        &resolved_ir.pipeline,
         storage.clone(),
         params,
         scan_limit_pushdown,
@@ -109,11 +110,11 @@ pub async fn execute_query(
             if batch.num_rows() == 0 {
                 continue;
             }
-            let filtered = apply_ir_filters(&ir.pipeline, &[batch], params)?;
+            let filtered = apply_ir_filters(&resolved_ir.pipeline, &[batch], params)?;
             if filtered.is_empty() {
                 continue;
             }
-            let projected = apply_projection(&ir.return_exprs, &filtered, params)?;
+            let projected = apply_projection(&resolved_ir.return_exprs, &filtered, params)?;
             out.extend(projected.into_iter().filter(|b| b.num_rows() > 0));
         }
         info!(result_batches = out.len(), "query execution complete");
@@ -136,30 +137,32 @@ pub async fn execute_query(
     }
 
     // Apply filters from the pipeline that reference struct fields
-    let filtered = apply_ir_filters(&ir.pipeline, &batches, params)?;
+    let filtered = apply_ir_filters(&resolved_ir.pipeline, &batches, params)?;
 
     // Apply return projections
     if has_aggregation {
-        let result = apply_aggregation(&ir.return_exprs, &filtered, params)?;
-        let result = apply_order_and_limit(&result, &ir.order_by, ir.limit, params)?;
+        let result = apply_aggregation(&resolved_ir.return_exprs, &filtered, params)?;
+        let result =
+            apply_order_and_limit(&result, &resolved_ir.order_by, resolved_ir.limit, params)?;
         info!(result_batches = result.len(), "query execution complete");
         Ok(result)
     } else {
-        let has_nearest = ir
+        let has_nearest = resolved_ir
             .order_by
             .iter()
             .any(|o| matches!(o.expr, IRExpr::Nearest { .. }));
-        let has_alias_order = ir
+        let has_alias_order = resolved_ir
             .order_by
             .iter()
             .any(|o| matches!(o.expr, IRExpr::AliasRef(_)));
 
         let result = if has_alias_order && !has_nearest {
-            let projected = apply_projection(&ir.return_exprs, &filtered, params)?;
-            apply_order_and_limit(&projected, &ir.order_by, ir.limit, params)?
+            let projected = apply_projection(&resolved_ir.return_exprs, &filtered, params)?;
+            apply_order_and_limit(&projected, &resolved_ir.order_by, resolved_ir.limit, params)?
         } else {
-            let ordered = apply_order_and_limit(&filtered, &ir.order_by, ir.limit, params)?;
-            apply_projection(&ir.return_exprs, &ordered, params)?
+            let ordered =
+                apply_order_and_limit(&filtered, &resolved_ir.order_by, resolved_ir.limit, params)?;
+            apply_projection(&resolved_ir.return_exprs, &ordered, params)?
         };
         info!(result_batches = result.len(), "query execution complete");
         Ok(result)
@@ -233,6 +236,532 @@ fn analyze_single_node_nearest_ann_candidate(
         query: nearest_query,
         filters,
     })
+}
+
+async fn resolve_nearest_query_embeddings(
+    ir: &QueryIR,
+    storage: &GraphStorage,
+    params: &ParamMap,
+) -> Result<QueryIR> {
+    let mut variable_types = AHashMap::<String, String>::new();
+    collect_variable_types_from_ops(&ir.pipeline, &mut variable_types);
+
+    let mut requests = AHashSet::<(String, usize)>::new();
+    collect_nearest_embedding_requests(ir, storage, &variable_types, params, &mut requests)?;
+    if requests.is_empty() {
+        return Ok(ir.clone());
+    }
+
+    let client = EmbeddingClient::from_env()?;
+    let mut resolved_vectors = AHashMap::<(String, usize), Vec<f32>>::new();
+    for (text, dim) in requests {
+        let vector = client.embed_text(&text, dim).await?;
+        resolved_vectors.insert((text, dim), vector);
+    }
+
+    let mut resolved = ir.clone();
+    apply_resolved_nearest_embeddings(
+        &mut resolved,
+        storage,
+        &variable_types,
+        params,
+        &resolved_vectors,
+    )?;
+    Ok(resolved)
+}
+
+fn collect_variable_types_from_ops(ops: &[IROp], variable_types: &mut AHashMap<String, String>) {
+    for op in ops {
+        match op {
+            IROp::NodeScan {
+                variable,
+                type_name,
+                ..
+            } => {
+                variable_types.insert(variable.clone(), type_name.clone());
+            }
+            IROp::Expand {
+                dst_var, dst_type, ..
+            } => {
+                variable_types.insert(dst_var.clone(), dst_type.clone());
+            }
+            IROp::Filter(_) => {}
+            IROp::AntiJoin { inner, .. } => {
+                collect_variable_types_from_ops(inner, variable_types);
+            }
+        }
+    }
+}
+
+fn collect_nearest_embedding_requests(
+    ir: &QueryIR,
+    storage: &GraphStorage,
+    variable_types: &AHashMap<String, String>,
+    params: &ParamMap,
+    out: &mut AHashSet<(String, usize)>,
+) -> Result<()> {
+    for op in &ir.pipeline {
+        collect_nearest_embedding_requests_from_op(op, storage, variable_types, params, out)?;
+    }
+    for projection in &ir.return_exprs {
+        collect_nearest_embedding_requests_from_expr(
+            &projection.expr,
+            storage,
+            variable_types,
+            params,
+            out,
+        )?;
+    }
+    for ordering in &ir.order_by {
+        collect_nearest_embedding_requests_from_expr(
+            &ordering.expr,
+            storage,
+            variable_types,
+            params,
+            out,
+        )?;
+    }
+    Ok(())
+}
+
+fn collect_nearest_embedding_requests_from_op(
+    op: &IROp,
+    storage: &GraphStorage,
+    variable_types: &AHashMap<String, String>,
+    params: &ParamMap,
+    out: &mut AHashSet<(String, usize)>,
+) -> Result<()> {
+    match op {
+        IROp::NodeScan { filters, .. } => {
+            for filter in filters {
+                collect_nearest_embedding_requests_from_expr(
+                    &filter.left,
+                    storage,
+                    variable_types,
+                    params,
+                    out,
+                )?;
+                collect_nearest_embedding_requests_from_expr(
+                    &filter.right,
+                    storage,
+                    variable_types,
+                    params,
+                    out,
+                )?;
+            }
+        }
+        IROp::Expand { .. } => {}
+        IROp::Filter(filter) => {
+            collect_nearest_embedding_requests_from_expr(
+                &filter.left,
+                storage,
+                variable_types,
+                params,
+                out,
+            )?;
+            collect_nearest_embedding_requests_from_expr(
+                &filter.right,
+                storage,
+                variable_types,
+                params,
+                out,
+            )?;
+        }
+        IROp::AntiJoin { inner, .. } => {
+            for inner_op in inner {
+                collect_nearest_embedding_requests_from_op(
+                    inner_op,
+                    storage,
+                    variable_types,
+                    params,
+                    out,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_nearest_embedding_requests_from_expr(
+    expr: &IRExpr,
+    storage: &GraphStorage,
+    variable_types: &AHashMap<String, String>,
+    params: &ParamMap,
+    out: &mut AHashSet<(String, usize)>,
+) -> Result<()> {
+    match expr {
+        IRExpr::Nearest {
+            variable,
+            property,
+            query,
+        } => {
+            let dim = lookup_nearest_vector_dim(storage, variable_types, variable, property)?;
+            let query_literal = nearest_query_literal(query.as_ref(), params)?;
+            if let Literal::String(text) = query_literal {
+                out.insert((text.clone(), dim));
+            }
+        }
+        IRExpr::Search { field, query }
+        | IRExpr::MatchText { field, query }
+        | IRExpr::Bm25 { field, query } => {
+            collect_nearest_embedding_requests_from_expr(
+                field.as_ref(),
+                storage,
+                variable_types,
+                params,
+                out,
+            )?;
+            collect_nearest_embedding_requests_from_expr(
+                query.as_ref(),
+                storage,
+                variable_types,
+                params,
+                out,
+            )?;
+        }
+        IRExpr::Fuzzy {
+            field,
+            query,
+            max_edits,
+        } => {
+            collect_nearest_embedding_requests_from_expr(
+                field.as_ref(),
+                storage,
+                variable_types,
+                params,
+                out,
+            )?;
+            collect_nearest_embedding_requests_from_expr(
+                query.as_ref(),
+                storage,
+                variable_types,
+                params,
+                out,
+            )?;
+            if let Some(max_edits) = max_edits {
+                collect_nearest_embedding_requests_from_expr(
+                    max_edits.as_ref(),
+                    storage,
+                    variable_types,
+                    params,
+                    out,
+                )?;
+            }
+        }
+        IRExpr::Rrf {
+            primary,
+            secondary,
+            k,
+        } => {
+            collect_nearest_embedding_requests_from_expr(
+                primary.as_ref(),
+                storage,
+                variable_types,
+                params,
+                out,
+            )?;
+            collect_nearest_embedding_requests_from_expr(
+                secondary.as_ref(),
+                storage,
+                variable_types,
+                params,
+                out,
+            )?;
+            if let Some(k) = k {
+                collect_nearest_embedding_requests_from_expr(
+                    k.as_ref(),
+                    storage,
+                    variable_types,
+                    params,
+                    out,
+                )?;
+            }
+        }
+        IRExpr::Aggregate { arg, .. } => {
+            collect_nearest_embedding_requests_from_expr(
+                arg.as_ref(),
+                storage,
+                variable_types,
+                params,
+                out,
+            )?;
+        }
+        IRExpr::PropAccess { .. }
+        | IRExpr::Variable(_)
+        | IRExpr::Param(_)
+        | IRExpr::Literal(_)
+        | IRExpr::AliasRef(_) => {}
+    }
+    Ok(())
+}
+
+fn apply_resolved_nearest_embeddings(
+    ir: &mut QueryIR,
+    storage: &GraphStorage,
+    variable_types: &AHashMap<String, String>,
+    params: &ParamMap,
+    vectors: &AHashMap<(String, usize), Vec<f32>>,
+) -> Result<()> {
+    for op in &mut ir.pipeline {
+        apply_resolved_nearest_embeddings_to_op(op, storage, variable_types, params, vectors)?;
+    }
+    for projection in &mut ir.return_exprs {
+        apply_resolved_nearest_embeddings_to_expr(
+            &mut projection.expr,
+            storage,
+            variable_types,
+            params,
+            vectors,
+        )?;
+    }
+    for ordering in &mut ir.order_by {
+        apply_resolved_nearest_embeddings_to_expr(
+            &mut ordering.expr,
+            storage,
+            variable_types,
+            params,
+            vectors,
+        )?;
+    }
+    Ok(())
+}
+
+fn apply_resolved_nearest_embeddings_to_op(
+    op: &mut IROp,
+    storage: &GraphStorage,
+    variable_types: &AHashMap<String, String>,
+    params: &ParamMap,
+    vectors: &AHashMap<(String, usize), Vec<f32>>,
+) -> Result<()> {
+    match op {
+        IROp::NodeScan { filters, .. } => {
+            for filter in filters {
+                apply_resolved_nearest_embeddings_to_expr(
+                    &mut filter.left,
+                    storage,
+                    variable_types,
+                    params,
+                    vectors,
+                )?;
+                apply_resolved_nearest_embeddings_to_expr(
+                    &mut filter.right,
+                    storage,
+                    variable_types,
+                    params,
+                    vectors,
+                )?;
+            }
+        }
+        IROp::Expand { .. } => {}
+        IROp::Filter(filter) => {
+            apply_resolved_nearest_embeddings_to_expr(
+                &mut filter.left,
+                storage,
+                variable_types,
+                params,
+                vectors,
+            )?;
+            apply_resolved_nearest_embeddings_to_expr(
+                &mut filter.right,
+                storage,
+                variable_types,
+                params,
+                vectors,
+            )?;
+        }
+        IROp::AntiJoin { inner, .. } => {
+            for inner_op in inner {
+                apply_resolved_nearest_embeddings_to_op(
+                    inner_op,
+                    storage,
+                    variable_types,
+                    params,
+                    vectors,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn apply_resolved_nearest_embeddings_to_expr(
+    expr: &mut IRExpr,
+    storage: &GraphStorage,
+    variable_types: &AHashMap<String, String>,
+    params: &ParamMap,
+    vectors: &AHashMap<(String, usize), Vec<f32>>,
+) -> Result<()> {
+    match expr {
+        IRExpr::Nearest {
+            variable,
+            property,
+            query,
+        } => {
+            let dim = lookup_nearest_vector_dim(storage, variable_types, variable, property)?;
+            let query_literal = nearest_query_literal(query.as_ref(), params)?;
+            if let Literal::String(text) = query_literal {
+                let key = (text.clone(), dim);
+                let vector = vectors.get(&key).ok_or_else(|| {
+                    NanoError::Execution(format!(
+                        "missing resolved embedding vector for nearest() query (dim={})",
+                        dim
+                    ))
+                })?;
+                *query = Box::new(IRExpr::Literal(vector_to_literal(vector)));
+            }
+        }
+        IRExpr::Search { field, query }
+        | IRExpr::MatchText { field, query }
+        | IRExpr::Bm25 { field, query } => {
+            apply_resolved_nearest_embeddings_to_expr(
+                field.as_mut(),
+                storage,
+                variable_types,
+                params,
+                vectors,
+            )?;
+            apply_resolved_nearest_embeddings_to_expr(
+                query.as_mut(),
+                storage,
+                variable_types,
+                params,
+                vectors,
+            )?;
+        }
+        IRExpr::Fuzzy {
+            field,
+            query,
+            max_edits,
+        } => {
+            apply_resolved_nearest_embeddings_to_expr(
+                field.as_mut(),
+                storage,
+                variable_types,
+                params,
+                vectors,
+            )?;
+            apply_resolved_nearest_embeddings_to_expr(
+                query.as_mut(),
+                storage,
+                variable_types,
+                params,
+                vectors,
+            )?;
+            if let Some(max_edits) = max_edits {
+                apply_resolved_nearest_embeddings_to_expr(
+                    max_edits.as_mut(),
+                    storage,
+                    variable_types,
+                    params,
+                    vectors,
+                )?;
+            }
+        }
+        IRExpr::Rrf {
+            primary,
+            secondary,
+            k,
+        } => {
+            apply_resolved_nearest_embeddings_to_expr(
+                primary.as_mut(),
+                storage,
+                variable_types,
+                params,
+                vectors,
+            )?;
+            apply_resolved_nearest_embeddings_to_expr(
+                secondary.as_mut(),
+                storage,
+                variable_types,
+                params,
+                vectors,
+            )?;
+            if let Some(k) = k {
+                apply_resolved_nearest_embeddings_to_expr(
+                    k.as_mut(),
+                    storage,
+                    variable_types,
+                    params,
+                    vectors,
+                )?;
+            }
+        }
+        IRExpr::Aggregate { arg, .. } => {
+            apply_resolved_nearest_embeddings_to_expr(
+                arg.as_mut(),
+                storage,
+                variable_types,
+                params,
+                vectors,
+            )?;
+        }
+        IRExpr::PropAccess { .. }
+        | IRExpr::Variable(_)
+        | IRExpr::Param(_)
+        | IRExpr::Literal(_)
+        | IRExpr::AliasRef(_) => {}
+    }
+    Ok(())
+}
+
+fn nearest_query_literal<'a>(query: &'a IRExpr, params: &'a ParamMap) -> Result<&'a Literal> {
+    match query {
+        IRExpr::Literal(lit) => Ok(lit),
+        IRExpr::Param(name) => params
+            .get(name)
+            .ok_or_else(|| NanoError::Execution(format!("parameter `${}` not provided", name))),
+        _ => Err(NanoError::Execution(
+            "nearest() query must be a Vector or String literal/parameter".to_string(),
+        )),
+    }
+}
+
+fn lookup_nearest_vector_dim(
+    storage: &GraphStorage,
+    variable_types: &AHashMap<String, String>,
+    variable: &str,
+    property: &str,
+) -> Result<usize> {
+    let type_name = variable_types.get(variable).ok_or_else(|| {
+        NanoError::Execution(format!(
+            "nearest() variable `{}` is not bound to a node type",
+            variable
+        ))
+    })?;
+    let node_type = storage.catalog.node_types.get(type_name).ok_or_else(|| {
+        NanoError::Execution(format!(
+            "nearest() node type `{}` not found in catalog",
+            type_name
+        ))
+    })?;
+    let prop = node_type.properties.get(property).ok_or_else(|| {
+        NanoError::Execution(format!(
+            "nearest() property `{}` not found on node type `{}`",
+            property, type_name
+        ))
+    })?;
+    if prop.list {
+        return Err(NanoError::Execution(format!(
+            "nearest() property `{}` on `{}` must be Vector(dim)",
+            property, type_name
+        )));
+    }
+    match prop.scalar {
+        ScalarType::Vector(dim) if dim > 0 => Ok(dim as usize),
+        _ => Err(NanoError::Execution(format!(
+            "nearest() property `{}` on `{}` must be Vector(dim)",
+            property, type_name
+        ))),
+    }
+}
+
+fn vector_to_literal(vector: &[f32]) -> Literal {
+    Literal::List(
+        vector
+            .iter()
+            .map(|v| Literal::Float(*v as f64))
+            .collect::<Vec<_>>(),
+    )
 }
 
 async fn try_execute_single_node_nearest_ann_fast_path(
@@ -2419,15 +2948,6 @@ fn resolve_nearest_query_vector(
     params: &ParamMap,
     expected_dim: usize,
 ) -> Result<Vec<f32>> {
-    resolve_nearest_query_vector_with_embedder(expr, params, expected_dim, None)
-}
-
-fn resolve_nearest_query_vector_with_embedder(
-    expr: &IRExpr,
-    params: &ParamMap,
-    expected_dim: usize,
-    embedder: Option<&EmbeddingClient>,
-) -> Result<Vec<f32>> {
     let lit = match expr {
         IRExpr::Literal(lit) => lit,
         IRExpr::Param(name) => params
@@ -2439,22 +2959,16 @@ fn resolve_nearest_query_vector_with_embedder(
             ));
         }
     };
-    literal_to_query_vector(lit, expected_dim, embedder)
+    literal_to_query_vector(lit, expected_dim)
 }
 
-fn literal_to_query_vector(
-    lit: &Literal,
-    expected_dim: usize,
-    embedder: Option<&EmbeddingClient>,
-) -> Result<Vec<f32>> {
+fn literal_to_query_vector(lit: &Literal, expected_dim: usize) -> Result<Vec<f32>> {
     let vec = match lit {
         Literal::List(items) => literal_list_to_f32_vector(items)?,
-        Literal::String(text) => {
-            if let Some(embedder) = embedder {
-                embedder.embed_text(text, expected_dim)?
-            } else {
-                EmbeddingClient::from_env()?.embed_text(text, expected_dim)?
-            }
+        Literal::String(_) => {
+            return Err(NanoError::Execution(
+                "nearest() string query was not pre-resolved to an embedding vector".to_string(),
+            ));
         }
         _ => {
             return Err(NanoError::Execution(
@@ -3223,15 +3737,16 @@ mod tests {
     }
 
     #[test]
-    fn resolve_nearest_query_vector_supports_string_param_with_embedder() {
+    fn resolve_nearest_query_vector_rejects_unresolved_string_query() {
         let mut params = ParamMap::new();
         params.insert("q".to_string(), Literal::String("alpha".to_string()));
         let query = IRExpr::Param("q".to_string());
-        let embedder = EmbeddingClient::mock_for_tests();
 
-        let vec = resolve_nearest_query_vector_with_embedder(&query, &params, 5, Some(&embedder))
-            .unwrap();
-        assert_eq!(vec.len(), 5);
+        let err = resolve_nearest_query_vector(&query, &params, 5).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("nearest() string query was not pre-resolved")
+        );
     }
 
     #[test]

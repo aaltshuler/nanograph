@@ -1,8 +1,8 @@
-use std::thread::sleep;
 use std::time::Duration;
 
-use reqwest::blocking::Client;
+use reqwest::Client;
 use serde::Deserialize;
+use tokio::time::sleep;
 
 use crate::error::{NanoError, Result};
 
@@ -125,14 +125,14 @@ impl EmbeddingClient {
         &self.model
     }
 
-    pub(crate) fn embed_text(&self, input: &str, expected_dim: usize) -> Result<Vec<f32>> {
-        let mut vectors = self.embed_texts(&[input.to_string()], expected_dim)?;
+    pub(crate) async fn embed_text(&self, input: &str, expected_dim: usize) -> Result<Vec<f32>> {
+        let mut vectors = self.embed_texts(&[input.to_string()], expected_dim).await?;
         vectors.pop().ok_or_else(|| {
             NanoError::Execution("embedding provider returned no vector".to_string())
         })
     }
 
-    pub(crate) fn embed_texts(
+    pub(crate) async fn embed_texts(
         &self,
         inputs: &[String],
         expected_dim: usize,
@@ -153,11 +153,12 @@ impl EmbeddingClient {
                 .collect()),
             EmbeddingTransport::OpenAi { .. } => {
                 self.embed_texts_openai_with_retry(inputs, expected_dim)
+                    .await
             }
         }
     }
 
-    fn embed_texts_openai_with_retry(
+    async fn embed_texts_openai_with_retry(
         &self,
         inputs: &[String],
         expected_dim: usize,
@@ -166,7 +167,7 @@ impl EmbeddingClient {
         let mut attempt = 0usize;
         loop {
             attempt += 1;
-            match self.embed_texts_openai_once(inputs, expected_dim) {
+            match self.embed_texts_openai_once(inputs, expected_dim).await {
                 Ok(vectors) => return Ok(vectors),
                 Err(err) => {
                     if !err.retryable || attempt >= max_attempt {
@@ -174,13 +175,13 @@ impl EmbeddingClient {
                     }
                     let shift = (attempt - 1).min(10) as u32;
                     let delay = self.retry_backoff_ms.saturating_mul(1u64 << shift);
-                    sleep(Duration::from_millis(delay));
+                    sleep(Duration::from_millis(delay)).await;
                 }
             }
         }
     }
 
-    fn embed_texts_openai_once(
+    async fn embed_texts_openai_once(
         &self,
         inputs: &[String],
         expected_dim: usize,
@@ -200,7 +201,12 @@ impl EmbeddingClient {
             "dimensions": expected_dim,
         });
         let url = format!("{}/embeddings", base_url);
-        let response = http.post(&url).bearer_auth(api_key).json(&request).send();
+        let response = http
+            .post(&url)
+            .bearer_auth(api_key)
+            .json(&request)
+            .send()
+            .await;
 
         let response = match response {
             Ok(resp) => resp,
@@ -214,7 +220,7 @@ impl EmbeddingClient {
         };
 
         let status = response.status();
-        let body = match response.text() {
+        let body = match response.text().await {
             Ok(body) => body,
             Err(err) => {
                 return Err(EmbedCallError {
@@ -358,12 +364,12 @@ fn xorshift64(mut x: u64) -> u64 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn mock_embeddings_are_deterministic() {
+    #[tokio::test]
+    async fn mock_embeddings_are_deterministic() {
         let client = EmbeddingClient::mock_for_tests();
-        let a = client.embed_text("alpha", 8).unwrap();
-        let b = client.embed_text("alpha", 8).unwrap();
-        let c = client.embed_text("beta", 8).unwrap();
+        let a = client.embed_text("alpha", 8).await.unwrap();
+        let b = client.embed_text("alpha", 8).await.unwrap();
+        let c = client.embed_text("beta", 8).await.unwrap();
         assert_eq!(a, b);
         assert_ne!(a, c);
         assert_eq!(a.len(), 8);

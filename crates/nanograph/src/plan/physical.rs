@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use ahash::{AHashMap, AHashSet};
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array,
-    Int32Array, Int64Array, ListArray, RecordBatch, StringArray, StructArray, UInt32Array,
-    UInt64Array,
+    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, FixedSizeListArray, Float32Array,
+    Float64Array, Int32Array, Int64Array, ListArray, RecordBatch, StringArray, StructArray,
+    UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion_common::Result as DFResult;
@@ -234,6 +234,74 @@ impl ExecutionPlan for ExpandExec {
 }
 
 impl ExpandExec {
+    fn output_struct_fields(output_schema: &SchemaRef, struct_name: &str) -> DFResult<Vec<Field>> {
+        let struct_idx = output_schema.index_of(struct_name).map_err(|e| {
+            datafusion_common::DataFusionError::Execution(format!(
+                "expand output schema missing destination field '{}': {}",
+                struct_name, e
+            ))
+        })?;
+        let struct_field = output_schema.field(struct_idx);
+        match struct_field.data_type() {
+            DataType::Struct(fields) => Ok(fields
+                .iter()
+                .map(|f| f.as_ref().clone())
+                .collect::<Vec<Field>>()),
+            other => Err(datafusion_common::DataFusionError::Execution(format!(
+                "expand destination field '{}' expected Struct, found {other:?}",
+                struct_name
+            ))),
+        }
+    }
+
+    fn align_column_to_field(col: &ArrayRef, field: &Field) -> DFResult<ArrayRef> {
+        if col.data_type() == field.data_type() {
+            return Ok(col.clone());
+        }
+
+        if let (
+            DataType::FixedSizeList(actual, actual_dim),
+            DataType::FixedSizeList(expected, expected_dim),
+        ) = (col.data_type(), field.data_type())
+        {
+            if actual_dim == expected_dim && actual.data_type() == expected.data_type() {
+                let list = col
+                    .as_any()
+                    .downcast_ref::<FixedSizeListArray>()
+                    .ok_or_else(|| {
+                        datafusion_common::DataFusionError::Execution(
+                            "failed to downcast FixedSizeList column while aligning expand output"
+                                .to_string(),
+                        )
+                    })?;
+                let rebuilt = FixedSizeListArray::try_new(
+                    expected.clone(),
+                    *expected_dim,
+                    list.values().clone(),
+                    list.nulls().cloned(),
+                )
+                .map_err(|e| {
+                    datafusion_common::DataFusionError::Execution(format!(
+                        "failed to align FixedSizeList column '{}': {}",
+                        field.name(),
+                        e
+                    ))
+                })?;
+                return Ok(Arc::new(rebuilt) as ArrayRef);
+            }
+        }
+
+        arrow_cast::cast(col, field.data_type()).map_err(|e| {
+            datafusion_common::DataFusionError::Execution(format!(
+                "failed to cast expanded column '{}' from {:?} to {:?}: {}",
+                field.name(),
+                col.data_type(),
+                field.data_type(),
+                e
+            ))
+        })
+    }
+
     fn expand_batch(&self, input: &RecordBatch) -> DFResult<RecordBatch> {
         let edge_seg = self
             .storage
@@ -354,20 +422,25 @@ impl ExpandExec {
 
         // Build destination struct column
         let dst_schema = dst_batch.schema();
-        let mut dst_field_arrays: Vec<ArrayRef> = Vec::with_capacity(dst_schema.fields().len());
+        let dst_struct_fields = Self::output_struct_fields(&self.output_schema, &self.dst_var)?;
+        let mut dst_field_arrays: Vec<ArrayRef> = Vec::with_capacity(dst_struct_fields.len());
 
         let dst_row_indices: Vec<usize> = valid_indices.iter().map(|(_, dr)| *dr).collect();
-        for field_idx in 0..dst_schema.fields().len() {
+        for field in &dst_struct_fields {
+            let field_idx = dst_schema.index_of(field.name()).map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "destination column '{}' missing in type '{}': {}",
+                    field.name(),
+                    self.dst_type,
+                    e
+                ))
+            })?;
             let dst_col = dst_batch.column(field_idx);
             let taken = take_rows(dst_col, &dst_row_indices)?;
-            dst_field_arrays.push(taken);
+            let aligned = Self::align_column_to_field(&taken, field)?;
+            dst_field_arrays.push(aligned);
         }
 
-        let dst_struct_fields: Vec<Field> = dst_schema
-            .fields()
-            .iter()
-            .map(|f| f.as_ref().clone())
-            .collect();
         let dst_struct_array = StructArray::new(dst_struct_fields.into(), dst_field_arrays, None);
         output_columns.push(Arc::new(dst_struct_array));
 
@@ -470,6 +543,34 @@ fn collect_unbounded_neighbors(csr: &CsrIndex, src_id: u64, min_hops: u32) -> Ve
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ExpandExec;
+    use arrow_array::ArrayRef;
+    use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
+    use arrow_schema::{DataType, Field};
+    use std::sync::Arc;
+
+    #[test]
+    fn align_column_to_field_rebuilds_fixed_size_list_child_nullability() {
+        let mut emb_builder = FixedSizeListBuilder::new(Float32Builder::new(), 2);
+        emb_builder.values().append_value(1.0);
+        emb_builder.values().append_value(2.0);
+        emb_builder.append(true);
+        let actual = Arc::new(emb_builder.finish()) as ArrayRef;
+
+        let expected = Field::new(
+            "embedding",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 2),
+            false,
+        );
+
+        let aligned = ExpandExec::align_column_to_field(&actual, &expected)
+            .expect("align vector child nullability");
+        assert_eq!(aligned.data_type(), expected.data_type());
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]

@@ -8,6 +8,8 @@
 - [x] `nanograph export --format jsonl` — dump full graph to stdout for git-friendly snapshots
 - [ ] Progress bars on `nanograph load` for large datasets (indicatif)
 - [x] `nanograph version --db` — print current Lance version per dataset type
+- [ ] locked node types
+- [ ] Encryption
 
 ## Query
 
@@ -16,7 +18,8 @@
 
 ## Storage
 
-- [ ] Content-addressed node IDs — derive from `@key` hash instead of auto-increment u64
+- [x] Content-addressed node IDs — derive from `@key` hash instead of auto-increment u64
+- [ ] Multimedia content + embeddings
 
 ## Schema / Types
 
@@ -27,3 +30,15 @@
 ## Performance
 
 - [ ] Benchmark suite + targets (criterion) — NodeScan 10K, 2-hop expansion 10K, JSONL load 100K
+
+## UX
+
+- [ ] Nudges for agents (proactivity)
+- [ ] ASCII Graphs for visualizing data
+
+## SDK
+
+- [ ] Rust SDK — `nanograph-rs` crate for Rust applications
+- [ ] Python SDK — `nanograph-py` package for Python applications
+- [ ] TypeScript SDK — `nanograph-ts` package for TypeScript/JavaScript applications
+- [ ] Go SDK — `nanograph-go` package for Go applications

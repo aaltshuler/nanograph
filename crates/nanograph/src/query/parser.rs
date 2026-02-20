@@ -437,6 +437,7 @@ fn parse_expr(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
         Rule::search_call => parse_search_call(inner),
         Rule::fuzzy_call => parse_fuzzy_call(inner),
         Rule::match_text_call => parse_match_text_call(inner),
+        Rule::nearest_ordering => parse_nearest_ordering(inner),
         Rule::bm25_call => parse_bm25_call(inner),
         Rule::rrf_call => parse_rrf_call(inner),
         Rule::ident => Ok(Expr::AliasRef(inner.as_str().to_string())),
@@ -656,7 +657,13 @@ fn parse_ordering(pair: pest::iterators::Pair<Rule>) -> Result<Ordering> {
         Rule::nearest_ordering => (parse_nearest_ordering(first)?, false),
         Rule::expr => {
             let expr = parse_expr(first)?;
-            let descending = inner.next().map_or(false, |p| p.as_str() == "desc");
+            let direction = inner.next().map(|p| p.as_str().to_string());
+            if matches!(expr, Expr::Nearest { .. }) && direction.is_some() {
+                return Err(NanoError::Parse(
+                    "nearest() ordering does not accept asc/desc modifiers".to_string(),
+                ));
+            }
+            let descending = matches!(direction.as_deref(), Some("desc"));
             (expr, descending)
         }
         other => {
@@ -1180,6 +1187,37 @@ query similar($q: Vector(3)) {
 }
 "#;
         assert!(parse_query(input).is_err());
+    }
+
+    #[test]
+    fn test_parse_nearest_expression_in_return_projection() {
+        let input = r#"
+query similar($q: Vector(3)) {
+    match { $d: Doc }
+    return { $d.id, nearest($d.embedding, $q) as score }
+    order { nearest($d.embedding, $q) }
+    limit 5
+}
+"#;
+        let qf = parse_query(input).unwrap();
+        let q = &qf.queries[0];
+        assert_eq!(q.return_clause.len(), 2);
+        match &q.return_clause[1].expr {
+            Expr::Nearest {
+                variable,
+                property,
+                query,
+            } => {
+                assert_eq!(variable, "d");
+                assert_eq!(property, "embedding");
+                assert!(matches!(query.as_ref(), Expr::Variable(v) if v == "q"));
+            }
+            other => panic!(
+                "expected nearest expression in return projection, got {:?}",
+                other
+            ),
+        }
+        assert_eq!(q.return_clause[1].alias.as_deref(), Some("score"));
     }
 
     #[test]

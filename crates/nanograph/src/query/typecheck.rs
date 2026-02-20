@@ -179,16 +179,33 @@ fn typecheck_mutation(catalog: &Catalog, mutation: &Mutation, params: &[Param]) 
                     )?;
                 }
 
+                let assigned_props: HashSet<&str> = insert
+                    .assignments
+                    .iter()
+                    .map(|assignment| assignment.property.as_str())
+                    .collect();
                 for (prop_name, prop_type) in &node_type.properties {
                     if prop_type.nullable {
                         continue;
                     }
-                    if !insert.assignments.iter().any(|a| &a.property == prop_name) {
+                    if assigned_props.contains(prop_name.as_str()) {
+                        continue;
+                    }
+
+                    if let Some(source_prop) = node_type.embed_sources.get(prop_name) {
+                        if assigned_props.contains(source_prop.as_str()) {
+                            continue;
+                        }
                         return Err(NanoError::Type(format!(
-                            "T12: insert for `{}` must provide non-nullable property `{}`",
-                            insert.type_name, prop_name
+                            "T12: insert for `{}` must provide non-nullable property `{}` or @embed source `{}`",
+                            insert.type_name, prop_name, source_prop
                         )));
                     }
+
+                    return Err(NanoError::Type(format!(
+                        "T12: insert for `{}` must provide non-nullable property `{}`",
+                        insert.type_name, prop_name
+                    )));
                 }
                 return Ok(insert.type_name.clone());
             }
@@ -1424,6 +1441,20 @@ node Doc {
         build_catalog(&schema).unwrap()
     }
 
+    fn setup_embed_vector() -> Catalog {
+        let schema = parse_schema(
+            r#"
+node Doc {
+    slug: String
+    body: String?
+    embedding: Vector(3) @embed(body)
+}
+"#,
+        )
+        .unwrap();
+        build_catalog(&schema).unwrap()
+    }
+
     #[test]
     fn test_basic_binding() {
         let catalog = setup();
@@ -2110,6 +2141,47 @@ query add_person($age: I32) {
         .unwrap();
         let err = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap_err();
         assert!(err.to_string().contains("T12"));
+    }
+
+    #[test]
+    fn test_mutation_insert_allows_embed_target_omission_when_source_present() {
+        let catalog = setup_embed_vector();
+        let qf = parse_query(
+            r#"
+query add_doc($slug: String, $body: String) {
+    insert Doc {
+        slug: $slug
+        body: $body
+    }
+}
+"#,
+        )
+        .unwrap();
+        let checked = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap();
+        match checked {
+            CheckedQuery::Mutation(ctx) => assert_eq!(ctx.target_type, "Doc"),
+            _ => panic!("expected mutation typecheck result"),
+        }
+    }
+
+    #[test]
+    fn test_mutation_insert_requires_embed_source_when_target_omitted() {
+        let catalog = setup_embed_vector();
+        let qf = parse_query(
+            r#"
+query add_doc($slug: String) {
+    insert Doc {
+        slug: $slug
+    }
+}
+"#,
+        )
+        .unwrap();
+        let err = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("T12"));
+        assert!(msg.contains("embedding"));
+        assert!(msg.contains("body"));
     }
 
     #[test]

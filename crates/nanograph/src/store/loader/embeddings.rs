@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -96,20 +95,20 @@ impl EmbedChunkingConfig {
     }
 }
 
-pub(crate) fn materialize_embeddings_for_load<'a>(
+pub(crate) async fn materialize_embeddings_for_load(
     db_path: &Path,
     schema_ir: &SchemaIR,
-    data_source: &'a str,
-) -> Result<Cow<'a, str>> {
-    materialize_embeddings_for_load_inner(db_path, schema_ir, data_source, None)
+    data_source: &str,
+) -> Result<String> {
+    materialize_embeddings_for_load_inner(db_path, schema_ir, data_source, None).await
 }
 
-fn materialize_embeddings_for_load_inner<'a>(
+async fn materialize_embeddings_for_load_inner(
     db_path: &Path,
     schema_ir: &SchemaIR,
-    data_source: &'a str,
+    data_source: &str,
     client_override: Option<&EmbeddingClient>,
-) -> Result<Cow<'a, str>> {
+) -> Result<String> {
     materialize_embeddings_for_load_inner_with_chunking(
         db_path,
         schema_ir,
@@ -117,6 +116,7 @@ fn materialize_embeddings_for_load_inner<'a>(
         client_override,
         EmbedChunkingConfig::from_env(),
     )
+    .await
 }
 
 pub(crate) fn has_embedding_specs(schema_ir: &SchemaIR) -> bool {
@@ -127,23 +127,23 @@ pub(crate) fn has_embedding_specs(schema_ir: &SchemaIR) -> bool {
     })
 }
 
-fn materialize_embeddings_for_load_inner_with_chunking<'a>(
+async fn materialize_embeddings_for_load_inner_with_chunking(
     db_path: &Path,
     schema_ir: &SchemaIR,
-    data_source: &'a str,
+    data_source: &str,
     client_override: Option<&EmbeddingClient>,
     chunking: EmbedChunkingConfig,
-) -> Result<Cow<'a, str>> {
+) -> Result<String> {
     let embed_specs = collect_embed_specs(schema_ir)?;
     if embed_specs.is_empty() {
-        return Ok(Cow::Borrowed(data_source));
+        return Ok(data_source.to_string());
     }
 
     let mut lines = Vec::new();
     let mut pending = Vec::new();
     parse_input_lines(data_source, &embed_specs, &mut lines, &mut pending)?;
     if pending.is_empty() {
-        return Ok(Cow::Borrowed(data_source));
+        return Ok(data_source.to_string());
     }
 
     let cache_path = db_path.join(EMBEDDING_CACHE_FILENAME);
@@ -183,7 +183,8 @@ fn materialize_embeddings_for_load_inner_with_chunking<'a>(
     for (dim, entries) in missing_by_dim {
         if chunking.is_enabled() {
             for (key, text) in entries {
-                let vector = embed_text_with_chunking(client, &text, dim, batch_size, chunking)?;
+                let vector =
+                    embed_text_with_chunking(client, &text, dim, batch_size, chunking).await?;
                 if vector.len() != dim {
                     return Err(NanoError::Storage(format!(
                         "embedding dimension mismatch for {}: expected {}, got {}",
@@ -209,6 +210,7 @@ fn materialize_embeddings_for_load_inner_with_chunking<'a>(
             let texts: Vec<String> = chunk.iter().map(|(_, text)| text.clone()).collect();
             let vectors = client
                 .embed_texts(&texts, dim)
+                .await
                 .map_err(|err| NanoError::Storage(format!("embedding request failed: {}", err)))?;
             if vectors.len() != chunk.len() {
                 return Err(NanoError::Storage(format!(
@@ -371,7 +373,7 @@ fn apply_embeddings_to_lines(
     Ok(())
 }
 
-fn render_output_lines<'a>(original: &'a str, lines: Vec<ParsedLine>) -> Result<Cow<'a, str>> {
+fn render_output_lines(original: &str, lines: Vec<ParsedLine>) -> Result<String> {
     let mut out = String::new();
     for (idx, line) in lines.into_iter().enumerate() {
         if idx > 0 {
@@ -389,10 +391,10 @@ fn render_output_lines<'a>(original: &'a str, lines: Vec<ParsedLine>) -> Result<
     if original.ends_with('\n') {
         out.push('\n');
     }
-    Ok(Cow::Owned(out))
+    Ok(out)
 }
 
-fn embed_text_with_chunking(
+async fn embed_text_with_chunking(
     client: &EmbeddingClient,
     source_text: &str,
     dim: usize,
@@ -407,6 +409,7 @@ fn embed_text_with_chunking(
     if chunks.len() == 1 {
         return client
             .embed_text(&chunks[0], dim)
+            .await
             .map_err(|err| NanoError::Storage(format!("embedding request failed: {}", err)));
     }
 
@@ -416,6 +419,7 @@ fn embed_text_with_chunking(
         let texts: Vec<String> = chunk_batch.to_vec();
         let mut embedded = client
             .embed_texts(&texts, dim)
+            .await
             .map_err(|err| NanoError::Storage(format!("embedding request failed: {}", err)))?;
         if embedded.len() != texts.len() {
             return Err(NanoError::Storage(format!(
@@ -804,8 +808,8 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn materialize_embeddings_populates_missing_vector() {
+    #[tokio::test]
+    async fn materialize_embeddings_populates_missing_vector() {
         let schema = parse_schema(
             r#"
 node Doc {
@@ -822,14 +826,15 @@ node Doc {
 "#;
         let temp = TempDir::new().unwrap();
         let client = EmbeddingClient::mock_for_tests();
-        let out =
-            materialize_embeddings_for_load_inner(temp.path(), &ir, data, Some(&client)).unwrap();
+        let out = materialize_embeddings_for_load_inner(temp.path(), &ir, data, Some(&client))
+            .await
+            .unwrap();
         assert!(out.contains("\"embedding\""));
         assert!(temp.path().join(EMBEDDING_CACHE_FILENAME).exists());
     }
 
-    #[test]
-    fn materialize_embeddings_is_noop_when_vectors_present() {
+    #[tokio::test]
+    async fn materialize_embeddings_is_noop_when_vectors_present() {
         let schema = parse_schema(
             r#"
 node Doc {
@@ -850,8 +855,9 @@ node Doc {
             data,
             Some(&EmbeddingClient::mock_for_tests()),
         )
+        .await
         .unwrap();
-        assert!(matches!(out, Cow::Borrowed(_)));
+        assert_eq!(out, data);
         assert!(!temp.path().join(EMBEDDING_CACHE_FILENAME).exists());
     }
 
@@ -972,8 +978,8 @@ node Doc {
         assert!(!lock_path.exists());
     }
 
-    #[test]
-    fn materialize_embeddings_chunking_pools_chunk_vectors() {
+    #[tokio::test]
+    async fn materialize_embeddings_chunking_pools_chunk_vectors() {
         let schema = parse_schema(
             r#"
 node Doc {
@@ -996,9 +1002,10 @@ node Doc {
             Some(&client),
             chunking,
         )
+        .await
         .unwrap();
 
-        let embedded: serde_json::Value = serde_json::from_str(out.as_ref()).unwrap();
+        let embedded: serde_json::Value = serde_json::from_str(&out).unwrap();
         let values = embedded["data"]["embedding"].as_array().unwrap();
         let actual: Vec<f32> = values.iter().map(|v| v.as_f64().unwrap() as f32).collect();
 
@@ -1007,7 +1014,7 @@ node Doc {
             chunking.chunk_chars,
             chunking.chunk_overlap_chars,
         );
-        let chunk_vectors = client.embed_texts(&chunk_texts, 6).unwrap();
+        let chunk_vectors = client.embed_texts(&chunk_texts, 6).await.unwrap();
         let expected = average_pool_embeddings(&chunk_vectors, 6).unwrap();
 
         assert_eq!(actual.len(), expected.len());

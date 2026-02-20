@@ -71,7 +71,7 @@ order_dir = { "asc" | "desc" }
 limit_clause = { "limit" ~ integer }
 
 // Expressions
-expr = { search_call | fuzzy_call | match_text_call | bm25_call | rrf_call | agg_call | prop_access | variable | literal | ident }
+expr = { nearest_ordering | search_call | fuzzy_call | match_text_call | bm25_call | rrf_call | agg_call | prop_access | variable | literal | ident }
 search_call = { "search" ~ "(" ~ expr ~ "," ~ expr ~ ")" }
 fuzzy_call = { "fuzzy" ~ "(" ~ expr ~ "," ~ expr ~ ("," ~ expr)? ~ ")" }
 match_text_call = { "match_text" ~ "(" ~ expr ~ "," ~ expr ~ ")" }

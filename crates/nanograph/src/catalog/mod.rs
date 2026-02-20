@@ -21,6 +21,8 @@ pub struct Catalog {
 pub struct NodeType {
     pub name: String,
     pub properties: HashMap<String, PropType>,
+    /// Maps @embed target property -> source text property.
+    pub embed_sources: HashMap<String, String>,
     pub indexed_properties: HashSet<String>,
     pub arrow_schema: SchemaRef,
 }
@@ -70,9 +72,18 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
             }
 
             let mut properties = HashMap::new();
+            let mut embed_sources = HashMap::new();
             let mut indexed_properties = HashSet::new();
             for prop in &node.properties {
                 properties.insert(prop.name.clone(), prop.prop_type.clone());
+                if let Some(source_prop) = prop
+                    .annotations
+                    .iter()
+                    .find(|ann| ann.name == "embed")
+                    .and_then(|ann| ann.value.clone())
+                {
+                    embed_sources.insert(prop.name.clone(), source_prop);
+                }
                 let scalar_index_eligible =
                     !prop.prop_type.list && !matches!(prop.prop_type.scalar, ScalarType::Vector(_));
                 if scalar_index_eligible
@@ -101,6 +112,7 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
                 NodeType {
                     name: node.name.clone(),
                     properties,
+                    embed_sources,
                     indexed_properties,
                     arrow_schema,
                 },

@@ -52,7 +52,11 @@ fn semantic_search_uses_string_query_with_dotenv_loaded_embeddings() {
         &query_path,
         r#"query semantic($q: String) {
     match { $d: Doc }
-    return { $d.slug as slug, $d.title as title }
+    return {
+        $d.slug as slug,
+        $d.title as title,
+        nearest($d.embedding, $q) as score
+    }
     order { nearest($d.embedding, $q) }
     limit 2
 }"#,
@@ -115,5 +119,106 @@ fn semantic_search_uses_string_query_with_dotenv_loaded_embeddings() {
     assert_eq!(
         rows[0]["title"],
         serde_json::Value::String("galactic rebellion story".to_string())
+    );
+    assert!(rows[0]["score"].is_number());
+    assert!(rows[1]["score"].is_number());
+    let score0 = rows[0]["score"].as_f64().unwrap();
+    let score1 = rows[1]["score"].as_f64().unwrap();
+    assert!(score0 <= score1);
+}
+
+#[test]
+fn semantic_search_string_query_does_not_panic_when_openai_unreachable() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("demo.nano");
+    let schema_path = dir.path().join("schema.pg");
+    let data_path = dir.path().join("data.jsonl");
+    let query_path = dir.path().join("search.gq");
+
+    write_file(
+        &schema_path,
+        r#"node Doc {
+    slug: String @key
+    embedding: Vector(8) @index
+}"#,
+    );
+    write_file(
+        &data_path,
+        r#"{"type":"Doc","data":{"slug":"a","embedding":[1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]}}
+{"type":"Doc","data":{"slug":"b","embedding":[0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0]}}"#,
+    );
+    write_file(
+        &query_path,
+        r#"query semantic($q: String) {
+    match { $d: Doc }
+    return { $d.slug as slug }
+    order { nearest($d.embedding, $q) }
+    limit 1
+}"#,
+    );
+
+    run_nanograph(
+        dir.path(),
+        &[
+            "init",
+            db_path.to_str().unwrap(),
+            "--schema",
+            schema_path.to_str().unwrap(),
+        ],
+    );
+    run_nanograph(
+        dir.path(),
+        &[
+            "load",
+            db_path.to_str().unwrap(),
+            "--data",
+            data_path.to_str().unwrap(),
+            "--mode",
+            "overwrite",
+        ],
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_nanograph"))
+        .current_dir(dir.path())
+        .env_remove("NANOGRAPH_EMBEDDINGS_MOCK")
+        .env("OPENAI_API_KEY", "dummy-test-key")
+        .env("OPENAI_BASE_URL", "http://127.0.0.1:1")
+        .env("NANOGRAPH_EMBED_RETRY_ATTEMPTS", "1")
+        .env("NANOGRAPH_EMBED_TIMEOUT_MS", "25")
+        .args([
+            "run",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--query",
+            query_path.to_str().unwrap(),
+            "--name",
+            "semantic",
+            "--param",
+            "q=who turned evil",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "command unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("The application panicked"),
+        "stderr should not report panic:\n{}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("Cannot drop a runtime in a context where blocking is not allowed"),
+        "stderr should not contain tokio runtime drop panic:\n{}",
+        stderr
+    );
+    assert!(
+        stderr.contains("embedding request failed"),
+        "stderr should contain normal embedding failure message:\n{}",
+        stderr
     );
 }

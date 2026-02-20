@@ -234,6 +234,7 @@ pub fn build_catalog_from_ir(ir: &SchemaIR) -> Result<Catalog> {
         match typedef {
             TypeDef::Node(n) => {
                 let mut properties = HashMap::new();
+                let mut embed_sources = HashMap::new();
                 let mut indexed_properties = HashSet::new();
                 let mut fields = vec![Field::new("id", arrow_schema::DataType::UInt64, false)];
 
@@ -252,6 +253,9 @@ pub fn build_catalog_from_ir(ir: &SchemaIR) -> Result<Catalog> {
                         },
                     };
                     properties.insert(prop.name.clone(), prop_type.clone());
+                    if let Some(source_prop) = &prop.embed_source {
+                        embed_sources.insert(prop.name.clone(), source_prop.clone());
+                    }
                     if prop.index && !prop.list && !matches!(scalar, ScalarType::Vector(_)) {
                         indexed_properties.insert(prop.name.clone());
                     }
@@ -263,6 +267,7 @@ pub fn build_catalog_from_ir(ir: &SchemaIR) -> Result<Catalog> {
                     NodeType {
                         name: n.name.clone(),
                         properties,
+                        embed_sources,
                         indexed_properties,
                         arrow_schema: Arc::new(Schema::new(fields)),
                     },
@@ -553,6 +558,7 @@ node Person {
             let nt_ir = catalog_ir.node_types.get(name).expect("missing node type");
             assert_eq!(nt_ast.name, nt_ir.name);
             assert_eq!(nt_ast.properties.len(), nt_ir.properties.len());
+            assert_eq!(nt_ast.embed_sources, nt_ir.embed_sources);
             assert_eq!(nt_ast.arrow_schema, nt_ir.arrow_schema);
         }
 
