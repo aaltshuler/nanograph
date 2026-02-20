@@ -57,15 +57,30 @@ impl GraphManifest {
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| NanoError::Manifest(format!("serialize error: {}", e)))?;
 
-        std::fs::write(&tmp_path, json.as_bytes())?;
+        eprintln!("[manifest] writing tmp: {}", tmp_path.display());
+        std::fs::write(&tmp_path, json.as_bytes()).map_err(|e| {
+            eprintln!("[manifest] FAILED write({}): {e}", tmp_path.display());
+            e
+        })?;
 
         // fsync the file, then drop the handle before rename (Windows requires this)
+        eprintln!("[manifest] fsync: {}", tmp_path.display());
         {
-            let file = std::fs::File::open(&tmp_path)?;
-            file.sync_all()?;
+            let file = std::fs::File::open(&tmp_path).map_err(|e| {
+                eprintln!("[manifest] FAILED open-for-fsync({}): {e}", tmp_path.display());
+                e
+            })?;
+            file.sync_all().map_err(|e| {
+                eprintln!("[manifest] FAILED sync_all({}): {e}", tmp_path.display());
+                e
+            })?;
         }
 
-        std::fs::rename(&tmp_path, &path)?;
+        eprintln!("[manifest] rename {} -> {}", tmp_path.display(), path.display());
+        std::fs::rename(&tmp_path, &path).map_err(|e| {
+            eprintln!("[manifest] FAILED rename({} -> {}): {e}", tmp_path.display(), path.display());
+            e
+        })?;
         Ok(())
     }
 

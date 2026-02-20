@@ -240,17 +240,39 @@ impl Database {
         let catalog = build_catalog_from_ir(&schema_ir)?;
 
         // Create directory structure
-        std::fs::create_dir_all(db_path)?;
-        std::fs::create_dir_all(db_path.join("nodes"))?;
-        std::fs::create_dir_all(db_path.join("edges"))?;
+        std::fs::create_dir_all(db_path).map_err(|e| {
+            eprintln!("[init] FAILED create_dir_all({}): {e}", db_path.display());
+            e
+        })?;
+        info!("[init] created {}", db_path.display());
+
+        std::fs::create_dir_all(db_path.join("nodes")).map_err(|e| {
+            eprintln!("[init] FAILED create_dir_all(nodes): {e}");
+            e
+        })?;
+        std::fs::create_dir_all(db_path.join("edges")).map_err(|e| {
+            eprintln!("[init] FAILED create_dir_all(edges): {e}");
+            e
+        })?;
+        info!("[init] created nodes/ and edges/ subdirs");
 
         // Write schema.pg (human-authored source)
-        std::fs::write(db_path.join(SCHEMA_PG_FILENAME), schema_source)?;
+        let schema_pg_path = db_path.join(SCHEMA_PG_FILENAME);
+        std::fs::write(&schema_pg_path, schema_source).map_err(|e| {
+            eprintln!("[init] FAILED write({}): {e}", schema_pg_path.display());
+            e
+        })?;
+        info!("[init] wrote {}", schema_pg_path.display());
 
         // Write schema.ir.json
         let ir_json = serde_json::to_string_pretty(&schema_ir)
             .map_err(|e| NanoError::Manifest(format!("serialize IR error: {}", e)))?;
-        std::fs::write(db_path.join(SCHEMA_IR_FILENAME), &ir_json)?;
+        let ir_path = db_path.join(SCHEMA_IR_FILENAME);
+        std::fs::write(&ir_path, &ir_json).map_err(|e| {
+            eprintln!("[init] FAILED write({}): {e}", ir_path.display());
+            e
+        })?;
+        info!("[init] wrote {}", ir_path.display());
 
         // Write empty manifest
         let ir_hash = hash_string(&ir_json);
@@ -259,7 +281,10 @@ impl Database {
         manifest.next_type_id = next_type_id;
         manifest.next_prop_id = next_prop_id;
         manifest.committed_at = now_unix_seconds_string();
-        manifest.write_atomic(db_path)?;
+        manifest.write_atomic(db_path).map_err(|e| {
+            eprintln!("[init] FAILED write_atomic(manifest) in {}: {e}", db_path.display());
+            e
+        })?;
 
         let storage = GraphStorage::new(catalog.clone());
         info!("database initialized");
