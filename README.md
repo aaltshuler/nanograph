@@ -56,7 +56,7 @@ nanograph check --db my.nano --query queries.gq
 nanograph run --db my.nano --query queries.gq --name my_query
 ```
 
-See `examples/starwars/` for a ready-to-run demo (66 nodes, 146 edges, 27 queries).
+See `examples/starwars/` for a ready-to-run demo (66 nodes, 146 edges, 30 queries).
 
 ## Schema language
 

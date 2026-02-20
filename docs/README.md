@@ -4,10 +4,13 @@
 
 | Document | Description |
 |----------|-------------|
-| [quick-start.md](user/quick-start.md) | Build a Star Wars graph in 5 minutes |
+| [quick-start.md](user/quick-start.md) | Zero to first query in 5 minutes |
 | [cli-reference.md](user/cli-reference.md) | All commands, options, and data formats |
-| [revops-case.md](user/revops-case.md) | Use Cases & Diagrams |
-| [revops-graph-schema.md](user/revops-graph-schema.md) | Graph Schema Spec |
+| [schema.md](user/schema.md) | Schema language reference — types, annotations, naming |
+| [queries.md](user/queries.md) | Query language reference — match, return, traversal, mutations |
+| [search.md](user/search.md) | Text search, vector search, hybrid fusion |
+| [starwars-example.md](user/starwars-example.md) | Star Wars worked example with search |
+| [context-graph-example.md](user/context-graph-example.md) | CRM context graph case study |
 
 ## Developer Docs
 

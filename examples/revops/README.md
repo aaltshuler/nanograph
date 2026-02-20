@@ -10,7 +10,7 @@ Personal CRM and decision trace system. Demonstrates the complete physics of exe
 |------|-------------|
 | `revops.pg` | Schema — 10 node types, 21 edge types |
 | `revops.gq` | Queries — 24 total: lookups, traces, aggregation, filtering, mutations |
-| `revops.jsonl` | Seed data — Stripe Migration example (14 nodes, 22 edges) |
+| `revops.jsonl` | Seed data — Stripe Migration example (16 nodes, 22 edges) |
 
 ## Quick Start
 
@@ -19,22 +19,20 @@ Personal CRM and decision trace system. Demonstrates the complete physics of exe
 cargo build -p nanograph-cli
 
 # Create database
-nanograph init --schema examples/revops/revops.pg /path/to/omni.nano
+nanograph init omni.nano --schema examples/revops/revops.pg
 
 # Load seed data
-nanograph load --data examples/revops/revops.jsonl --mode overwrite /path/to/omni.nano
+nanograph load omni.nano --data examples/revops/revops.jsonl --mode overwrite
 
 # Typecheck queries
-nanograph check --db /path/to/omni.nano --query examples/revops/revops.gq
+nanograph check --db omni.nano --query examples/revops/revops.gq
 
-# Run a query (RUST_LOG=off suppresses tracing)
-RUST_LOG=off nanograph run --db /path/to/omni.nano \
-  --query examples/revops/revops.gq --name pipeline_summary --format table
+# Run a query
+nanograph run --db omni.nano --query examples/revops/revops.gq --name pipeline_summary
 
 # Run with parameters
-RUST_LOG=off nanograph run --db /path/to/omni.nano \
-  --query examples/revops/revops.gq --name decision_trace \
-  --param opp=opp-stripe-migration --format table
+nanograph run --db omni.nano --query examples/revops/revops.gq --name decision_trace \
+  --param opp=opp-stripe-migration
 ```
 
 Output formats: `table` (default), `csv`, `jsonl`, `json`.
@@ -157,7 +155,7 @@ The seed data implements the complete three-phase trace from the [context graph 
 Load additional data with merge mode (upserts by `@key`):
 
 ```bash
-nanograph load --data your-data.jsonl --mode merge /path/to/omni.nano
+nanograph load omni.nano --data your-data.jsonl --mode merge
 ```
 
-To evolve the schema, edit `<db>/schema.pg` then run `nanograph migrate <db>`.
+To evolve the schema, edit `<db>/schema.pg` then run `nanograph migrate omni.nano`.

@@ -6,7 +6,7 @@ Typed property graph of the Star Wars universe with a rich relationship model an
 
 | File | Description |
 |------|-------------|
-| `starwars.pg` | Merged schema (9 node types, 25 edge types, slug `@key` identity) |
+| `starwars.pg` | Merged schema (9 node types, 26 edge types, slug `@key` identity) |
 | `starwars.jsonl` | Merged data (~66 nodes, ~146 edges) |
 | `starwars.gq` | Read + mutation query suite (legacy reads + film/date + mutations) |
 

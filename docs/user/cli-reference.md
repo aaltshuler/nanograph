@@ -211,6 +211,29 @@ Edges with properties:
 RUST_LOG=debug nanograph run --db mydb.nano --query q.gq --name my_query
 ```
 
+## Upgrading from 0.6 to 0.7
+
+The internal schema IR format changed in 0.7. Databases created with 0.6 will fail to open with a `schema mismatch` error. To migrate, export your data as JSON from the old CLI, then reimport with the new one:
+
+```bash
+# 1. Export data using your current (0.6) build
+nanograph export --db mydb.nano --format jsonl > backup.jsonl
+
+# 2. Build the new (0.7) CLI
+cargo build -p nanograph-cli
+
+# 3. Create a fresh database from the original schema
+nanograph init mydb-v07.nano --schema mydb.nano/schema.pg
+
+# 4. Load the exported data
+nanograph load mydb-v07.nano --data backup.jsonl --mode overwrite
+
+# 5. Verify
+nanograph doctor mydb-v07.nano
+```
+
+If you no longer have the 0.6 binary, you can patch the manifest hash manually: compute the FNV-1a hash of the current `schema.ir.json` file and update `schema_ir_hash` in `graph.manifest.json`, then export.
+
 ## See also
 
 - [Schema Language Reference](schema.md) — types, annotations, naming conventions

@@ -55,7 +55,7 @@ Semantic search is built on `Vector(dim)` properties and Lance's exact KNN. Two 
 - **Manual vectors**: Put vectors directly in JSONL data, query with `nearest(prop, $param)` ordering.
 - **Auto-embedding**: Annotate a `Vector(dim)` property with `@embed(source_prop)` — embeddings are generated from the source String property at load time via OpenAI API.
 
-Query predicates: `nearest(vector_prop, query)` orders by cosine distance, `search(string_prop, query)` for exact substring match, `fuzzy(string_prop, query[, max_edits])` for fuzzy text match. `nearest` is an ordering expression used in `order` clauses.
+Query predicates: `search(string_prop, query)` for token-based keyword match, `fuzzy(string_prop, query[, max_edits])` for approximate match, `match_text(string_prop, query)` for contiguous phrase match. Ordering/ranking: `nearest(vector_prop, query)` for cosine distance, `bm25(string_prop, query)` for lexical relevance, `rrf(nearest(...), bm25(...))` for hybrid fusion. `nearest` and `rrf` require a `limit` clause.
 
 Embedding cache: `_embedding_cache.jsonl` in the DB directory caches content-hashed embeddings to avoid re-embedding unchanged data. Large text (>1500 chars by default) is chunked with overlap and averaged.
 
@@ -118,17 +118,17 @@ All commands support `--json` global flag for structured output. Core: `init`, `
 
 ### Type System
 
-Scalar types: `String`, `I32`, `I64`, `U64`, `F32`, `F64`, `Bool`, `Date`, `DateTime`. Vector type: `Vector(dim)` for fixed-size float vectors (semantic search). Enum types: `enum(val1, val2, ...)`. List types: `[String]`, `[I32]`, etc. All property types are nullable by appending `?`. Query literals include `date("2026-01-15")`, `datetime("2026-01-15T10:00:00Z")`, and list literals `[1, 2, 3]`.
+Scalar types: `String`, `I32`, `I64`, `U32`, `U64`, `F32`, `F64`, `Bool`, `Date`, `DateTime`. Vector type: `Vector(dim)` for fixed-size float vectors (semantic search). Enum types: `enum(val1, val2, ...)`. List types: `[String]`, `[I32]`, etc. All property types are nullable by appending `?`. Query literals include `date("2026-01-15")`, `datetime("2026-01-15T10:00:00Z")`, and list literals `[1, 2, 3]`.
 
 ### Schema Annotations
 
 - `@key` — single property per node type, used for keyed merge. Auto-indexed.
 - `@unique` — enforced on load/upsert. Nullable unique allows multiple nulls.
-- `@index` — Lance scalar (B-tree) index. Enables index-backed filtering.
+- `@index` — creates a scalar index for scalar fields or a vector index for `Vector(dim)` fields.
 - `@embed(source_prop)` — auto-generates embeddings from a String property at load time. Target must be `Vector(dim)`.
 - `@rename_from("old")` — tracks type/property renames for migration.
 
-List properties cannot have `@key`, `@unique`, or `@index`.
+List properties cannot have `@key`, `@unique`, `@index`, or `@embed`.
 
 ### Schema Migration
 
@@ -173,7 +173,7 @@ Arrow 57, DataFusion 52, Lance 2.0 + lance-index 2.0 — these must stay compati
 
 ## Design Documents
 
-- `grammar.ebnf` — formal grammar for both DSLs, includes type rules (T1-T14; T10-T14 cover mutations)
+- `grammar.ebnf` — formal grammar for both DSLs, includes type rules (T1-T21; T10-T14 cover mutations, T15-T21 cover search/ordering)
 - `docs/dev/architecture.md` — system overview, module map, data flow
 - `docs/dev/db-features.md` — feature roadmap with implementation status
 - `docs/dev/test-framework.md` — test tiers, commands, fixture policy, CI guidance
