@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -57,30 +58,15 @@ impl GraphManifest {
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| NanoError::Manifest(format!("serialize error: {}", e)))?;
 
-        eprintln!("[manifest] writing tmp: {}", tmp_path.display());
-        std::fs::write(&tmp_path, json.as_bytes()).map_err(|e| {
-            eprintln!("[manifest] FAILED write({}): {e}", tmp_path.display());
-            e
-        })?;
-
-        // fsync the file, then drop the handle before rename (Windows requires this)
-        eprintln!("[manifest] fsync: {}", tmp_path.display());
+        // Write + fsync on the same handle. File::open() is read-only which
+        // causes sync_all() to fail on Windows (FlushFileBuffers needs write access).
         {
-            let file = std::fs::File::open(&tmp_path).map_err(|e| {
-                eprintln!("[manifest] FAILED open-for-fsync({}): {e}", tmp_path.display());
-                e
-            })?;
-            file.sync_all().map_err(|e| {
-                eprintln!("[manifest] FAILED sync_all({}): {e}", tmp_path.display());
-                e
-            })?;
+            let mut file = std::fs::File::create(&tmp_path)?;
+            file.write_all(json.as_bytes())?;
+            file.sync_all()?;
         }
 
-        eprintln!("[manifest] rename {} -> {}", tmp_path.display(), path.display());
-        std::fs::rename(&tmp_path, &path).map_err(|e| {
-            eprintln!("[manifest] FAILED rename({} -> {}): {e}", tmp_path.display(), path.display());
-            e
-        })?;
+        std::fs::rename(&tmp_path, &path)?;
         Ok(())
     }
 
