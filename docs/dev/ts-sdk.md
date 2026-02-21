@@ -32,14 +32,14 @@ crates/nanograph-ts/
 export class Database {
   static init(dbPath: string, schemaSource: string): Promise<Database>
   static open(dbPath: string): Promise<Database>
-  load(dataSource: string, mode: string): Promise<void>
-  run(querySource: string, queryName: string, params?: unknown): Promise<unknown>
-  check(querySource: string): Promise<unknown>
-  describe(): Promise<unknown>
-  compact(options?: unknown): Promise<unknown>
-  cleanup(options?: unknown): Promise<unknown>
-  doctor(): Promise<unknown>
-  close(): void
+  load(dataSource: string, mode: "overwrite" | "append" | "merge"): Promise<void>
+  run(querySource: string, queryName: string, params?: Record<string, unknown>): Promise<Record<string, unknown>[] | MutationResult>
+  check(querySource: string): Promise<CheckResult[]>
+  describe(): Promise<DescribeResult>
+  compact(options?: CompactOptions): Promise<CompactResult>
+  cleanup(options?: CleanupOptions): Promise<CleanupResult>
+  doctor(): Promise<DoctorResult>
+  close(): Promise<void>
 }
 ```
 

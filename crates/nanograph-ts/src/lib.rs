@@ -38,6 +38,7 @@ impl JsDatabase {
 fn prop_def_to_json(prop: &nanograph::schema_ir::PropDef) -> serde_json::Value {
     let mut obj = serde_json::json!({
         "name": prop.name,
+        "propId": prop.prop_id,
         "type": prop.scalar_type,
         "nullable": prop.nullable,
     });
@@ -234,11 +235,13 @@ impl JsDatabase {
     /// ```
     #[napi]
     pub async fn describe(&self) -> Result<serde_json::Value> {
-        let guard = self.inner.lock().await;
-        let db = guard
-            .as_ref()
-            .ok_or_else(|| napi::Error::from_reason("database is closed"))?;
-        let ir = &db.schema_ir;
+        let ir = {
+            let guard = self.inner.lock().await;
+            let db = guard
+                .as_ref()
+                .ok_or_else(|| napi::Error::from_reason("database is closed"))?;
+            db.schema_ir.clone()
+        };
 
         let mut node_types = Vec::new();
         for nt in ir.node_types() {
@@ -334,6 +337,7 @@ impl JsDatabase {
             "healthy": report.healthy,
             "issues": report.issues,
             "warnings": report.warnings,
+            "manifestDbVersion": report.manifest_db_version,
             "datasetsChecked": report.datasets_checked,
             "txRows": report.tx_rows,
             "cdcRows": report.cdc_rows,
@@ -343,15 +347,11 @@ impl JsDatabase {
     /// Close the database, releasing resources.
     ///
     /// ```js
-    /// db.close();
+    /// await db.close();
     /// ```
     #[napi]
-    pub fn close(&self) -> Result<()> {
-        // Use try_lock since close is sync. If the lock is held (e.g., during a query),
-        // this will fail, which is the right behavior.
-        let mut guard = self.inner.try_lock().map_err(|_| {
-            napi::Error::from_reason("cannot close: database is in use by another operation")
-        })?;
+    pub async fn close(&self) -> Result<()> {
+        let mut guard = self.inner.lock().await;
         *guard = None;
         Ok(())
     }

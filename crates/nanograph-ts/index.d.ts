@@ -2,6 +2,7 @@
 
 export interface PropDef {
   name: string;
+  propId: number;
   type: string;
   nullable: boolean;
   list?: boolean;
@@ -45,6 +46,8 @@ export interface MutationResult {
 
 export interface CompactOptions {
   targetRowsPerFragment?: number;
+  materializeDeletions?: boolean;
+  materializeDeletionsThreshold?: number;
 }
 
 export interface CompactResult {
@@ -59,6 +62,7 @@ export interface CompactResult {
 
 export interface CleanupOptions {
   retainTxVersions?: number;
+  retainDatasetVersions?: number;
 }
 
 export interface CleanupResult {
@@ -75,6 +79,7 @@ export interface DoctorResult {
   healthy: boolean;
   issues: string[];
   warnings: string[];
+  manifestDbVersion: number;
   datasetsChecked: number;
   txRows: number;
   cdcRows: number;
@@ -117,5 +122,5 @@ export class Database {
   doctor(): Promise<DoctorResult>;
 
   /** Close the database, releasing resources. */
-  close(): void;
+  close(): Promise<void>;
 }

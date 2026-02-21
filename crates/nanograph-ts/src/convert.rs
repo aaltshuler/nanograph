@@ -1,13 +1,7 @@
 use nanograph::ParamMap;
+use nanograph::json_output::{JS_MAX_SAFE_INTEGER_U64, is_js_safe_integer_i64};
 use nanograph::query::ast::{Literal, Param};
 use nanograph::store::database::{CleanupOptions, CompactOptions, LoadMode};
-
-const JS_MAX_SAFE_INTEGER_U64: u64 = 9_007_199_254_740_991;
-const JS_MAX_SAFE_INTEGER_I64: i64 = JS_MAX_SAFE_INTEGER_U64 as i64;
-
-fn is_js_safe_integer_i64(value: i64) -> bool {
-    (-JS_MAX_SAFE_INTEGER_I64..=JS_MAX_SAFE_INTEGER_I64).contains(&value)
-}
 
 fn parse_i64_param(key: &str, value: &serde_json::Value) -> napi::Result<i64> {
     match value {
@@ -243,10 +237,13 @@ fn convert_with_type_hint(
             Ok(Literal::List(out))
         }
         _ => {
-            // Enum or unknown type — treat as string
+            // Enum or unknown type — require string
             match value {
                 serde_json::Value::String(s) => Ok(Literal::String(s.clone())),
-                other => Ok(Literal::String(other.to_string())),
+                other => Err(napi::Error::from_reason(format!(
+                    "param '{}': expected string for type '{}', got {}",
+                    key, type_name, json_type_name(other)
+                ))),
             }
         }
     }
