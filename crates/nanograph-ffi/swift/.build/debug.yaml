@@ -1,0 +1,56 @@
+client:
+  name: basic
+  file-system: device-agnostic
+tools: {}
+targets:
+  "CNanoGraph-arm64-apple-macosx26.0-debug.module": ["<CNanoGraph-arm64-apple-macosx26.0-debug.module>"]
+  "NanoGraph-arm64-apple-macosx26.0-debug.module": ["<NanoGraph-arm64-apple-macosx26.0-debug.module>"]
+  "PackageStructure": ["<PackageStructure>"]
+  "main": ["<CNanoGraph-arm64-apple-macosx26.0-debug.module>","<NanoGraph-arm64-apple-macosx26.0-debug.module>"]
+  "test": ["<CNanoGraph-arm64-apple-macosx26.0-debug.module>","<NanoGraph-arm64-apple-macosx26.0-debug.module>"]
+default: "main"
+nodes:
+  "/Users/andrew/code/nanograph/crates/nanograph-ffi/swift/Sources/CNanoGraph/":
+    is-directory-structure: true
+    content-exclusion-patterns: [".git",".build"]
+  "/Users/andrew/code/nanograph/crates/nanograph-ffi/swift/Sources/NanoGraph/":
+    is-directory-structure: true
+    content-exclusion-patterns: [".git",".build"]
+commands:
+  "/Users/andrew/code/nanograph/crates/nanograph-ffi/swift/.build/arm64-apple-macosx/debug/NanoGraph.build/sources":
+    tool: write-auxiliary-file
+    inputs: ["<sources-file-list>","/Users/andrew/code/nanograph/crates/nanograph-ffi/swift/Sources/NanoGraph/NanoGraph.swift"]
+    outputs: ["/Users/andrew/code/nanograph/crates/nanograph-ffi/swift/.build/arm64-apple-macosx/debug/NanoGraph.build/sources"]
+    description: "Write auxiliary file /Users/andrew/code/nanograph/crates/nanograph-ffi/swift/.build/arm64-apple-macosx/debug/NanoGraph.build/sources"
+
+  "/Users/andrew/code/nanograph/crates/nanograph-ffi/swift/.build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt":
+    tool: write-auxiliary-file
+    inputs: ["<swift-get-version>","/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc"]
+    outputs: ["/Users/andrew/code/nanograph/crates/nanograph-ffi/swift/.build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt"]
+    always-out-of-date: "true"
+    description: "Write auxiliary file /Users/andrew/code/nanograph/crates/nanograph-ffi/swift/.build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt"
+
+  "<CNanoGraph-arm64-apple-macosx26.0-debug.module>":
+    tool: phony
+    inputs: []
+    outputs: ["<CNanoGraph-arm64-apple-macosx26.0-debug.module>"]
+
+  "<NanoGraph-arm64-apple-macosx26.0-debug.module>":
+    tool: phony
+    inputs: ["/Users/andrew/code/nanograph/crates/nanograph-ffi/swift/.build/arm64-apple-macosx/debug/NanoGraph.build/NanoGraph.swift.o","/Users/andrew/code/nanograph/crates/nanograph-ffi/swift/.build/arm64-apple-macosx/debug/Modules/NanoGraph.swiftmodule"]
+    outputs: ["<NanoGraph-arm64-apple-macosx26.0-debug.module>"]
+
+  "C.NanoGraph-arm64-apple-macosx26.0-debug.module":
+    tool: shell
+    inputs: ["/Users/andrew/code/nanograph/crates/nanograph-ffi/swift/Sources/NanoGraph/NanoGraph.swift","/Users/andrew/code/nanograph/crates/nanograph-ffi/swift/.build/arm64-apple-macosx/debug/swift-version--58304C5D6DBC2206.txt","/Users/andrew/code/nanograph/crates/nanograph-ffi/swift/.build/arm64-apple-macosx/debug/NanoGraph.build/sources"]
+    outputs: ["/Users/andrew/code/nanograph/crates/nanograph-ffi/swift/.build/arm64-apple-macosx/debug/NanoGraph.build/NanoGraph.swift.o","/Users/andrew/code/nanograph/crates/nanograph-ffi/swift/.build/arm64-apple-macosx/debug/Modules/NanoGraph.swiftmodule"]
+    description: "Compiling Swift Module 'NanoGraph' (1 sources)"
+    args: ["/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc","-module-name","NanoGraph","-emit-dependencies","-emit-module","-emit-module-path","/Users/andrew/code/nanograph/crates/nanograph-ffi/swift/.build/arm64-apple-macosx/debug/Modules/NanoGraph.swiftmodule","-output-file-map","/Users/andrew/code/nanograph/crates/nanograph-ffi/swift/.build/arm64-apple-macosx/debug/NanoGraph.build/output-file-map.json","-parse-as-library","-incremental","-c","@/Users/andrew/code/nanograph/crates/nanograph-ffi/swift/.build/arm64-apple-macosx/debug/NanoGraph.build/sources","-I","/Users/andrew/code/nanograph/crates/nanograph-ffi/swift/.build/arm64-apple-macosx/debug/Modules","-target","arm64-apple-macosx13.0","-incremental","-enable-batch-mode","-serialize-diagnostics","-index-store-path","/Users/andrew/code/nanograph/crates/nanograph-ffi/swift/.build/arm64-apple-macosx/debug/index/store","-Onone","-enable-testing","-j10","-DSWIFT_PACKAGE","-DDEBUG","-DSWIFT_MODULE_RESOURCE_BUNDLE_UNAVAILABLE","-Xcc","-fmodule-map-file=/Users/andrew/code/nanograph/crates/nanograph-ffi/swift/.build/arm64-apple-macosx/debug/CNanoGraph.build/module.modulemap","-Xcc","-I","-Xcc","/Users/andrew/code/nanograph/crates/nanograph-ffi/swift/Sources/CNanoGraph/include","-module-cache-path","/Users/andrew/code/nanograph/crates/nanograph-ffi/swift/.build/arm64-apple-macosx/debug/ModuleCache","-parseable-output","-parse-as-library","-emit-objc-header","-emit-objc-header-path","/Users/andrew/code/nanograph/crates/nanograph-ffi/swift/.build/arm64-apple-macosx/debug/NanoGraph.build/include/NanoGraph-Swift.h","-swift-version","6","-plugin-path","/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/host/plugins/testing","-sdk","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.2.sdk","-F","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks","-F","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/PrivateFrameworks","-I","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib","-L","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib","-g","-Xcc","-isysroot","-Xcc","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.2.sdk","-Xcc","-F","-Xcc","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks","-Xcc","-F","-Xcc","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/PrivateFrameworks","-Xcc","-fPIC","-Xcc","-g","-package-name","swift"]
+
+  "PackageStructure":
+    tool: package-structure-tool
+    inputs: ["/Users/andrew/code/nanograph/crates/nanograph-ffi/swift/Sources/CNanoGraph/","/Users/andrew/code/nanograph/crates/nanograph-ffi/swift/Sources/NanoGraph/","/Users/andrew/code/nanograph/crates/nanograph-ffi/swift/Package.swift","/Users/andrew/code/nanograph/crates/nanograph-ffi/swift/Package.resolved"]
+    outputs: ["<PackageStructure>"]
+    description: "Planning build"
+    allow-missing-inputs: true
+

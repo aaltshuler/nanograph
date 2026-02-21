@@ -2,6 +2,7 @@ mod catalog;
 mod embedding;
 pub mod error;
 mod ir;
+pub mod json_output;
 mod plan;
 pub mod query;
 pub mod schema;

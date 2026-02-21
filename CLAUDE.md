@@ -31,7 +31,13 @@ RUST_LOG=debug cargo run -p nanograph-cli -- run ...  # enable tracing
 
 ### Workspace
 
-Two crates: `nanograph` (library) and `nanograph-cli` (binary named `nanograph`). The CLI depends on the library. All domain logic lives in the library; the CLI is a thin clap wrapper that calls library functions.
+Four crates:
+- `nanograph` — core library. All domain logic lives here.
+- `nanograph-cli` — binary named `nanograph`. Thin clap wrapper that calls library functions.
+- `nanograph-ffi` — C ABI (`cdylib`/`staticlib`) for Swift and native clients. Exports `nanograph_db_*` C functions; results are heap-allocated JSON strings freed with `nanograph_string_free`. Includes Swift Package wrapper in `swift/`.
+- `nanograph-ts` — TypeScript/Node.js SDK via napi-rs. npm package `@nanograph/sdk`. `JsDatabase` wraps core `Database` behind `Arc<tokio::sync::Mutex>`. Platform-aware `.node` loader for macOS/Linux/Windows.
+
+All SDK crates call the same core pipeline (parse → typecheck → lower → execute → serialize via `json_output`). No logic duplication.
 
 ### Dual-Mode Execution
 
@@ -81,6 +87,7 @@ Key modules: `embedding.rs` (OpenAI client, retry, mock mode), `store/loader/emb
 | `store/manifest.rs` | Dataset inventory (`graph.manifest.json`) — tracks which node/edge types have Lance datasets |
 | `store/txlog.rs` | Transaction catalog + CDC log (`_tx_catalog.jsonl`, `_cdc_log.jsonl`) |
 | `embedding.rs` | OpenAI embedding client, retry logic, mock mode |
+| `json_output.rs` | Shared Arrow→JSON serialization for CLI and SDKs. Handles JS safe integer range (i64/u64 > 2^53 are stringified) |
 | `types.rs` | Core type definitions, `PropType`, Arrow type mappings |
 | `error.rs` | `NanoError` error type |
 
@@ -153,6 +160,8 @@ The CLI loads `.env` from CWD at startup (custom parser, no external dependency)
 - `NANOGRAPH_EMBED_BATCH_SIZE` — batch size for API calls (default: 64).
 - `NANOGRAPH_EMBED_CHUNK_CHARS` — chunk size for large text; 0 disables (default: 1500).
 - `NANOGRAPH_EMBED_CHUNK_OVERLAP_CHARS` — overlap between chunks (default: 200).
+- `NANOGRAPH_EMBED_CACHE_MAX_ENTRIES` — max cache entries (default: 50000).
+- `NANOGRAPH_EMBED_CACHE_LOCK_STALE_SECS` — stale lock timeout (default: 60).
 - `NANOGRAPH_EMBEDDINGS_MOCK=1` — use deterministic mock embeddings (no API key needed). Used in tests/CI.
 
 See `.env.example` for reference.
@@ -167,19 +176,20 @@ See `.env.example` for reference.
 
 **Modifying Pest grammars**: Edit `.pest` file → update corresponding `parser.rs` → update `typecheck.rs` if the change affects type rules → update `grammar.ebnf` to keep it in sync.
 
+**Changing query result shape or adding types**: Update `json_output.rs` (Arrow→JSON conversion shared by CLI + SDKs) → update TS SDK `convert.rs` if type mapping changes → update FFI `src/lib.rs` if C API surface changes.
+
 ## Version Constraints
 
-Arrow 57, DataFusion 52, Lance 2.0 + lance-index 2.0 — these must stay compatible with each other. Pest 2 for both grammars. Dependencies use sub-crates, not monolithic packages: `arrow-array`, `arrow-schema`, `arrow-select`, `arrow-cast`, `arrow-ord` (not `arrow`); `datafusion-physical-plan`, `datafusion-physical-expr`, `datafusion-execution`, `datafusion-common` (not `datafusion`). Import accordingly. All dependency versions are centralized in the root `Cargo.toml` under `[workspace.dependencies]` — add or update versions there, then reference with `dep.workspace = true` in crate-level Cargo.toml files.
+Arrow 57, DataFusion 52, Lance 2.0 + lance-index 2.0 — these must stay compatible with each other. Pest 2 for both grammars. napi/napi-derive 2 for TS SDK. Dependencies use sub-crates, not monolithic packages: `arrow-array`, `arrow-schema`, `arrow-select`, `arrow-cast`, `arrow-ord` (not `arrow`); `datafusion-physical-plan`, `datafusion-physical-expr`, `datafusion-execution`, `datafusion-common` (not `datafusion`). Import accordingly. All dependency versions are centralized in the root `Cargo.toml` under `[workspace.dependencies]` — add or update versions there, then reference with `dep.workspace = true` in crate-level Cargo.toml files.
 
 ## Design Documents
 
 - `grammar.ebnf` — formal grammar for both DSLs, includes type rules (T1-T21; T10-T14 cover mutations, T15-T21 cover search/ordering)
 - `docs/dev/architecture.md` — system overview, module map, data flow
-- `docs/dev/db-features.md` — feature roadmap with implementation status
-- `docs/dev/test-framework.md` — test tiers, commands, fixture policy, CI guidance
 - `docs/dev/backlog.md` — current backlog and priorities
-- `docs/dev/search-plan.md` — search feature phased plan (vector, text, hybrid)
-- `docs/dev/fts-rfc.md` — Phase 4 RFC for `match_text`, `bm25`, `rrf` syntax
+- `docs/dev/search.md` — search feature design (vector, text, hybrid)
+- `docs/dev/sdks.md` — SDK strategy (TypeScript in-repo via napi-rs, Swift via C ABI)
+- `docs/dev/ts-sdk.md` — TypeScript SDK implementation details (lock semantics, type conversion, build)
 
 Source of truth for behavior is code. Update docs in the same PR when behavior changes.
 
@@ -187,9 +197,9 @@ Source of truth for behavior is code. Update docs in the same PR when behavior c
 
 Test schemas, queries, and data live in `crates/nanograph/tests/fixtures/` (test.pg, test.gq, test.jsonl). Star Wars example in `examples/starwars/`. Migration tests in `crates/nanograph/tests/schema_migration.rs`. Index performance harness in `crates/nanograph/tests/index_perf.rs` (run with `--ignored`). Write amplification harness in `crates/nanograph/tests/write_amp_perf.rs` (run with `--ignored`).
 
-CLI scenario scripts live in `tests/cli/scenarios/` and use shared helpers from `tests/cli/lib/common.sh` (build helpers, assertion macros, query runners). Scenarios: `lifecycle`, `migration`, `query_mutations`, `maintenance`, `revops_typed_cdc`, `text_search`, `context_graph_search`. Run all via `bash tests/cli/run-cli-e2e.sh` or one via `bash tests/cli/run-cli-e2e.sh <scenario>`.
+CLI scenario scripts live in `tests/cli/scenarios/` and use shared helpers from `tests/cli/lib/common.sh` (build helpers, assertion macros, query runners). Scenarios: `lifecycle`, `migration`, `query_mutations`, `maintenance`, `revops_typed_cdc`, `text_search`, `context_graph_search`, `starwars_search`. Run all via `bash tests/cli/run-cli-e2e.sh` or one via `bash tests/cli/run-cli-e2e.sh <scenario>`.
 
-CLI integration tests (Rust) in `crates/nanograph-cli/tests/` — e.g. `semantic_search.rs` validates `@embed` + `nearest()` with mock embeddings.
+CLI integration tests (Rust) in `crates/nanograph-cli/tests/` — `semantic_search.rs` (embed + nearest with mock) and `search_features.rs` (search predicates and ordering).
 
 ## Known Pitfalls
 
@@ -199,3 +209,4 @@ CLI integration tests (Rust) in `crates/nanograph-cli/tests/` — e.g. `semantic
 - When a query variable isn't in the batch schema, skip the filter rather than erroring.
 - Enum values are auto-sorted and deduplicated; duplicate values are rejected at parse time.
 - List properties cannot have `@key`, `@unique`, or `@index` annotations.
+- On Windows, `File::sync_all()` requires write access — open files with `OpenOptions::write(true)` before syncing. The `write_atomic` helper handles this correctly.

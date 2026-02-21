@@ -1,0 +1,4 @@
+module CNanoGraph {
+    umbrella "/Users/andrew/code/nanograph/crates/nanograph-ffi/swift/Sources/CNanoGraph/include"
+    export *
+}

@@ -34,6 +34,7 @@ query find($name: String, $min_age: I32, $since: DateTime) { ... }
 ```
 
 Supported parameter types: all scalar types (`String`, `I32`, `I64`, `U64`, `F32`, `F64`, `Bool`, `Date`, `DateTime`) plus `Vector(dim)`.
+For exact 64-bit integer values from JS/TS SDKs, pass decimal strings when above `Number.MAX_SAFE_INTEGER`.
 
 Pass values at runtime:
 

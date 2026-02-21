@@ -1,0 +1,3 @@
+module NanoGraph {
+    header "/Users/andrew/code/nanograph/crates/nanograph-ffi/swift/.build/arm64-apple-macosx/debug/NanoGraph.build/include/NanoGraph-Swift.h"
+}

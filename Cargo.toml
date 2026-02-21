@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "crates/nanograph",
     "crates/nanograph-cli",
+    "crates/nanograph-ts",
+    "crates/nanograph-ffi",
 ]
 
 [workspace.dependencies]
@@ -40,6 +42,8 @@ tempfile = "3"
 ahash = "0.8"
 ariadne = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+napi = { version = "2", features = ["async", "serde-json"] }
+napi-derive = "2"
 
 [profile.dev]
 debug = 0

@@ -1,0 +1,20 @@
+[package]
+name = "nanograph-ts"
+version = "0.7.1"
+edition = "2024"
+description = "NanoGraph TypeScript/Node.js SDK via napi-rs"
+repository = "https://github.com/aaltshuler/nanograph"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+nanograph = { path = "../nanograph" }
+napi = { workspace = true }
+napi-derive = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+
+[build-dependencies]
+napi-build = "2"
