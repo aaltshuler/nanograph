@@ -1,3 +1,8 @@
+---
+title: TypeScript SDK
+slug: ts-sdk
+---
+
 # nanograph-ts — TypeScript SDK
 
 napi-rs bindings that wrap the `nanograph` Rust library crate. Same query pipeline, storage engine, and type system as the CLI — no logic duplication.

@@ -1,3 +1,8 @@
+---
+title: CLI
+slug: cli
+---
+
 # CLI Reference
 
 ```

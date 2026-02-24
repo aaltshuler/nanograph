@@ -1,3 +1,8 @@
+---
+title: Search
+slug: search
+---
+
 # Search Guide
 
 NanoGraph supports text search, vector (semantic) search, hybrid search, and graph-constrained search — all from the same query language. This guide covers each type with real examples using a Star Wars character graph.
@@ -8,7 +13,7 @@ The examples use the `search-test/` dataset in the repo. For full schema syntax,
 
 The schema:
 
-```
+```graphql
 node Character {
     slug: String @key
     name: String
@@ -42,7 +47,7 @@ Text search predicates go in the `match` block and filter rows. They don't retur
 
 ### `search()` — token-based keyword match
 
-```
+```graphql
 query keyword_search($q: String) {
     match {
         $c: Character
@@ -63,7 +68,7 @@ Token-based keyword match: query and field are tokenized, lowercased, and all qu
 
 ### `fuzzy()` — approximate match
 
-```
+```graphql
 query fuzzy_search($q: String) {
     match {
         $c: Character
@@ -84,7 +89,7 @@ Matches even if there are small spelling differences (edit distance). Useful whe
 
 ### `match_text()` — contiguous token match
 
-```
+```graphql
 query match_text_search($q: String) {
     match {
         $c: Character
@@ -109,7 +114,7 @@ Matches contiguous token sequences. The query is tokenized and must appear as co
 
 Unlike the filter predicates above, `bm25()` returns a numeric score. It can be used in both `return` (to project the score) and `order` (to rank by relevance).
 
-```
+```graphql
 query bm25_search($q: String) {
     match {
         $c: Character
@@ -134,7 +139,7 @@ Vector search finds nodes by meaning similarity, not keyword matching. The query
 
 ### `nearest()` — semantic similarity
 
-```
+```graphql
 query semantic_search($q: String) {
     match { $c: Character }
     return {
@@ -180,7 +185,7 @@ Hybrid search combines vector and text signals for better results than either al
 
 RRF merges two ranked lists by combining `1/(k + rank)` from each signal. It doesn't require the scores to be on the same scale.
 
-```
+```graphql
 query hybrid_search($q: String) {
     match {
         $c: Character
@@ -215,7 +220,7 @@ This is where NanoGraph's graph structure shines. You can combine edge traversal
 
 Find Luke's parents ranked by semantic similarity to a query:
 
-```
+```graphql
 query family_semantic($slug: String, $q: String) {
     match {
         $c: Character { slug: $slug }
@@ -247,7 +252,7 @@ The graph traversal (`hasParent`) narrows the candidate set first, then `nearest
 
 Find students of a mentor, ranked by bio relevance:
 
-```
+```graphql
 query students_search($mentor: String, $q: String) {
     match {
         $m: Character { slug: $mentor }
@@ -268,7 +273,7 @@ nanograph run --db sw.nano --query search-test/queries.gq --name students_search
 
 No search predicates — just follow edges:
 
-```
+```graphql
 query mentors_of($slug: String) {
     match {
         $c: Character { slug: $slug }
@@ -288,7 +293,7 @@ nanograph run --db sw.nano --query search-test/queries.gq --name mentors_of --pa
 
 Traverse from characters to films:
 
-```
+```graphql
 query debut_film($slug: String) {
     match {
         $c: Character { slug: $slug }
@@ -307,7 +312,7 @@ nanograph run --db sw.nano --query search-test/queries.gq --name debut_film --pa
 
 Find all characters who debuted in a given film:
 
-```
+```graphql
 query same_debut($film: String) {
     match {
         $c: Character
@@ -389,7 +394,7 @@ Match the `Vector(dim)` to the model's output:
 
 Use text predicates in `match` to narrow candidates, then rank with `nearest()` or `bm25()`:
 
-```
+```graphql
 query dark_side_semantic($q: String) {
     match {
         $c: Character
@@ -405,7 +410,7 @@ query dark_side_semantic($q: String) {
 
 Use edge traversal to define the candidate set, then rank with search:
 
-```
+```graphql
 query mentor_students_ranked($mentor: String, $q: String) {
     match {
         $m: Character { slug: $mentor }
@@ -423,7 +428,7 @@ This is the key pattern for graph-constrained search: **edges define context, se
 
 Project all scores to understand why results are ranked the way they are:
 
-```
+```graphql
 return {
     $c.slug,
     nearest($c.embedding, $q) as vec_dist,

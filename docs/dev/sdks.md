@@ -1,3 +1,8 @@
+---
+title: SDKs
+slug: sdks
+---
+
 # SDK Strategy
 
 Expose the Rust core to JS/TS and Swift via FFI. Keep SDKs embedded and local-first: no service process, no GraphQL adapter.

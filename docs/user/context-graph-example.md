@@ -1,3 +1,8 @@
+---
+title: Context Graph
+slug: context-graph
+---
+
 # Context Graph Example
 
 A CRM / RevOps context graph that captures the full physics of execution — from intelligence capture through enrichment, screening, decision-making, and delivery. This example demonstrates NanoGraph's ability to model complex real-world workflows with typed nodes, edges, and decision traces.
@@ -164,7 +169,7 @@ nanograph run --db omni.nano --query examples/revops/revops.gq --name all_client
 
 From an opportunity, trace who decided and what signal drove it:
 
-```
+```graphql
 query decision_trace($opp: String) {
     match {
         $o: Opportunity { slug: $opp }
@@ -307,7 +312,7 @@ nanograph run --db omni.nano --query examples/revops/revops.gq --name pipeline_s
 
 To add semantic search to this graph, annotate a text property with `@embed`:
 
-```
+```graphql
 node Signal {
     slug: String @key
     observedAt: DateTime
@@ -319,7 +324,7 @@ node Signal {
 
 Then load with embeddings enabled and query with graph-constrained semantic search:
 
-```
+```graphql
 // Find signals affecting a client, ranked by semantic similarity
 query client_signals_ranked($client: String, $q: String) {
     match {
@@ -336,7 +341,7 @@ This follows the **graph scope then rank** pattern from the [Search Guide](searc
 
 For hybrid fusion under traversal, combine `nearest()` and `bm25()` with `rrf()`:
 
-```
+```graphql
 query client_signals_hybrid($client: String, $q: String) {
     match {
         $c: Client { slug: $client }

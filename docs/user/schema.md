@@ -1,3 +1,8 @@
+---
+title: Schema
+slug: schema
+---
+
 # Schema Language Reference
 
 NanoGraph schemas are defined in `.pg` files. A schema declares node types, edge types, property types, and annotations. It is the source of truth for your graph's structure — all queries are validated against it at compile time.
@@ -6,7 +11,7 @@ NanoGraph schemas are defined in `.pg` files. A schema declares node types, edge
 
 A node type declares a named entity with typed properties:
 
-```
+```graphql
 node Person {
     name: String
     age: I32?
@@ -15,7 +20,7 @@ node Person {
 
 Nodes can inherit from a parent type:
 
-```
+```graphql
 node Employee : Person {
     employee_id: String @unique
 }
@@ -27,13 +32,13 @@ An `Employee` has all `Person` properties plus its own. Queries binding `$e: Emp
 
 An edge type connects two node types:
 
-```
+```graphql
 edge Knows: Person -> Person
 ```
 
 Edges can have properties:
 
-```
+```graphql
 edge Knows: Person -> Person {
     since: Date?
 }
@@ -60,7 +65,7 @@ Endpoint types are fixed — each edge type connects exactly one source type to 
 
 ### Vector type
 
-```
+```graphql
 embedding: Vector(1536)
 ```
 
@@ -68,7 +73,7 @@ Fixed-size float vector for semantic search. The dimension must match your embed
 
 ### Enum type
 
-```
+```graphql
 status: enum(active, completed, hold)
 ```
 
@@ -76,7 +81,7 @@ Enums define a closed set of allowed string values. Values are auto-sorted alpha
 
 ### List type
 
-```
+```graphql
 tags: [String]
 notes: [String]?
 ```
@@ -87,7 +92,7 @@ Lists wrap any scalar type: `[String]`, `[I32]`, `[F64]`, etc. List properties c
 
 Append `?` to make any type nullable:
 
-```
+```graphql
 rank: String?
 age: I32?
 tags: [String]?
@@ -97,7 +102,7 @@ tags: [String]?
 
 Annotations modify property behavior. They appear after the type:
 
-```
+```graphql
 slug: String @key
 name: String @unique
 email: String @index
@@ -123,7 +128,7 @@ old_name: String @rename_from("previous_name")
 
 ## Comments
 
-```
+```graphql
 // Line comment
 
 /* Block comment
@@ -152,7 +157,7 @@ Use `@rename_from("old_name")` to track renames so data is preserved. See [cli-r
 
 A Star Wars search schema with vector embeddings:
 
-```
+```graphql
 node Character {
     slug: String @key
     name: String

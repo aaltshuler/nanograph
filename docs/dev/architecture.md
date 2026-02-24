@@ -1,4 +1,6 @@
 ---
+title: Architecture
+slug: architecture
 audience: dev
 status: active
 updated: 2026-02-12

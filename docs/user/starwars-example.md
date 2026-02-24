@@ -1,3 +1,8 @@
+---
+title: Star Wars
+slug: starwars
+---
+
 # Star Wars Example
 
 A worked example using the `search-test/` dataset — 10 characters, 8 films, 26 edges. Demonstrates text search, vector search, hybrid search, and graph-constrained queries with real output.
@@ -8,7 +13,7 @@ For the full Star Wars graph (66 nodes, 146 edges, 30 queries), see `examples/st
 
 The schema defines two node types and five edge types:
 
-```
+```graphql
 node Character {
     slug: String @key
     name: String
@@ -69,7 +74,7 @@ Embeddings require `OPENAI_API_KEY` for real vectors, or `NANOGRAPH_EMBEDDINGS_M
 
 Find characters whose bio contains tokens matching "dark side":
 
-```
+```graphql
 query keyword_search($q: String) {
     match {
         $c: Character

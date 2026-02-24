@@ -1,10 +1,15 @@
+---
+title: Queries
+slug: queries
+---
+
 # Query Language Reference
 
 NanoGraph queries are defined in `.gq` files. The query language uses typed Datalog semantics with GraphQL-shaped syntax — named, parameterized queries validated against the schema at compile time.
 
 ## Query structure
 
-```
+```graphql
 query friends_of($name: String) {
     match {
         $p: Person { name: $name }
@@ -29,7 +34,7 @@ Every query has:
 
 Parameters are typed and prefixed with `$`:
 
-```
+```graphql
 query find($name: String, $min_age: I32, $since: DateTime) { ... }
 ```
 
@@ -51,7 +56,7 @@ The `match` block contains clauses that are implicitly conjoined (AND). All clau
 
 Bind a variable to a node type:
 
-```
+```graphql
 $p: Person
 $p: Person { name: "Alice" }
 $p: Person { name: $n, age: 30 }
@@ -63,7 +68,7 @@ Property matches in braces filter at bind time. Variables (`$n`) capture values 
 
 Traverse edges using Datalog predicate syntax:
 
-```
+```graphql
 $p knows $f
 ```
 
@@ -88,7 +93,7 @@ Using PascalCase in queries (e.g. `$s HasMentor $m`) produces a parse error.
 
 Multi-hop traversal without recursion:
 
-```
+```graphql
 $a knows{1,3} $b
 ```
 
@@ -98,7 +103,7 @@ Compiles to a finite union of 1-hop, 2-hop, and 3-hop traversals. Bounds must sa
 
 Boolean expressions over bound variables:
 
-```
+```graphql
 $f.age > 25
 $p.name != "Bob"
 $p.createdAt >= datetime("2026-01-01T00:00:00Z")
@@ -109,7 +114,7 @@ Comparison operators: `=`, `!=`, `>`, `<`, `>=`, `<=`.
 
 ### Negation
 
-```
+```graphql
 not {
     $p worksAt $_
 }
@@ -135,7 +140,7 @@ These go in the `match` block and act as filters — a row either matches or doe
 
 Projections define what columns appear in the output:
 
-```
+```graphql
 return {
     $f.name
     $f.age
@@ -160,7 +165,7 @@ Use `as` to alias columns.
 
 `bm25()`, `nearest()`, and `rrf()` can be projected to inspect scores:
 
-```
+```graphql
 return {
     $c.slug,
     bm25($c.bio, $q) as lexical_score,
@@ -171,7 +176,7 @@ return {
 
 ## Order clause
 
-```
+```graphql
 order { $f.age desc }
 order { $p.name asc, $p.age desc }
 ```
@@ -190,7 +195,7 @@ Default direction is ascending. Ordering expressions:
 
 ## Limit clause
 
-```
+```graphql
 limit 10
 ```
 
@@ -216,7 +221,7 @@ Mutation queries modify graph data. They use the same `query` wrapper but contai
 
 Append a new node:
 
-```
+```graphql
 query add_person($name: String, $age: I32) {
     insert Person { name: $name, age: $age }
 }
@@ -224,7 +229,7 @@ query add_person($name: String, $age: I32) {
 
 Insert an edge (endpoints resolved by `@key`):
 
-```
+```graphql
 query add_edge($from: String, $to: String) {
     insert Knows { from: $from, to: $to }
 }
@@ -234,7 +239,7 @@ query add_edge($from: String, $to: String) {
 
 Update by `@key` (merge semantics — requires the node type to have a `@key` property):
 
-```
+```graphql
 query advance_stage() {
     update Opportunity set {
         stage: "won"
@@ -247,7 +252,7 @@ query advance_stage() {
 
 Delete nodes matching a predicate. Edges where the deleted node is an endpoint are automatically cascaded:
 
-```
+```graphql
 query remove_cancelled() {
     delete ActionItem where slug = "ai-draft-proposal"
 }
@@ -255,7 +260,7 @@ query remove_cancelled() {
 
 ## Comments
 
-```
+```graphql
 // Line comment
 
 /* Block comment */
