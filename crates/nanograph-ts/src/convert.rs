@@ -97,6 +97,16 @@ fn parse_u64_param(key: &str, value: &serde_json::Value) -> napi::Result<u64> {
     }
 }
 
+fn parse_i32_param(key: &str, value: &serde_json::Value) -> napi::Result<i32> {
+    let parsed = parse_i64_param(key, value)?;
+    i32::try_from(parsed).map_err(|_| {
+        napi::Error::from_reason(format!(
+            "param '{}': value {} exceeds I32 range",
+            key, parsed
+        ))
+    })
+}
+
 /// Convert a JS params object to a ParamMap, using query param type declarations
 /// for type-guided conversion.
 pub fn js_object_to_param_map(
@@ -136,9 +146,17 @@ fn convert_with_type_hint(
     match type_name {
         "String" => match value {
             serde_json::Value::String(s) => Ok(Literal::String(s.clone())),
-            other => Ok(Literal::String(other.to_string())),
+            other => Err(napi::Error::from_reason(format!(
+                "param '{}': expected string, got {}",
+                key,
+                json_type_name(other)
+            ))),
         },
-        "I32" | "I64" => {
+        "I32" => {
+            let n = parse_i32_param(key, value)?;
+            Ok(Literal::Integer(n as i64))
+        }
+        "I64" => {
             let n = parse_i64_param(key, value)?;
             Ok(Literal::Integer(n))
         }
@@ -349,6 +367,18 @@ pub fn parse_compact_options(opts: Option<&serde_json::Value>) -> napi::Result<C
             ));
         }
     };
+    for key in obj.keys() {
+        match key.as_str() {
+            "targetRowsPerFragment" | "materializeDeletions" | "materializeDeletionsThreshold" => {
+            }
+            _ => {
+                return Err(napi::Error::from_reason(format!(
+                    "unknown compact option '{}'",
+                    key
+                )));
+            }
+        }
+    }
     if let Some(v) = obj.get("targetRowsPerFragment") {
         let parsed = v.as_u64().ok_or_else(|| {
             napi::Error::from_reason("targetRowsPerFragment must be a positive integer")
@@ -392,6 +422,17 @@ pub fn parse_cleanup_options(opts: Option<&serde_json::Value>) -> napi::Result<C
             ));
         }
     };
+    for key in obj.keys() {
+        match key.as_str() {
+            "retainTxVersions" | "retainDatasetVersions" => {}
+            _ => {
+                return Err(napi::Error::from_reason(format!(
+                    "unknown cleanup option '{}'",
+                    key
+                )));
+            }
+        }
+    }
     if let Some(v) = obj.get("retainTxVersions") {
         let parsed = v.as_u64().ok_or_else(|| {
             napi::Error::from_reason("retainTxVersions must be a positive integer")
