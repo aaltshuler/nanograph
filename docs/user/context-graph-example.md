@@ -17,92 +17,69 @@ The graph captures a three-phase execution cycle. Each phase builds on the previ
 
 Jamie's coffee chat produces a Signal. The Signal links to who it's about and what deal it reveals.
 
-```text
-  👤 Jamie Lee (Client)
-     tags: ['connector']
-        │
-        └── OWNS ──▶ ☕ Coffee Chat (Record)
-                        platform: 'internal'
-                        recordType: 'meeting'
-                           ▲
-                           │ SOURCED_FROM
-                           │
-                     🧠 "Hates vendor" (Signal)
-                        urgency: 'high'
-                        sourceType: 'meeting'
-                           │
-                           ├── AFFECTS ──▶ 👤 Priya Shah (Client)
-                           │                  company: 'Stripe'
-                           │
-                           └── SURFACED ──▶ 🎯 Stripe Migration (Opportunity)
-                                              stage: 'identified'
+```mermaid
+graph TD
+    Jamie["Jamie Lee (Client)"]
+    Coffee["Coffee Chat (Record)"]
+    Signal["'Hates vendor' (Signal)"]
+    Priya["Priya Shah (Client)"]
+    Opp["Stripe Migration (Opportunity)"]
 
-  👤 Priya Shah (Client) ── OWNS ──▶ 🎯 Stripe Migration (Opportunity)
+    Jamie -->|OWNS| Coffee
+    Signal -->|SOURCED_FROM| Coffee
+    Signal -->|AFFECTS| Priya
+    Signal -->|SURFACED| Opp
+    Priya -->|OWNS| Opp
 ```
 
 ### Phase 2 — Enrichment & Screening: Agent builds the case
 
 The agent reads the Screening Policy, generates an Enrichment Profile based on its criteria, then the Decision is screened and passes.
 
-```text
-  ⚖️ Make Proposal (Decision)
-     intent: 'Make proposal for Stripe migration'
-     domain: 'sales'
-        │
-        ├── MADE_BY ──────────▶ 👤 Andrew (Actor, type: 'human')
-        │
-        ├── INFORMED_BY ──────▶ 🧠 "Hates vendor" (Signal)
-        │   (influence: 'primary')
-        │
-        ├── AFFECTS ──────────▶ 👤 Priya Shah (Client)
-        │
-        ├── TARGETS ──────────▶ 🎯 Stripe Migration (Opportunity)
-        │
-        ├── SCREENED_BY ──────▶ 📜 Screening Policy (Policy)
-        │   (outcome: 'passed')    key: 'client-screen'
-        │                             │
-        │                             └── SUPERSEDES ──▶ 📜 Screening Policy v1
-        │
-        └── RESULTED_IN ─────▶ ⚙️ Build Profile (Action)
-                                  operation: 'create'
-                                  success: true
-                                     │
-                                     └── TOUCHED ──▶ 📊 Enrichment Profile (Record)
-                                         (action: 'created')
-                                                        │
-                                                        └── DERIVED_FROM ──▶ 📜 Screening Policy
+```mermaid
+graph TD
+    Decision["Make Proposal (Decision)"]
+    Andrew["Andrew (Actor)"]
+    Signal["'Hates vendor' (Signal)"]
+    Priya["Priya Shah (Client)"]
+    Opp["Stripe Migration (Opportunity)"]
+    Policy["Screening Policy (Policy)"]
+    PolicyV1["Screening Policy v1"]
+    Action["Build Profile (Action)"]
+    Profile["Enrichment Profile (Record)"]
+
+    Decision -->|MADE_BY| Andrew
+    Decision -->|INFORMED_BY| Signal
+    Decision -->|AFFECTS| Priya
+    Decision -->|TARGETS| Opp
+    Decision -->|SCREENED_BY| Policy
+    Policy -->|SUPERSEDES| PolicyV1
+    Decision -->|RESULTED_IN| Action
+    Action -->|TOUCHED| Profile
+    Profile -->|DERIVED_FROM| Policy
 ```
 
 ### Phase 3 — Execution: Work is assigned, completed, and proven
 
 The Decision generates work. The agent executes it, creating the proposal and advancing the deal.
 
-```text
-  ⚖️ Make Proposal (Decision)
-        │
-        ├── GENERATES ────▶ 📋 Draft Proposal (ActionItem)
-        │                     status: 'completed'
-        │                     priority: 'high'
-        │                        │
-        │                        └── ASSIGNED_TO ──▶ 🤖 OmniBot (Actor, type: 'agent')
-        │
-        └── RESULTED_IN ──▶ ⚙️ Sent Proposal (Action)
-                               operation: 'send'
-                               success: true
-                                  │
-                                  ├── RESOLVES ──▶ 📋 Draft Proposal (ActionItem)
-                                  │
-                                  ├── TOUCHED ───▶ 📄 Proposal.pdf (Record)
-                                  │   (action: 'created')
-                                  │
-                                  └── TOUCHED ───▶ 🎯 Stripe Migration (Opportunity)
-                                      (action: 'updated',
-                                       mutatedFields: ['stage'])
+```mermaid
+graph TD
+    Decision["Make Proposal (Decision)"]
+    Draft["Draft Proposal (ActionItem)"]
+    OmniBot["OmniBot (Actor)"]
+    SentAction["Sent Proposal (Action)"]
+    Proposal["Proposal.pdf (Record)"]
+    Opp["Stripe Migration (Opportunity)"]
+    Pipeline["Data Pipeline (Project)"]
 
-  🎯 Stripe Migration (Opportunity)
-        │
-        └── CONTAINS ──▶ 🏗️ Data Pipeline (Project)
-                            status: 'active'
+    Decision -->|GENERATES| Draft
+    Draft -->|ASSIGNED_TO| OmniBot
+    Decision -->|RESULTED_IN| SentAction
+    SentAction -->|RESOLVES| Draft
+    SentAction -->|TOUCHED| Proposal
+    SentAction -->|TOUCHED| Opp
+    Opp -->|CONTAINS| Pipeline
 ```
 
 ## Schema overview

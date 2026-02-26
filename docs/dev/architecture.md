@@ -40,76 +40,78 @@ All source paths relative to `crates/nanograph/src/`.
 
 ## 3) Command and data lifecycle
 
-```text
-                                 +------------------+
-                                 |   User / CLI     |
-                                 +---------+--------+
-                                           |
-   +------------+------------+-------------+-------------+------------+
-   |            |            |             |             |            |
-  init        load        run/check     migrate       delete
-   |            |            |             |             |
-   v            v            v             v             v
-read .pg    DB::open()   parse .gq     DB::open()    DB::open()
-parse       load_jsonl   typecheck     diff old/new  delete_nodes()
-build IR    (mode:        lower/exec    schema IR     cascade edges
-write .pg    overwrite    or exec       plan steps    compact Lance
-write IR     append       mutation      apply safe
-write mfst   merge)                     confirm/block
+```mermaid
+graph TD
+    CLI["User / CLI"]
+
+    CLI --> Init
+    CLI --> Load
+    CLI --> RunCheck["run / check"]
+    CLI --> Migrate
+    CLI --> Delete
+
+    Init --> I1["read .pg → parse → build IR"]
+    I1 --> I2["write .pg + IR + manifest"]
+
+    Load --> L1["DB::open()"]
+    L1 --> L2["load_jsonl\n(overwrite / append / merge)"]
+
+    RunCheck --> R1["parse .gq → typecheck"]
+    R1 --> R2["lower / exec query\nor exec mutation"]
+
+    Migrate --> M1["DB::open()"]
+    M1 --> M2["diff schema IR → plan steps"]
+    M2 --> M3["apply safe / confirm / block"]
+
+    Delete --> D1["DB::open()"]
+    D1 --> D2["delete_nodes()\ncascade edges → compact Lance"]
 ```
 
 ## 4) Query pipeline (logical -> physical)
 
-```text
-Query text (.gq)
-    |
-    v
-parse_query()
-    |
-    v
-typecheck_query()  (T1–T9 for reads, T10–T14 for mutations)
-  - resolves variable bindings/types
-  - resolves traversal direction
-  - validates filter compatibility
-    |
-    +------ read query ------+------ mutation query ------+
-    |                                                      |
-    v                                                      v
-lower_query() -> QueryIR                    lower_mutation_query() -> MutationIR
-  pipeline: [NodeScan|Expand|Filter|AntiJoin]  op: Insert | Update | Delete
-  return_exprs/order/limit                     assignments + predicates
-    |                                                      |
-    v                                                      v
-build_physical_plan()                         execute_mutation()
-    |                                           - insert: append to Lance
-    +--> NodeScanExec  (scan + Lance pushdown)  - update: merge via @key
-    +--> CrossJoinExec (combine bindings)        - delete: cascade edges
-    +--> ExpandExec    (CSR/CSC expansion)              |
-    +--> AntiJoinExec  (negation)                       v
-    |                                         MutationExecResult
-    v                                           (rows affected)
-execute_query()
-  - fast path: stream when no agg/order/limit
-  - otherwise: collect, filter/project/agg/order/limit
-    |
-    v
-Arrow RecordBatch result(s)
+```mermaid
+graph TD
+    Source["Query text (.gq)"]
+    Parse["parse_query()"]
+    TC["typecheck_query()\nT1–T9 reads, T10–T14 mutations"]
+
+    Source --> Parse --> TC
+
+    TC -->|read query| Lower["lower_query() → QueryIR\nNodeScan · Expand · Filter · AntiJoin"]
+    TC -->|mutation query| LowerMut["lower_mutation_query() → MutationIR\nInsert · Update · Delete"]
+
+    Lower --> Plan["build_physical_plan()"]
+    Plan --> NSE["NodeScanExec\n(scan + Lance pushdown)"]
+    Plan --> CJE["CrossJoinExec\n(combine bindings)"]
+    Plan --> EXE["ExpandExec\n(CSR/CSC expansion)"]
+    Plan --> AJE["AntiJoinExec\n(negation)"]
+
+    NSE & CJE & EXE & AJE --> Exec["execute_query()\nstream or collect → filter/project/agg/order/limit"]
+    Exec --> Result["Arrow RecordBatch"]
+
+    LowerMut --> ExecMut["execute_mutation()\ninsert → append to Lance\nupdate → merge via @key\ndelete → cascade edges"]
+    ExecMut --> MutResult["MutationExecResult\n(rows affected)"]
 ```
 
 ## 5) Storage architecture
 
-```text
-On disk (db directory)                     In memory (GraphStorage)
-----------------------                     ------------------------
-schema.pg                                  catalog
-schema.ir.json                             node_segments[type]:
-graph.manifest.json                          - schema
-nodes/                                        - batches[]
-  <type_id_hex>/                              - id_to_row map
-edges/                                      edge_segments[type]:
-  <type_id_hex>/                              - src_ids[], dst_ids[], edge_ids[]
-                                              - edge property batches[]
-                                              - csr (outgoing), csc (incoming)
+```mermaid
+graph LR
+    subgraph Disk["On disk (db directory)"]
+        PG["schema.pg"]
+        IR["schema.ir.json"]
+        Manifest["graph.manifest.json"]
+        Nodes["nodes/&lt;type_id_hex&gt;/"]
+        Edges["edges/&lt;type_id_hex&gt;/"]
+    end
+
+    subgraph Memory["In memory (GraphStorage)"]
+        Catalog["catalog"]
+        NodeSeg["node_segments per type\nschema · batches · id_to_row"]
+        EdgeSeg["edge_segments per type\nsrc/dst/edge IDs · property batches\nCSR (outgoing) · CSC (incoming)"]
+    end
+
+    Disk --> Memory
 ```
 
 Manifest is the authoritative dataset inventory. `Database::open()` validates the schema hash, restores the listed datasets, then rebuilds CSR/CSC indices.

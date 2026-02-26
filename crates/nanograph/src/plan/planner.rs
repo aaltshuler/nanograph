@@ -157,7 +157,11 @@ pub async fn execute_query(
             .any(|o| matches!(o.expr, IRExpr::AliasRef(_)));
 
         let result = if has_alias_order && !has_nearest {
-            let projected = apply_projection(&resolved_ir.return_exprs, &filtered, params)?;
+            // Alias-based ordering needs globally comparable alias values. For rank-producing
+            // aliases (bm25/rrf), projecting per input batch would compute scores on different
+            // local corpora/rankings and produce unstable global ordering.
+            let projected =
+                apply_projection_for_alias_ordering(&resolved_ir.return_exprs, &filtered, params)?;
             apply_order_and_limit(&projected, &resolved_ir.order_by, resolved_ir.limit, params)?
         } else {
             let ordered =
@@ -2405,6 +2409,24 @@ fn apply_projection(
     Ok(result)
 }
 
+fn apply_projection_for_alias_ordering(
+    projections: &[IRProjection],
+    batches: &[RecordBatch],
+    params: &ParamMap,
+) -> Result<Vec<RecordBatch>> {
+    if batches.is_empty() {
+        return Ok(vec![]);
+    }
+    if batches.len() == 1 {
+        return apply_projection(projections, batches, params);
+    }
+
+    let schema = batches[0].schema();
+    let combined = arrow_select::concat::concat_batches(&schema, batches)
+        .map_err(|e| NanoError::Execution(e.to_string()))?;
+    apply_projection(projections, &[combined], params)
+}
+
 fn infer_projection_field(
     expr: &IRExpr,
     alias: Option<&str>,
@@ -3645,6 +3667,52 @@ mod tests {
         let out = out.as_any().downcast_ref::<Float64Array>().unwrap();
         assert!(out.value(0) > out.value(1));
         assert!(out.value(0) > out.value(2));
+    }
+
+    #[test]
+    fn alias_order_projection_combines_batches_for_global_scores() {
+        let schema = Arc::new(Schema::new(vec![Field::new("text", DataType::Utf8, false)]));
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec![
+                "billing invoice reconciliation delay",
+                "warm referral for analytics migration project",
+            ])) as ArrayRef],
+        )
+        .unwrap();
+        let batch2 = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec![
+                "billing invoice dispute with procurement owner",
+                "customer onboarding checklist",
+            ])) as ArrayRef],
+        )
+        .unwrap();
+
+        let projections = vec![IRProjection {
+            expr: IRExpr::Bm25 {
+                field: Box::new(IRExpr::Variable("text".to_string())),
+                query: Box::new(IRExpr::Literal(Literal::String(
+                    "billing invoice".to_string(),
+                ))),
+            },
+            alias: Some("score".to_string()),
+        }];
+
+        let split_projected = apply_projection(
+            &projections,
+            &[batch1.clone(), batch2.clone()],
+            &ParamMap::new(),
+        )
+        .unwrap();
+        assert_eq!(split_projected.len(), 2);
+
+        let global_projected =
+            apply_projection_for_alias_ordering(&projections, &[batch1, batch2], &ParamMap::new())
+                .unwrap();
+        assert_eq!(global_projected.len(), 1);
+        assert_eq!(global_projected[0].num_rows(), 4);
+        assert_eq!(global_projected[0].schema().field(0).name(), "score");
     }
 
     #[test]

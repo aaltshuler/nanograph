@@ -1,12 +1,12 @@
 ---
 audience: dev
 status: draft
-updated: 2026-02-19
+updated: 2026-02-24
 ---
 
-# Traditional and Fuzzy Search (NanoGraph v0)
+# Search Semantics (Current)
 
-This document describes the **current NanoGraph behavior** for traditional text search and fuzzy text search in graph queries.
+This document summarizes the current NanoGraph search behavior across text, vector, hybrid, and graph-constrained queries.
 
 ## Scope
 
@@ -14,72 +14,80 @@ Implemented now:
 
 - `search(field, query)`
 - `fuzzy(field, query[, max_edits])`
+- `match_text(field, query)`
+- `bm25(field, query)`
+- `nearest(vector_field, query_vector_or_text)`
+- `rrf(rank_expr_a, rank_expr_b[, k])`
 
-Not implemented in this phase:
+Still pending / future optimization work:
 
-- BM25 ranking
-- Phrase/proximity scoring
-- Lance FTS index pushdown
-- Hybrid vector + BM25 ranking (RRF)
+- Lance FTS pushdown for text predicates and BM25
+- Broader ANN/hybrid pushdown coverage beyond current fast paths
 
 ## Query Syntax
 
-These functions are boolean expressions and can be used directly inside `match` blocks:
-
 ```gq
-query keyword_signals($q: String) {
+query keyword($q: String) {
     match {
         $s: Signal
         search($s.summary, $q)
     }
-    return { $s.slug, $s.summary }
+    return { $s.slug }
 }
 
-query fuzzy_signals($q: String, $m: I64) {
+query phrase($q: String) {
     match {
         $s: Signal
-        fuzzy($s.summary, $q, $m)
+        match_text($s.summary, $q)
     }
-    return { $s.slug, $s.summary }
+    return { $s.slug }
+}
+
+query semantic($q: String) {
+    match { $s: Signal }
+    return { $s.slug, nearest($s.embedding, $q) as distance }
+    order { nearest($s.embedding, $q) }
+    limit 5
+}
+
+query hybrid($q: String) {
+    match { $s: Signal }
+    return { $s.slug, rrf(nearest($s.embedding, $q), bm25($s.summary, $q)) as score }
+    order { rrf(nearest($s.embedding, $q), bm25($s.summary, $q)) desc }
+    limit 5
 }
 ```
 
 ## Semantics
 
-### `search(field, query)`
+### Text predicates (boolean filters)
 
-- Case-insensitive token search.
-- Both `field` and `query` are tokenized by non-alphanumeric boundaries.
-- **All query tokens must exist as exact tokens** in the field text.
-- Empty token sets evaluate to `false`.
+- `search(field, query)`: case-insensitive token search; query and field are tokenized by non-alphanumeric boundaries; all query tokens must exist as exact tokens; empty token sets evaluate to `false`.
+- `fuzzy(field, query[, max_edits])`: case-insensitive token search with typo tolerance; each query token must fuzzy-match a field token via Levenshtein distance; `max_edits` must be integer >= 0; default per-token edits are `0` (len <= 2), `1` (len <= 5), `2` (len > 5).
+- `match_text(field, query)`: tokenized contiguous phrase match (query tokens must appear in order and adjacent).
 
-### `fuzzy(field, query[, max_edits])`
+### Ranking functions
 
-- Case-insensitive token search with typo tolerance.
-- Each query token must fuzzy-match at least one field token.
-- Matching uses Levenshtein edit distance.
-- `max_edits` is optional and must be an integer scalar (`I32`, `I64`, `U32`, `U64`) >= 0.
-- If `max_edits` is omitted, per-token defaults are:
-  - length <= 2: `0`
-  - length <= 5: `1`
-  - length > 5: `2`
+- `bm25(field, query)`: returns lexical relevance score; higher is better; use `desc` ordering.
+- `nearest(vector_field, query)`: returns cosine distance; lower is better; default ordering is ascending; ordering with `nearest(...)` requires `limit`.
+- `rrf(a, b[, k])`: reciprocal rank fusion over rank-producing expressions (`nearest` / `bm25` / nested `rrf`); higher is better; use `desc`; ordering with `rrf(...)` requires `limit`; `k` must be integer > 0 (default `60`).
 
 ## Type Rules
 
-- `field` must be scalar `String`.
-- `query` must be scalar `String`.
-- `max_edits` (if provided) must be integer scalar.
-
-Type errors are reported as `T19` violations.
+- `search` / `fuzzy` require String field/query (`T19`).
+- `match_text` / `bm25` require String field/query (`T20`).
+- `rrf` operands must be rank expressions and `k > 0` (`T21`).
+- `nearest` validates vector property and query dimension compatibility (`T15`).
+- Standalone `nearest` and `rrf` ordering require `limit` (`T17`, `T21`).
 
 ## Execution Notes
 
-- Current execution is correctness-first and in-memory at filter evaluation time.
-- These predicates are **not** pushed into Lance SQL scanner filters in this phase.
-- This path is deterministic and works with graph traversal constraints.
+- Text predicate evaluation, BM25 scoring, and RRF fusion run in planner execution (correctness-first path).
+- String queries for `nearest(..., $q: String)` are resolved to embeddings before execution.
+- Single-node `nearest` queries can use an ANN fast path when an index is available.
+- Graph traversal constraints are applied before ranking, enabling graph-scoped search.
 
 ## Roadmap
 
-- FTS/BM25 and hybrid ranking remain Phase 4 (`docs/dev/search-plan.md`).
-- Phase 4 design contract is in `docs/dev/fts-rfc.md`.
-- Lance-native inverted-index pushdown and hybrid scoring implementation should follow `docs/dev/fts-rfc.md`.
+- Continue improving pushdown/index utilization for text and hybrid ranking paths.
+- Keep semantics aligned with `docs/user/search.md` and `docs/user/queries.md`.

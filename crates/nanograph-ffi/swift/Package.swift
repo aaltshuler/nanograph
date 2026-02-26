@@ -29,5 +29,10 @@ let package = Package(
                 .unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "../../../target/release"]),
             ]
         ),
+        .testTarget(
+            name: "NanoGraphTests",
+            dependencies: ["NanoGraph"],
+            path: "Tests/NanoGraphTests"
+        ),
     ]
 )

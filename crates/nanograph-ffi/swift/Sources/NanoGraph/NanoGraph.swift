@@ -19,6 +19,8 @@ public enum LoadMode: String {
 }
 
 public final class Database {
+    // Serializes handle lifecycle/use to avoid close-vs-operation races.
+    private let lock = NSLock()
     private var handle: OpaquePointer?
 
     private init(handle: OpaquePointer) {
@@ -26,9 +28,11 @@ public final class Database {
     }
 
     deinit {
-        if let handle {
-            nanograph_db_destroy(handle)
-            self.handle = nil
+        lock.withLock {
+            if let handle {
+                nanograph_db_destroy(handle)
+                self.handle = nil
+            }
         }
     }
 
@@ -55,26 +59,30 @@ public final class Database {
     }
 
     public func close() throws {
-        guard let handle else {
-            return
+        try lock.withLock {
+            guard let handle else {
+                return
+            }
+            let status = nanograph_db_close(handle)
+            if status != 0 {
+                throw NanoGraphError.message(Self.lastErrorMessage())
+            }
+            nanograph_db_destroy(handle)
+            self.handle = nil
         }
-        let status = nanograph_db_close(handle)
-        if status != 0 {
-            throw NanoGraphError.message(Self.lastErrorMessage())
-        }
-        nanograph_db_destroy(handle)
-        self.handle = nil
     }
 
     public func load(dataSource: String, mode: LoadMode) throws {
-        let handle = try requireHandle()
-        let status = dataSource.withCString { dataPtr in
-            mode.rawValue.withCString { modePtr in
-                nanograph_db_load(handle, dataPtr, modePtr)
+        try lock.withLock {
+            let handle = try requireHandleLocked()
+            let status = dataSource.withCString { dataPtr in
+                mode.rawValue.withCString { modePtr in
+                    nanograph_db_load(handle, dataPtr, modePtr)
+                }
             }
-        }
-        if status != 0 {
-            throw NanoGraphError.message(Self.lastErrorMessage())
+            if status != 0 {
+                throw NanoGraphError.message(Self.lastErrorMessage())
+            }
         }
     }
 
@@ -84,64 +92,76 @@ public final class Database {
         params: Any? = nil
     ) throws -> Any {
         let paramsJSON = try encodeJSON(params)
-        let handle = try requireHandle()
-        let ptr = querySource.withCString { querySourcePtr in
-            queryName.withCString { queryNamePtr in
-                if let paramsJSON {
-                    return paramsJSON.withCString { paramsPtr in
-                        nanograph_db_run(handle, querySourcePtr, queryNamePtr, paramsPtr)
+        return try lock.withLock {
+            let handle = try requireHandleLocked()
+            let ptr = querySource.withCString { querySourcePtr in
+                queryName.withCString { queryNamePtr in
+                    if let paramsJSON {
+                        return paramsJSON.withCString { paramsPtr in
+                            nanograph_db_run(handle, querySourcePtr, queryNamePtr, paramsPtr)
+                        }
                     }
+                    return nanograph_db_run(handle, querySourcePtr, queryNamePtr, nil)
                 }
-                return nanograph_db_run(handle, querySourcePtr, queryNamePtr, nil)
             }
+            return try decodeOwnedJSONString(ptr)
         }
-        return try decodeOwnedJSONString(ptr)
     }
 
     public func check(querySource: String) throws -> Any {
-        let handle = try requireHandle()
-        let ptr = querySource.withCString { querySourcePtr in
-            nanograph_db_check(handle, querySourcePtr)
+        return try lock.withLock {
+            let handle = try requireHandleLocked()
+            let ptr = querySource.withCString { querySourcePtr in
+                nanograph_db_check(handle, querySourcePtr)
+            }
+            return try decodeOwnedJSONString(ptr)
         }
-        return try decodeOwnedJSONString(ptr)
     }
 
     public func describe() throws -> Any {
-        let handle = try requireHandle()
-        let ptr = nanograph_db_describe(handle)
-        return try decodeOwnedJSONString(ptr)
+        try lock.withLock {
+            let handle = try requireHandleLocked()
+            let ptr = nanograph_db_describe(handle)
+            return try decodeOwnedJSONString(ptr)
+        }
     }
 
     public func compact(options: Any? = nil) throws -> Any {
-        let handle = try requireHandle()
         let optionsJSON = try encodeJSON(options)
-        let ptr = if let optionsJSON {
-            optionsJSON.withCString { optionsPtr in
-                nanograph_db_compact(handle, optionsPtr)
+        return try lock.withLock {
+            let handle = try requireHandleLocked()
+            let ptr = if let optionsJSON {
+                optionsJSON.withCString { optionsPtr in
+                    nanograph_db_compact(handle, optionsPtr)
+                }
+            } else {
+                nanograph_db_compact(handle, nil)
             }
-        } else {
-            nanograph_db_compact(handle, nil)
+            return try decodeOwnedJSONString(ptr)
         }
-        return try decodeOwnedJSONString(ptr)
     }
 
     public func cleanup(options: Any? = nil) throws -> Any {
-        let handle = try requireHandle()
         let optionsJSON = try encodeJSON(options)
-        let ptr = if let optionsJSON {
-            optionsJSON.withCString { optionsPtr in
-                nanograph_db_cleanup(handle, optionsPtr)
+        return try lock.withLock {
+            let handle = try requireHandleLocked()
+            let ptr = if let optionsJSON {
+                optionsJSON.withCString { optionsPtr in
+                    nanograph_db_cleanup(handle, optionsPtr)
+                }
+            } else {
+                nanograph_db_cleanup(handle, nil)
             }
-        } else {
-            nanograph_db_cleanup(handle, nil)
+            return try decodeOwnedJSONString(ptr)
         }
-        return try decodeOwnedJSONString(ptr)
     }
 
     public func doctor() throws -> Any {
-        let handle = try requireHandle()
-        let ptr = nanograph_db_doctor(handle)
-        return try decodeOwnedJSONString(ptr)
+        try lock.withLock {
+            let handle = try requireHandleLocked()
+            let ptr = nanograph_db_doctor(handle)
+            return try decodeOwnedJSONString(ptr)
+        }
     }
 
     public func run<T: Decodable>(
@@ -164,7 +184,7 @@ public final class Database {
         return try decodeValue(type, from: raw)
     }
 
-    private func requireHandle() throws -> OpaquePointer {
+    private func requireHandleLocked() throws -> OpaquePointer {
         guard let handle else {
             throw NanoGraphError.message("Database is closed")
         }

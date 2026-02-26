@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
 use std::ptr;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use tokio::runtime::Runtime;
 
@@ -20,22 +20,26 @@ const STATUS_OK: c_int = 0;
 const STATUS_ERR: c_int = -1;
 
 thread_local! {
-    static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
+    static LAST_ERROR_CSTR: RefCell<Option<CString>> = const { RefCell::new(None) };
+}
+
+static LAST_ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+fn last_error_slot() -> &'static Mutex<Option<String>> {
+    LAST_ERROR.get_or_init(|| Mutex::new(None))
 }
 
 fn set_last_error(message: impl Into<String>) {
-    let fallback = CString::new("nanograph-ffi: error contained interior null byte")
-        .expect("static string must be valid CString");
-    let next = CString::new(message.into()).unwrap_or(fallback);
-    LAST_ERROR.with(|slot| {
-        *slot.borrow_mut() = Some(next);
-    });
+    let next = message.into().replace('\0', "\\0");
+    if let Ok(mut slot) = last_error_slot().lock() {
+        *slot = Some(next);
+    }
 }
 
 fn clear_last_error() {
-    LAST_ERROR.with(|slot| {
-        *slot.borrow_mut() = None;
-    });
+    if let Ok(mut slot) = last_error_slot().lock() {
+        *slot = None;
+    }
 }
 
 fn to_status(result: FfiResult<()>) -> c_int {
@@ -124,6 +128,12 @@ fn parse_compact_options(opts: Option<&serde_json::Value>) -> FfiResult<CompactO
         Some(serde_json::Value::Null) | None => return Ok(result),
         Some(_) => return Err("compact options must be a JSON object".to_string()),
     };
+    for key in obj.keys() {
+        match key.as_str() {
+            "targetRowsPerFragment" | "materializeDeletions" | "materializeDeletionsThreshold" => {}
+            _ => return Err(format!("unknown compact option '{}'", key)),
+        }
+    }
     if let Some(v) = obj.get("targetRowsPerFragment") {
         let parsed = v
             .as_u64()
@@ -158,6 +168,12 @@ fn parse_cleanup_options(opts: Option<&serde_json::Value>) -> FfiResult<CleanupO
         Some(serde_json::Value::Null) | None => return Ok(result),
         Some(_) => return Err("cleanup options must be a JSON object".to_string()),
     };
+    for key in obj.keys() {
+        match key.as_str() {
+            "retainTxVersions" | "retainDatasetVersions" => {}
+            _ => return Err(format!("unknown cleanup option '{}'", key)),
+        }
+    }
     if let Some(v) = obj.get("retainTxVersions") {
         let parsed = v
             .as_u64()
@@ -207,6 +223,17 @@ fn parse_u64_param(key: &str, value: &serde_json::Value) -> FfiResult<u64> {
     }
 }
 
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
 fn json_value_to_literal_inferred(key: &str, value: &serde_json::Value) -> FfiResult<Literal> {
     match value {
         serde_json::Value::String(s) => Ok(Literal::String(s.clone())),
@@ -249,7 +276,11 @@ fn json_value_to_literal_typed(
     match type_name {
         "String" => match value {
             serde_json::Value::String(s) => Ok(Literal::String(s.clone())),
-            other => Ok(Literal::String(other.to_string())),
+            other => Err(format!(
+                "param '{}': expected string, got {}",
+                key,
+                json_type_name(other)
+            )),
         },
         "I32" | "I64" => Ok(Literal::Integer(parse_i64_param(key, value)?)),
         "U32" => {
@@ -312,7 +343,12 @@ fn json_value_to_literal_typed(
         }
         _ => match value {
             serde_json::Value::String(s) => Ok(Literal::String(s.clone())),
-            other => Ok(Literal::String(other.to_string())),
+            other => Err(format!(
+                "param '{}': expected string for type '{}', got {}",
+                key,
+                type_name,
+                json_type_name(other)
+            )),
         },
     }
 }
@@ -373,29 +409,28 @@ pub struct NanoGraphHandle {
 }
 
 impl NanoGraphHandle {
-    fn new(db: Database) -> FfiResult<Self> {
-        let runtime = Runtime::new().map_err(|e| format!("failed to create runtime: {}", e))?;
-        Ok(Self {
+    fn with_runtime(runtime: Runtime, db: Database) -> Self {
+        Self {
             runtime,
             db: Mutex::new(Some(db)),
-        })
+        }
     }
 }
 
-fn with_handle_mut<T>(
+fn with_handle<T>(
     handle: *mut NanoGraphHandle,
-    f: impl FnOnce(&mut NanoGraphHandle) -> FfiResult<T>,
+    f: impl FnOnce(&NanoGraphHandle) -> FfiResult<T>,
 ) -> FfiResult<T> {
     if handle.is_null() {
         return Err("database handle is null".to_string());
     }
     // SAFETY: pointer is checked for null above and expected to come from this library.
-    let handle = unsafe { handle.as_mut() }.ok_or_else(|| "invalid database handle".to_string())?;
+    let handle = unsafe { &*handle };
     f(handle)
 }
 
 fn run_query_json(
-    handle: &mut NanoGraphHandle,
+    handle: &NanoGraphHandle,
     query_source: &str,
     query_name: &str,
     params: Option<serde_json::Value>,
@@ -455,12 +490,21 @@ fn run_query_json(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nanograph_last_error_message() -> *const c_char {
-    LAST_ERROR.with(|slot| {
-        if let Some(message) = slot.borrow().as_ref() {
-            message.as_ptr()
-        } else {
-            ptr::null()
-        }
+    let message = match last_error_slot().lock() {
+        Ok(guard) => guard.clone(),
+        Err(_) => None,
+    };
+    let Some(message) = message else {
+        return ptr::null();
+    };
+
+    LAST_ERROR_CSTR.with(|slot| {
+        let fallback = CString::new("nanograph-ffi: error contained interior null byte")
+            .expect("static string must be valid CString");
+        let next = CString::new(message).unwrap_or(fallback);
+        let mut slot = slot.borrow_mut();
+        *slot = Some(next);
+        slot.as_ref().map_or(ptr::null(), |s| s.as_ptr())
     })
 }
 
@@ -487,8 +531,7 @@ pub extern "C" fn nanograph_db_init(
         let db = runtime
             .block_on(Database::init(db_path.as_ref(), &schema_source))
             .map_err(to_ffi_err)?;
-        drop(runtime);
-        let handle = NanoGraphHandle::new(db)?;
+        let handle = NanoGraphHandle::with_runtime(runtime, db);
         Ok(Box::into_raw(Box::new(handle)))
     })();
 
@@ -512,8 +555,7 @@ pub extern "C" fn nanograph_db_open(db_path: *const c_char) -> *mut NanoGraphHan
         let db = runtime
             .block_on(Database::open(db_path.as_ref()))
             .map_err(to_ffi_err)?;
-        drop(runtime);
-        let handle = NanoGraphHandle::new(db)?;
+        let handle = NanoGraphHandle::with_runtime(runtime, db);
         Ok(Box::into_raw(Box::new(handle)))
     })();
 
@@ -531,7 +573,7 @@ pub extern "C" fn nanograph_db_open(db_path: *const c_char) -> *mut NanoGraphHan
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nanograph_db_close(handle: *mut NanoGraphHandle) -> c_int {
-    to_status(with_handle_mut(handle, |handle| {
+    to_status(with_handle(handle, |handle| {
         let mut guard = handle
             .db
             .lock()
@@ -573,7 +615,7 @@ pub extern "C" fn nanograph_db_load(
         }
     };
 
-    to_status(with_handle_mut(handle, |handle| {
+    to_status(with_handle(handle, |handle| {
         let load_mode = parse_load_mode(&mode)?;
         let mut guard = handle
             .db
@@ -601,7 +643,7 @@ pub extern "C" fn nanograph_db_run(
         let query_source = parse_required_str("query_source", query_source)?;
         let query_name = parse_required_str("query_name", query_name)?;
         let params = parse_optional_json(params_json)?;
-        with_handle_mut(handle, |handle| {
+        with_handle(handle, |handle| {
             run_query_json(handle, &query_source, &query_name, params)
         })
     })();
@@ -615,7 +657,7 @@ pub extern "C" fn nanograph_db_check(
 ) -> *mut c_char {
     let result = (|| {
         let query_source = parse_required_str("query_source", query_source)?;
-        with_handle_mut(handle, |handle| {
+        with_handle(handle, |handle| {
             let queries = parse_query(&query_source).map_err(to_ffi_err)?;
             let catalog = {
                 let guard = handle
@@ -657,7 +699,7 @@ pub extern "C" fn nanograph_db_check(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nanograph_db_describe(handle: *mut NanoGraphHandle) -> *mut c_char {
-    let result = with_handle_mut(handle, |handle| {
+    let result = with_handle(handle, |handle| {
         let guard = handle
             .db
             .lock()
@@ -706,7 +748,7 @@ pub extern "C" fn nanograph_db_compact(
 ) -> *mut c_char {
     let result = (|| {
         let options = parse_optional_json(options_json)?;
-        with_handle_mut(handle, |handle| {
+        with_handle(handle, |handle| {
             let opts = parse_compact_options(options.as_ref())?;
             let mut guard = handle
                 .db
@@ -740,7 +782,7 @@ pub extern "C" fn nanograph_db_cleanup(
 ) -> *mut c_char {
     let result = (|| {
         let options = parse_optional_json(options_json)?;
-        with_handle_mut(handle, |handle| {
+        with_handle(handle, |handle| {
             let opts = parse_cleanup_options(options.as_ref())?;
             let mut guard = handle
                 .db
@@ -769,7 +811,7 @@ pub extern "C" fn nanograph_db_cleanup(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nanograph_db_doctor(handle: *mut NanoGraphHandle) -> *mut c_char {
-    let result = with_handle_mut(handle, |handle| {
+    let result = with_handle(handle, |handle| {
         let guard = handle
             .db
             .lock()
@@ -788,4 +830,39 @@ pub extern "C" fn nanograph_db_doctor(handle: *mut NanoGraphHandle) -> *mut c_ch
         }))
     });
     json_result_to_ptr(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::CStr;
+    use std::ptr;
+    use std::thread;
+
+    use super::{clear_last_error, nanograph_db_open, nanograph_last_error_message};
+
+    #[test]
+    fn last_error_is_visible_across_threads() {
+        clear_last_error();
+
+        thread::spawn(|| {
+            let _ = nanograph_db_open(ptr::null());
+        })
+        .join()
+        .expect("error producer thread panicked");
+
+        let msg = thread::spawn(|| {
+            let ptr = nanograph_last_error_message();
+            assert!(!ptr.is_null(), "expected error pointer");
+            // SAFETY: pointer originates from `nanograph_last_error_message`.
+            unsafe { CStr::from_ptr(ptr).to_string_lossy().into_owned() }
+        })
+        .join()
+        .expect("error reader thread panicked");
+
+        assert!(
+            msg.contains("db_path must not be null"),
+            "unexpected error message: {}",
+            msg
+        );
+    }
 }
