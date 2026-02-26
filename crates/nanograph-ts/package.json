@@ -15,11 +15,12 @@
     ]
   },
   "scripts": {
+    "install": "napi build --platform --js index.js --release",
     "build": "napi build --platform --js index.js --release",
     "build:debug": "napi build --platform --js index.js",
     "test": "node --test __test__/index.spec.mjs"
   },
-  "devDependencies": {
+  "dependencies": {
     "@napi-rs/cli": "^3.0.0"
   },
   "engines": {
@@ -33,6 +34,8 @@
   "files": [
     "index.js",
     "index.d.ts",
-    "*.node"
+    "src/",
+    "build.rs",
+    "Cargo.toml"
   ]
 }
