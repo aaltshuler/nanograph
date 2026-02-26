@@ -10,7 +10,7 @@ license = "MIT"
 crate-type = ["cdylib"]
 
 [dependencies]
-nanograph = { path = "../nanograph" }
+nanograph = { path = "../nanograph", version = "0.8.0" }
 napi = { workspace = true }
 napi-derive = { workspace = true }
 tokio = { workspace = true }

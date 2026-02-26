@@ -10,6 +10,6 @@ license = "MIT"
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
-nanograph = { path = "../nanograph" }
+nanograph = { path = "../nanograph", version = "0.8.0" }
 tokio = { workspace = true }
 serde_json = { workspace = true }

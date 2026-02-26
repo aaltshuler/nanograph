@@ -38,7 +38,7 @@
 
 ## SDK
 
-- [ ] Rust SDK — `nanograph-rs` crate, embed NanoGraph as a library in Rust applications
-- [ ] Python SDK — `nanograph-py` package, PyO3 bindings for Python applications
-- [ ] TypeScript SDK — `nanograph-ts` package, NAPI or WASM bindings for Node.js/browser
-- [ ] Go SDK — `nanograph-go` package, CGo bindings for Go applications
+- [x] TypeScript SDK — `nanograph-db` npm package, napi-rs bindings for Node.js
+- [x] Swift SDK — `nanograph-ffi` C ABI + Swift Package wrapper
+- [ ] Python SDK — PyO3 bindings for Python applications
+- [ ] Go SDK — CGo bindings for Go applications
