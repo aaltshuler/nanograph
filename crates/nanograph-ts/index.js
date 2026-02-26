@@ -34,7 +34,7 @@ switch (platform) {
           if (localFileExisted) {
             nativeBinding = require('./nanograph.darwin-x64.node')
           } else {
-            nativeBinding = require('@nanograph/sdk-darwin-x64')
+            nativeBinding = require('nanograph-db-darwin-x64')
           }
         } catch (e) {
           loadError = e
@@ -46,7 +46,7 @@ switch (platform) {
           if (localFileExisted) {
             nativeBinding = require('./nanograph.darwin-arm64.node')
           } else {
-            nativeBinding = require('@nanograph/sdk-darwin-arm64')
+            nativeBinding = require('nanograph-db-darwin-arm64')
           }
         } catch (e) {
           loadError = e
@@ -67,7 +67,7 @@ switch (platform) {
             if (localFileExisted) {
               nativeBinding = require('./nanograph.linux-x64-gnu.node')
             } else {
-              nativeBinding = require('@nanograph/sdk-linux-x64-gnu')
+              nativeBinding = require('nanograph-db-linux-x64-gnu')
             }
           } catch (e) {
             loadError = e
@@ -83,7 +83,7 @@ switch (platform) {
             if (localFileExisted) {
               nativeBinding = require('./nanograph.linux-arm64-gnu.node')
             } else {
-              nativeBinding = require('@nanograph/sdk-linux-arm64-gnu')
+              nativeBinding = require('nanograph-db-linux-arm64-gnu')
             }
           } catch (e) {
             loadError = e
@@ -102,7 +102,7 @@ switch (platform) {
           if (localFileExisted) {
             nativeBinding = require('./nanograph.win32-x64-msvc.node')
           } else {
-            nativeBinding = require('@nanograph/sdk-win32-x64-msvc')
+            nativeBinding = require('nanograph-db-win32-x64-msvc')
           }
         } catch (e) {
           loadError = e

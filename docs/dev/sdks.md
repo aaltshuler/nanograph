@@ -50,7 +50,7 @@ db.close(): void
 
 ### Packaging model
 
-- npm package: `@nanograph/sdk`
+- npm package: `nanograph-db`
 - prebuilt `.node` artifacts per target with `@napi-rs/cli`
 - typed surface is maintained in `index.d.ts` (not generated from Rust signatures)
 

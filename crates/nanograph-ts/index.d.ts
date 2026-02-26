@@ -1,4 +1,4 @@
-/* @nanograph/sdk — TypeScript type definitions (hand-written) */
+/* nanograph-db — TypeScript type definitions (hand-written) */
 
 export interface PropDef {
   name: string;

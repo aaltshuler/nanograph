@@ -21,7 +21,7 @@ Single `Database` class exposed to JS/TS via napi-rs v2. Interior mutability (`A
 crates/nanograph-ts/
 ├── Cargo.toml              # cdylib crate, depends on nanograph + napi
 ├── build.rs                # napi_build::setup()
-├── package.json            # @nanograph/sdk, @napi-rs/cli v3
+├── package.json            # nanograph-db, @napi-rs/cli v3
 ├── index.js                # Platform-aware native binding loader
 ├── index.d.ts              # TypeScript type definitions
 ├── src/

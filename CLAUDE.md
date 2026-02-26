@@ -35,7 +35,7 @@ Four crates:
 - `nanograph` — core library. All domain logic lives here.
 - `nanograph-cli` — binary named `nanograph`. Thin clap wrapper that calls library functions.
 - `nanograph-ffi` — C ABI (`cdylib`/`staticlib`) for Swift and native clients. Exports `nanograph_db_*` C functions; results are heap-allocated JSON strings freed with `nanograph_string_free`. Includes Swift Package wrapper in `swift/`.
-- `nanograph-ts` — TypeScript/Node.js SDK via napi-rs. npm package `@nanograph/sdk`. `JsDatabase` wraps core `Database` behind `Arc<tokio::sync::Mutex>`. Platform-aware `.node` loader for macOS/Linux/Windows.
+- `nanograph-ts` — TypeScript/Node.js SDK via napi-rs. npm package `nanograph-db`. `JsDatabase` wraps core `Database` behind `Arc<tokio::sync::Mutex>`. Platform-aware `.node` loader for macOS/Linux/Windows.
 
 All SDK crates call the same core pipeline (parse → typecheck → lower → execute → serialize via `json_output`). No logic duplication.
 
