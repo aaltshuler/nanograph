@@ -6,6 +6,10 @@ members = [
     "crates/nanograph-ts",
     "crates/nanograph-ffi",
 ]
+default-members = [
+    "crates/nanograph",
+    "crates/nanograph-cli",
+]
 
 [workspace.dependencies]
 # Arrow sub-crates (replaces monolithic `arrow`)
