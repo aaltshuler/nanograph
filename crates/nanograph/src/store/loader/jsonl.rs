@@ -870,7 +870,7 @@ edge Knows: Person -> Person
     #[test]
     fn json_values_to_array_builds_fixed_size_list_vectors() {
         let values = vec![json!([0.1, 0.2, 0.3]), json!(null), json!([1, 2, 3])];
-        let dt = DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 3);
+        let dt = DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 3);
         let arr = json_values_to_array(&values, &dt, true).unwrap();
         let vecs = arr
             .as_any()
@@ -885,7 +885,7 @@ edge Knows: Person -> Person
     #[test]
     fn json_values_to_array_rejects_fixed_size_list_length_mismatch() {
         let values = vec![json!([0.1, 0.2])];
-        let dt = DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 3);
+        let dt = DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 3);
         let err = json_values_to_array(&values, &dt, true).unwrap_err();
         assert!(err.to_string().contains("length mismatch"));
     }

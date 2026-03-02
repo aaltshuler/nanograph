@@ -2,134 +2,59 @@
 
 [![Crates.io](https://img.shields.io/crates/v/nanograph)](https://crates.io/crates/nanograph)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![MSRV](https://img.shields.io/badge/MSRV-1.85-blue)](https://www.rust-lang.org)
 
-On-device property graph database. No server, no cloud, no connection strings. Think DuckDB, but for graphs.
+On-device graph database for agents and humans. One CLI. One folder. Schema-as-code. No server.
 
-Schema-as-code, compile-time validated, Arrow-native.
+Built on Rust, Lance, Arrow, and DataFusion.
 
-## Use cases
+**[Website](https://nanograph.io)** | **[Docs](https://nanograph.io/docs)** | **[Examples](examples/starwars/)**
 
-- **Local first context graph**
-- **Memory layer for AI agents**
-- **Dependency & lineage graph**
-- **Personal knowledge graph (PKM)**
-- **Indexing & ontology layer for Obsidian**
-- **Analytics & domain exploration**
+## Why nanograph
 
-## Key benefits
-
-- **Schema-as-code** -- schema files live in your repo, version with git, review in PRs. No "property not found" at runtime. Ever.
-- **Local-first** -- no server. A library you link or a CLI you run. Works offline, works in CI, works on a plane.
-- **CLI workflow** -- `nanograph init` / `load` / `check` / `run`. DB as a build artifact, not a service.
-- **Graph-native operators** -- traversal, neighbor expansion, and path primitives are first-class, not bolted onto relational joins.
-- **Columnar execution** -- batch/vectorized through Arrow RecordBatches. Results integrate naturally with the Arrow ecosystem.
-- **Built-in CDC** -- every mutation is logged to a commit-gated journal. Replay decision traces, sync downstream, or audit changes from any version.
-- **Fast** -- Rust, Arrow columnar execution, Lance storage with scalar indexes. Sub-millisecond opens, vectorized scans, zero cold-start.
+- **On-device** -- no server, no cloud, no Docker. Everything stays on your machine.
+- **Schema-as-code** -- `.pg` files version-controlled in git, enforced at query time. No "property not found" at runtime.
+- **Built for agents** -- Claude reads, writes, and traverses the graph natively.
+- **Fast** -- Rust + Lance + Arrow columnar execution. Sub-millisecond opens, ACID, time-travel.
+- **Full search stack** -- full-text, semantic, fuzzy, BM25, hybrid, graph-constrained reranking.
+- **Built-in CDC** -- every mutation logged to a ledger. Replay, audit, sync from any version.
+- **Zero setup** -- create a graph and start querying. Delete and recreate in seconds.
 
 ## Install
 
-Requirements:
-- [Rust](https://www.rust-lang.org/tools/install) (1.85+)
-- `protoc` (`brew install protobuf`)
+```bash
+brew install nanograph/tap/nanograph
+```
+
+Or from source (requires [Rust](https://www.rust-lang.org/tools/install) 1.85+ and `protoc`):
 
 ```bash
 cargo install nanograph-cli
 ```
 
-Built on Arrow, Lance, and DataFusion — first build may take a few minutes.
+### SDKs
 
+- **TypeScript/Node.js** -- `npm install nanograph-db`
+- **Swift** -- Swift Package via the [nanograph-ffi](crates/nanograph-ffi/swift/) wrapper
 
 ## Quick start
 
 ```bash
-# Initialize a database from a schema
 nanograph init my.nano --schema schema.pg
-
-# Load data
 nanograph load my.nano --data data.jsonl --mode overwrite
-
-# Typecheck queries
 nanograph check --db my.nano --query queries.gq
-
-# Run a query
 nanograph run --db my.nano --query queries.gq --name my_query
 ```
 
-See `examples/starwars/` for a ready-to-run demo (66 nodes, 146 edges, 30 queries).
+See [`examples/starwars/`](examples/starwars/) for a ready-to-run demo with 66 nodes, 146 edges, and 30 queries.
 
-## Schema language
+## Use cases
 
-Schema files are source code — version them with git, review them in PRs, catch relationship bugs at compile time.
+- Context graphs and decision traces for AI agents
+- Agentic memory with typed, sub-100ms local queries
+- Personal knowledge graphs with schema enforcement
+- Dependency and lineage modeling
+- Feature generation for ML pipelines
 
-```
-node Character {
-    slug: String @key
-    name: String
-    alignment: enum(hero, villain, neutral)
-    era: enum(prequel, original, sequel)
-    tags: [String]?
-}
+## License
 
-node Film {
-    slug: String @key
-    name: String
-    release_date: Date
-}
-
-edge DebutsIn: Character -> Film
-```
-
-## Query language
-
-Typed Datalog with GraphQL-shaped syntax. Edge traversal as predicates, compile-time type checking.
-
-```
-query friends_of($name: String) {
-    match {
-        $p: Person { name: $name }
-        $p knows $f
-    }
-    return { $f.name, $f.age }
-}
-```
-
-Mutations are first-class:
-
-```
-query add_person($name: String, $age: I32) {
-    insert Person { name: $name, age: $age }
-}
-
-query update_age($name: String, $age: I32) {
-    update Person set { age: $age } where name = $name
-}
-
-query remove_person($name: String) {
-    delete Person where name = $name
-}
-```
-
-## Change tracking
-
-Every mutation is logged to a commit-gated CDC journal. Replay changes since any version:
-
-```bash
-nanograph changes my.nano --since 3 --format jsonl
-nanograph changes my.nano --from 1 --to 5 --format json
-```
-
-## Testing
-
-```bash
-# Engine + library tests
-cargo test -p nanograph
-cargo test -p nanograph-cli
-
-# CLI end-to-end scenarios
-bash tests/cli/run-cli-e2e.sh
-```
-
-## Origin
-
-Inspired by using DuckDB as a ledger for Claude Code projects -- the same instant-open, zero-infra experience, applied to property graphs and agentic memory.
+MIT

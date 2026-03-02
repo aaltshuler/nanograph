@@ -1,6 +1,6 @@
 {
   "name": "nanograph-db",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "NanoGraph — embedded typed property graph DB for TypeScript/Node.js",
   "main": "index.js",
   "types": "index.d.ts",

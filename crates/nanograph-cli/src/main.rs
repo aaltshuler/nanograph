@@ -1062,11 +1062,7 @@ fn init_tracing() {
 }
 
 fn default_log_filter() -> &'static str {
-    if cfg!(debug_assertions) {
-        "info"
-    } else {
-        "error"
-    }
+    "error"
 }
 
 fn normalize_span(span: Option<nanograph::error::SourceSpan>, source: &str) -> Range<usize> {
