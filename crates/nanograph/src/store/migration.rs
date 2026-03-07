@@ -13,7 +13,7 @@ use crate::catalog::schema_ir::{
     EdgeTypeDef, NodeTypeDef, PropDef, SchemaIR, TypeDef, build_catalog_from_ir,
 };
 use crate::error::{NanoError, Result};
-use crate::schema::ast::{Annotation, PropDecl, SchemaDecl, SchemaFile};
+use crate::schema::ast::{PropDecl, SchemaDecl, SchemaFile, annotation_value, has_annotation};
 use crate::schema::parser::parse_schema;
 use crate::store::database::Database;
 use crate::store::graph::GraphStorage;
@@ -97,6 +97,44 @@ pub enum MigrationStep {
         prop_id: u32,
         nullable: bool,
     },
+    AlterPropertyKey {
+        type_name: String,
+        type_id: u32,
+        prop_name: String,
+        prop_id: u32,
+        keyed: bool,
+    },
+    AlterPropertyUnique {
+        type_name: String,
+        type_id: u32,
+        prop_name: String,
+        prop_id: u32,
+        unique: bool,
+    },
+    AlterPropertyIndex {
+        type_name: String,
+        type_id: u32,
+        prop_name: String,
+        prop_id: u32,
+        indexed: bool,
+    },
+    AlterPropertyEnumValues {
+        type_name: String,
+        type_id: u32,
+        prop_name: String,
+        prop_id: u32,
+        old_values: Vec<String>,
+        new_values: Vec<String>,
+    },
+    AlterMetadata {
+        target_kind: String,
+        type_name: String,
+        type_id: u32,
+        prop_name: Option<String>,
+        annotation: String,
+        old_value: Option<String>,
+        new_value: Option<String>,
+    },
     RebindEdgeEndpoints {
         edge_name: String,
         edge_type_id: u32,
@@ -137,6 +175,35 @@ impl MigrationPlan {
             .iter()
             .any(|s| s.safety == MigrationSafety::Confirm)
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaCompatibility {
+    Additive,
+    CompatibleWithConfirmation,
+    Breaking,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemaDiffStep {
+    pub step: MigrationStep,
+    pub classification: SchemaCompatibility,
+    pub reason: String,
+    #[serde(default)]
+    pub remediation: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemaDiffReport {
+    pub old_schema_hash: String,
+    pub new_schema_hash: String,
+    pub compatibility: SchemaCompatibility,
+    pub has_breaking: bool,
+    pub steps: Vec<SchemaDiffStep>,
+    pub warnings: Vec<String>,
+    pub blocked: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -327,13 +394,6 @@ async fn plan_schema_migration(db_path: &Path) -> Result<PlannedMigration> {
     })
 }
 
-fn annotation_value<'a>(annotations: &'a [Annotation], key: &str) -> Option<&'a str> {
-    annotations
-        .iter()
-        .find(|a| a.name == key)
-        .and_then(|a| a.value.as_deref())
-}
-
 fn build_desired_schema_ir(
     old_ir: &SchemaIR,
     manifest: &GraphManifest,
@@ -341,9 +401,24 @@ fn build_desired_schema_ir(
     warnings: &mut Vec<String>,
     blocked: &mut Vec<String>,
 ) -> Result<(SchemaIR, u32, u32)> {
-    let mut next_type_id = manifest.next_type_id;
-    let mut next_prop_id = manifest.next_prop_id;
+    build_desired_schema_ir_with_ids(
+        old_ir,
+        manifest.next_type_id,
+        manifest.next_prop_id,
+        desired_schema,
+        warnings,
+        blocked,
+    )
+}
 
+fn build_desired_schema_ir_with_ids(
+    old_ir: &SchemaIR,
+    mut next_type_id: u32,
+    mut next_prop_id: u32,
+    desired_schema: &SchemaFile,
+    warnings: &mut Vec<String>,
+    blocked: &mut Vec<String>,
+) -> Result<(SchemaIR, u32, u32)> {
     let mut old_nodes_by_name = HashMap::new();
     let mut old_edges_by_name = HashMap::new();
     for ty in &old_ir.types {
@@ -429,15 +504,12 @@ fn build_desired_schema_ir(
                 list: prop.prop_type.list,
                 enum_values: prop.prop_type.enum_values.clone().unwrap_or_default(),
                 nullable: prop.prop_type.nullable,
-                key: prop.annotations.iter().any(|a| a.name == "key"),
-                unique: prop.annotations.iter().any(|a| a.name == "unique"),
-                index: prop.annotations.iter().any(|a| a.name == "key")
-                    || prop.annotations.iter().any(|a| a.name == "index"),
-                embed_source: prop
-                    .annotations
-                    .iter()
-                    .find(|a| a.name == "embed")
-                    .and_then(|a| a.value.clone()),
+                key: has_annotation(&prop.annotations, "key"),
+                unique: has_annotation(&prop.annotations, "unique"),
+                index: has_annotation(&prop.annotations, "key")
+                    || has_annotation(&prop.annotations, "index"),
+                embed_source: annotation_value(&prop.annotations, "embed").map(str::to_string),
+                description: annotation_value(&prop.annotations, "description").map(str::to_string),
             });
         }
 
@@ -453,6 +525,8 @@ fn build_desired_schema_ir(
         node_defs.push(NodeTypeDef {
             name: node.name.clone(),
             type_id,
+            description: annotation_value(&node.annotations, "description").map(str::to_string),
+            instruction: annotation_value(&node.annotations, "instruction").map(str::to_string),
             properties: props,
         });
     }
@@ -538,6 +612,7 @@ fn build_desired_schema_ir(
                 unique: false,
                 index: false,
                 embed_source: None,
+                description: annotation_value(&prop.annotations, "description").map(str::to_string),
             });
         }
 
@@ -557,6 +632,8 @@ fn build_desired_schema_ir(
             dst_type_id,
             src_type_name: edge.from_type.clone(),
             dst_type_name: edge.to_type.clone(),
+            description: annotation_value(&edge.annotations, "description").map(str::to_string),
+            instruction: annotation_value(&edge.annotations, "instruction").map(str::to_string),
             properties: props,
         });
     }
@@ -604,6 +681,898 @@ fn alloc_next_id(next: &mut u32) -> Result<u32> {
         .checked_add(1)
         .ok_or_else(|| NanoError::Manifest("identity counter overflow".to_string()))?;
     Ok(id)
+}
+
+pub fn analyze_schema_diff(
+    old_schema: &SchemaFile,
+    new_schema: &SchemaFile,
+) -> Result<SchemaDiffReport> {
+    let old_ir = crate::catalog::schema_ir::build_schema_ir(old_schema)?;
+    let (next_type_id, next_prop_id) = next_schema_identity_counters(&old_ir);
+    let mut warnings = Vec::new();
+    let mut blocked = Vec::new();
+    let (new_ir, _, _) = build_desired_schema_ir_with_ids(
+        &old_ir,
+        next_type_id,
+        next_prop_id,
+        new_schema,
+        &mut warnings,
+        &mut blocked,
+    )?;
+
+    let old_ir_json = serde_json::to_string_pretty(&old_ir)
+        .map_err(|e| NanoError::Manifest(format!("serialize IR error: {}", e)))?;
+    let new_ir_json = serde_json::to_string_pretty(&new_ir)
+        .map_err(|e| NanoError::Manifest(format!("serialize IR error: {}", e)))?;
+
+    let mut steps = Vec::new();
+    analyze_schema_changes(&old_ir, &new_ir, &mut steps, &mut blocked);
+
+    let compatibility = overall_schema_compatibility(&steps, &blocked);
+    Ok(SchemaDiffReport {
+        old_schema_hash: hash_string(&old_ir_json),
+        new_schema_hash: hash_string(&new_ir_json),
+        compatibility,
+        has_breaking: compatibility >= SchemaCompatibility::Breaking,
+        steps,
+        warnings,
+        blocked,
+    })
+}
+
+fn next_schema_identity_counters(ir: &SchemaIR) -> (u32, u32) {
+    let next_type_id = ir
+        .types
+        .iter()
+        .map(|typedef| match typedef {
+            TypeDef::Node(node) => node.type_id,
+            TypeDef::Edge(edge) => edge.type_id,
+        })
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1)
+        .max(1);
+    let next_prop_id = ir
+        .types
+        .iter()
+        .flat_map(|typedef| match typedef {
+            TypeDef::Node(node) => node.properties.iter(),
+            TypeDef::Edge(edge) => edge.properties.iter(),
+        })
+        .map(|prop| prop.prop_id)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1)
+        .max(1);
+    (next_type_id, next_prop_id)
+}
+
+fn analyze_schema_changes(
+    old_ir: &SchemaIR,
+    new_ir: &SchemaIR,
+    steps: &mut Vec<SchemaDiffStep>,
+    blocked: &mut Vec<String>,
+) {
+    let old_nodes = old_ir
+        .types
+        .iter()
+        .filter_map(|t| match t {
+            TypeDef::Node(node) => Some((node.type_id, node)),
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
+    let new_nodes = new_ir
+        .types
+        .iter()
+        .filter_map(|t| match t {
+            TypeDef::Node(node) => Some((node.type_id, node)),
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
+    let old_edges = old_ir
+        .types
+        .iter()
+        .filter_map(|t| match t {
+            TypeDef::Edge(edge) => Some((edge.type_id, edge)),
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
+    let new_edges = new_ir
+        .types
+        .iter()
+        .filter_map(|t| match t {
+            TypeDef::Edge(edge) => Some((edge.type_id, edge)),
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
+
+    let unmatched_old_nodes = old_nodes
+        .values()
+        .copied()
+        .filter(|node| !new_nodes.contains_key(&node.type_id))
+        .collect::<Vec<_>>();
+    let unmatched_new_nodes = new_nodes
+        .values()
+        .copied()
+        .filter(|node| !old_nodes.contains_key(&node.type_id))
+        .collect::<Vec<_>>();
+    let unmatched_old_edges = old_edges
+        .values()
+        .copied()
+        .filter(|edge| !new_edges.contains_key(&edge.type_id))
+        .collect::<Vec<_>>();
+    let unmatched_new_edges = new_edges
+        .values()
+        .copied()
+        .filter(|edge| !old_edges.contains_key(&edge.type_id))
+        .collect::<Vec<_>>();
+
+    for new_node in new_nodes.values() {
+        match old_nodes.get(&new_node.type_id) {
+            None => {
+                let remediation = possible_node_rename_source(new_node, &unmatched_old_nodes)
+                    .map(|old_name| format!("@rename_from(\"{}\")", old_name));
+                let classification = if remediation.is_some() {
+                    SchemaCompatibility::CompatibleWithConfirmation
+                } else {
+                    SchemaCompatibility::Additive
+                };
+                let reason = if let Some(old_name) = remediation
+                    .as_ref()
+                    .and_then(|value| value.strip_prefix("@rename_from(\""))
+                    .and_then(|value| value.strip_suffix("\")"))
+                {
+                    format!(
+                        "possible node rename from `{}` without @rename_from",
+                        old_name
+                    )
+                } else {
+                    "new node type".to_string()
+                };
+                steps.push(SchemaDiffStep {
+                    step: MigrationStep::AddNodeType {
+                        name: new_node.name.clone(),
+                        type_id: new_node.type_id,
+                    },
+                    classification,
+                    reason,
+                    remediation,
+                });
+            }
+            Some(old_node) => {
+                if old_node.name != new_node.name {
+                    steps.push(SchemaDiffStep {
+                        step: MigrationStep::RenameType {
+                            type_kind: "node".to_string(),
+                            type_id: new_node.type_id,
+                            old_name: old_node.name.clone(),
+                            new_name: new_node.name.clone(),
+                        },
+                        classification: SchemaCompatibility::Additive,
+                        reason: "node rename preserved with @rename_from".to_string(),
+                        remediation: None,
+                    });
+                }
+                analyze_metadata_change(
+                    "node",
+                    &new_node.name,
+                    new_node.type_id,
+                    None,
+                    "description",
+                    old_node.description.as_deref(),
+                    new_node.description.as_deref(),
+                    steps,
+                );
+                analyze_metadata_change(
+                    "node",
+                    &new_node.name,
+                    new_node.type_id,
+                    None,
+                    "instruction",
+                    old_node.instruction.as_deref(),
+                    new_node.instruction.as_deref(),
+                    steps,
+                );
+                analyze_property_changes(
+                    &old_node.name,
+                    &new_node.name,
+                    old_node.type_id,
+                    &old_node.properties,
+                    &new_node.properties,
+                    steps,
+                    blocked,
+                );
+            }
+        }
+    }
+
+    for old_node in old_nodes.values() {
+        if new_nodes.contains_key(&old_node.type_id) {
+            continue;
+        }
+        let remediation =
+            possible_node_rename_target(old_node, &unmatched_new_nodes).map(|new_name| {
+                format!(
+                    "consider @rename_from(\"{}\") on `{}`",
+                    old_node.name, new_name
+                )
+            });
+        let classification = if remediation.is_some() {
+            SchemaCompatibility::CompatibleWithConfirmation
+        } else {
+            SchemaCompatibility::CompatibleWithConfirmation
+        };
+        let reason = if remediation.is_some() {
+            format!(
+                "possible node rename from `{}` without @rename_from",
+                old_node.name
+            )
+        } else {
+            "node type removed from desired schema".to_string()
+        };
+        steps.push(SchemaDiffStep {
+            step: MigrationStep::DropNodeType {
+                name: old_node.name.clone(),
+                type_id: old_node.type_id,
+            },
+            classification,
+            reason,
+            remediation,
+        });
+    }
+
+    for new_edge in new_edges.values() {
+        match old_edges.get(&new_edge.type_id) {
+            None => {
+                let remediation = possible_edge_rename_source(new_edge, &unmatched_old_edges)
+                    .map(|old_name| format!("@rename_from(\"{}\")", old_name));
+                let classification = if remediation.is_some() {
+                    SchemaCompatibility::CompatibleWithConfirmation
+                } else {
+                    SchemaCompatibility::Additive
+                };
+                let reason = if let Some(old_name) = remediation
+                    .as_ref()
+                    .and_then(|value| value.strip_prefix("@rename_from(\""))
+                    .and_then(|value| value.strip_suffix("\")"))
+                {
+                    format!(
+                        "possible edge rename from `{}` without @rename_from",
+                        old_name
+                    )
+                } else {
+                    "new edge type".to_string()
+                };
+                steps.push(SchemaDiffStep {
+                    step: MigrationStep::AddEdgeType {
+                        name: new_edge.name.clone(),
+                        type_id: new_edge.type_id,
+                        src_type_id: new_edge.src_type_id,
+                        dst_type_id: new_edge.dst_type_id,
+                    },
+                    classification,
+                    reason,
+                    remediation,
+                });
+            }
+            Some(old_edge) => {
+                if old_edge.name != new_edge.name {
+                    steps.push(SchemaDiffStep {
+                        step: MigrationStep::RenameType {
+                            type_kind: "edge".to_string(),
+                            type_id: new_edge.type_id,
+                            old_name: old_edge.name.clone(),
+                            new_name: new_edge.name.clone(),
+                        },
+                        classification: SchemaCompatibility::Additive,
+                        reason: "edge rename preserved with @rename_from".to_string(),
+                        remediation: None,
+                    });
+                }
+                analyze_metadata_change(
+                    "edge",
+                    &new_edge.name,
+                    new_edge.type_id,
+                    None,
+                    "description",
+                    old_edge.description.as_deref(),
+                    new_edge.description.as_deref(),
+                    steps,
+                );
+                analyze_metadata_change(
+                    "edge",
+                    &new_edge.name,
+                    new_edge.type_id,
+                    None,
+                    "instruction",
+                    old_edge.instruction.as_deref(),
+                    new_edge.instruction.as_deref(),
+                    steps,
+                );
+                if old_edge.src_type_id != new_edge.src_type_id
+                    || old_edge.dst_type_id != new_edge.dst_type_id
+                {
+                    steps.push(SchemaDiffStep {
+                        step: MigrationStep::RebindEdgeEndpoints {
+                            edge_name: new_edge.name.clone(),
+                            edge_type_id: new_edge.type_id,
+                            old_src_type_id: old_edge.src_type_id,
+                            old_dst_type_id: old_edge.dst_type_id,
+                            new_src_type_id: new_edge.src_type_id,
+                            new_dst_type_id: new_edge.dst_type_id,
+                        },
+                        classification: SchemaCompatibility::Breaking,
+                        reason: "edge endpoints changed".to_string(),
+                        remediation: None,
+                    });
+                }
+                analyze_property_changes(
+                    &old_edge.name,
+                    &new_edge.name,
+                    old_edge.type_id,
+                    &old_edge.properties,
+                    &new_edge.properties,
+                    steps,
+                    blocked,
+                );
+            }
+        }
+    }
+
+    for old_edge in old_edges.values() {
+        if new_edges.contains_key(&old_edge.type_id) {
+            continue;
+        }
+        let remediation =
+            possible_edge_rename_target(old_edge, &unmatched_new_edges).map(|new_name| {
+                format!(
+                    "consider @rename_from(\"{}\") on `{}`",
+                    old_edge.name, new_name
+                )
+            });
+        let reason = if remediation.is_some() {
+            format!(
+                "possible edge rename from `{}` without @rename_from",
+                old_edge.name
+            )
+        } else {
+            "edge type removed from desired schema".to_string()
+        };
+        steps.push(SchemaDiffStep {
+            step: MigrationStep::DropEdgeType {
+                name: old_edge.name.clone(),
+                type_id: old_edge.type_id,
+            },
+            classification: SchemaCompatibility::CompatibleWithConfirmation,
+            reason,
+            remediation,
+        });
+    }
+}
+
+fn analyze_property_changes(
+    source_type_name: &str,
+    display_type_name: &str,
+    type_id: u32,
+    old_props: &[PropDef],
+    new_props: &[PropDef],
+    steps: &mut Vec<SchemaDiffStep>,
+    blocked: &mut Vec<String>,
+) {
+    let old_by_id = old_props
+        .iter()
+        .map(|prop| (prop.prop_id, prop))
+        .collect::<HashMap<_, _>>();
+    let new_by_id = new_props
+        .iter()
+        .map(|prop| (prop.prop_id, prop))
+        .collect::<HashMap<_, _>>();
+
+    let unmatched_old = old_props
+        .iter()
+        .filter(|prop| !new_by_id.contains_key(&prop.prop_id))
+        .collect::<Vec<_>>();
+    let unmatched_new = new_props
+        .iter()
+        .filter(|prop| !old_by_id.contains_key(&prop.prop_id))
+        .collect::<Vec<_>>();
+
+    for new_prop in new_props {
+        match old_by_id.get(&new_prop.prop_id) {
+            None => {
+                let remediation = possible_property_rename_source(new_prop, &unmatched_old)
+                    .map(|old_name| format!("@rename_from(\"{}\")", old_name));
+                let (classification, reason, remediation) = if let Some(remediation) = remediation {
+                    (
+                        SchemaCompatibility::CompatibleWithConfirmation,
+                        format!(
+                            "possible property rename without @rename_from on `{}`.`{}`",
+                            display_type_name, new_prop.name
+                        ),
+                        Some(remediation),
+                    )
+                } else if new_prop.nullable {
+                    (
+                        SchemaCompatibility::Additive,
+                        "new nullable property".to_string(),
+                        None,
+                    )
+                } else {
+                    let reason = format!(
+                        "type `{}` adds non-nullable property `{}` without a backfill",
+                        display_type_name, new_prop.name
+                    );
+                    blocked.push(reason.clone());
+                    (
+                        SchemaCompatibility::Blocked,
+                        reason,
+                        Some(
+                            "make the property nullable or backfill it during migration"
+                                .to_string(),
+                        ),
+                    )
+                };
+                steps.push(SchemaDiffStep {
+                    step: MigrationStep::AddProperty {
+                        type_name: display_type_name.to_string(),
+                        type_id,
+                        prop_name: new_prop.name.clone(),
+                        prop_id: new_prop.prop_id,
+                        data_type: prop_display_type(new_prop),
+                        nullable: new_prop.nullable,
+                    },
+                    classification,
+                    reason,
+                    remediation,
+                });
+            }
+            Some(old_prop) => {
+                if old_prop.name != new_prop.name {
+                    steps.push(SchemaDiffStep {
+                        step: MigrationStep::RenameProperty {
+                            type_name: display_type_name.to_string(),
+                            type_id,
+                            old_name: old_prop.name.clone(),
+                            new_name: new_prop.name.clone(),
+                            prop_id: new_prop.prop_id,
+                        },
+                        classification: SchemaCompatibility::Additive,
+                        reason: "property rename preserved with @rename_from".to_string(),
+                        remediation: None,
+                    });
+                }
+                analyze_metadata_change(
+                    "property",
+                    display_type_name,
+                    type_id,
+                    Some((&new_prop.name, new_prop.prop_id)),
+                    "description",
+                    old_prop.description.as_deref(),
+                    new_prop.description.as_deref(),
+                    steps,
+                );
+                if old_prop.enum_values != new_prop.enum_values {
+                    let (classification, reason, remediation) = classify_enum_value_change(
+                        display_type_name,
+                        &new_prop.name,
+                        old_prop,
+                        new_prop,
+                    );
+                    steps.push(SchemaDiffStep {
+                        step: MigrationStep::AlterPropertyEnumValues {
+                            type_name: display_type_name.to_string(),
+                            type_id,
+                            prop_name: new_prop.name.clone(),
+                            prop_id: new_prop.prop_id,
+                            old_values: old_prop.enum_values.clone(),
+                            new_values: new_prop.enum_values.clone(),
+                        },
+                        classification,
+                        reason,
+                        remediation,
+                    });
+                }
+                if old_prop.list != new_prop.list || old_prop.scalar_type != new_prop.scalar_type {
+                    let (classification, reason, remediation) = classify_schema_only_type_change(
+                        display_type_name,
+                        &new_prop.name,
+                        old_prop,
+                        new_prop,
+                    );
+                    steps.push(SchemaDiffStep {
+                        step: MigrationStep::AlterPropertyType {
+                            type_name: display_type_name.to_string(),
+                            type_id,
+                            prop_name: new_prop.name.clone(),
+                            prop_id: new_prop.prop_id,
+                            old_type: prop_display_type(old_prop),
+                            new_type: prop_display_type(new_prop),
+                        },
+                        classification,
+                        reason,
+                        remediation,
+                    });
+                }
+                if old_prop.nullable != new_prop.nullable {
+                    let (classification, reason) = classify_schema_only_nullability_change(
+                        display_type_name,
+                        &new_prop.name,
+                        old_prop,
+                        new_prop,
+                    );
+                    steps.push(SchemaDiffStep {
+                        step: MigrationStep::AlterPropertyNullability {
+                            type_name: display_type_name.to_string(),
+                            type_id,
+                            prop_name: new_prop.name.clone(),
+                            prop_id: new_prop.prop_id,
+                            nullable: new_prop.nullable,
+                        },
+                        classification,
+                        reason,
+                        remediation: None,
+                    });
+                }
+                if old_prop.key != new_prop.key {
+                    steps.push(SchemaDiffStep {
+                        step: MigrationStep::AlterPropertyKey {
+                            type_name: display_type_name.to_string(),
+                            type_id,
+                            prop_name: new_prop.name.clone(),
+                            prop_id: new_prop.prop_id,
+                            keyed: new_prop.key,
+                        },
+                        classification: SchemaCompatibility::Breaking,
+                        reason: format!(
+                            "changing @key on `{}`.`{}` changes identity semantics",
+                            display_type_name, new_prop.name
+                        ),
+                        remediation: None,
+                    });
+                }
+                if old_prop.unique != new_prop.unique {
+                    steps.push(SchemaDiffStep {
+                        step: MigrationStep::AlterPropertyUnique {
+                            type_name: display_type_name.to_string(),
+                            type_id,
+                            prop_name: new_prop.name.clone(),
+                            prop_id: new_prop.prop_id,
+                            unique: new_prop.unique,
+                        },
+                        classification: SchemaCompatibility::CompatibleWithConfirmation,
+                        reason: if new_prop.unique {
+                            "unique constraint added".to_string()
+                        } else {
+                            "unique constraint removed".to_string()
+                        },
+                        remediation: None,
+                    });
+                }
+                if old_prop.index != new_prop.index {
+                    steps.push(SchemaDiffStep {
+                        step: MigrationStep::AlterPropertyIndex {
+                            type_name: display_type_name.to_string(),
+                            type_id,
+                            prop_name: new_prop.name.clone(),
+                            prop_id: new_prop.prop_id,
+                            indexed: new_prop.index,
+                        },
+                        classification: if new_prop.index {
+                            SchemaCompatibility::Additive
+                        } else {
+                            SchemaCompatibility::CompatibleWithConfirmation
+                        },
+                        reason: if new_prop.index {
+                            "index added".to_string()
+                        } else {
+                            "index removed".to_string()
+                        },
+                        remediation: None,
+                    });
+                }
+            }
+        }
+    }
+
+    for old_prop in old_props {
+        if new_by_id.contains_key(&old_prop.prop_id) {
+            continue;
+        }
+        let remediation =
+            possible_property_rename_target(old_prop, &unmatched_new).map(|new_name| {
+                format!(
+                    "consider @rename_from(\"{}\") on `{}`.`{}`",
+                    old_prop.name, source_type_name, new_name
+                )
+            });
+        let reason = if remediation.is_some() {
+            format!(
+                "possible property rename without @rename_from on `{}`.`{}`",
+                display_type_name, old_prop.name
+            )
+        } else {
+            "property removed from desired schema".to_string()
+        };
+        steps.push(SchemaDiffStep {
+            step: MigrationStep::DropProperty {
+                type_name: display_type_name.to_string(),
+                type_id,
+                prop_name: old_prop.name.clone(),
+                prop_id: old_prop.prop_id,
+            },
+            classification: SchemaCompatibility::CompatibleWithConfirmation,
+            reason,
+            remediation,
+        });
+    }
+}
+
+fn analyze_metadata_change(
+    target_kind: &str,
+    type_name: &str,
+    type_id: u32,
+    prop: Option<(&str, u32)>,
+    annotation: &str,
+    old_value: Option<&str>,
+    new_value: Option<&str>,
+    steps: &mut Vec<SchemaDiffStep>,
+) {
+    if old_value == new_value {
+        return;
+    }
+    let (prop_name, _prop_id) = prop
+        .map(|(name, prop_id)| (Some(name.to_string()), Some(prop_id)))
+        .unwrap_or((None, None));
+    steps.push(SchemaDiffStep {
+        step: MigrationStep::AlterMetadata {
+            target_kind: target_kind.to_string(),
+            type_name: type_name.to_string(),
+            type_id,
+            prop_name,
+            annotation: annotation.to_string(),
+            old_value: old_value.map(str::to_string),
+            new_value: new_value.map(str::to_string),
+        },
+        classification: SchemaCompatibility::Additive,
+        reason: format!("{} metadata updated", annotation),
+        remediation: None,
+    });
+}
+
+fn classify_enum_value_change(
+    type_name: &str,
+    prop_name: &str,
+    old_prop: &PropDef,
+    new_prop: &PropDef,
+) -> (SchemaCompatibility, String, Option<String>) {
+    let old_values = old_prop.enum_values.iter().cloned().collect::<HashSet<_>>();
+    let new_values = new_prop.enum_values.iter().cloned().collect::<HashSet<_>>();
+
+    if old_values.is_subset(&new_values) && !new_values.is_subset(&old_values) {
+        return (
+            SchemaCompatibility::Additive,
+            format!("enum domain expanded for `{}`.`{}`", type_name, prop_name),
+            None,
+        );
+    }
+    if new_values.is_subset(&old_values) && !old_values.is_subset(&new_values) {
+        return (
+            SchemaCompatibility::Breaking,
+            format!("enum values removed from `{}`.`{}`", type_name, prop_name),
+            None,
+        );
+    }
+    (
+        SchemaCompatibility::Breaking,
+        format!(
+            "enum values changed incompatibly for `{}`.`{}`",
+            type_name, prop_name
+        ),
+        None,
+    )
+}
+
+fn classify_schema_only_type_change(
+    type_name: &str,
+    prop_name: &str,
+    old_prop: &PropDef,
+    new_prop: &PropDef,
+) -> (SchemaCompatibility, String, Option<String>) {
+    if old_prop.list != new_prop.list {
+        return (
+            SchemaCompatibility::Breaking,
+            format!(
+                "list/scalar shape changed for `{}`.`{}`",
+                type_name, prop_name
+            ),
+            None,
+        );
+    }
+
+    let old_scalar = ScalarType::from_str_name(&old_prop.scalar_type);
+    let new_scalar = ScalarType::from_str_name(&new_prop.scalar_type);
+    if let (Some(old_scalar), Some(new_scalar)) = (old_scalar, new_scalar) {
+        if is_lossless_scalar_change(old_scalar, new_scalar) {
+            return (
+                SchemaCompatibility::CompatibleWithConfirmation,
+                format!(
+                    "lossless scalar widening for `{}`.`{}` requires a rewrite",
+                    type_name, prop_name
+                ),
+                None,
+            );
+        }
+    }
+
+    (
+        SchemaCompatibility::Breaking,
+        format!(
+            "non-lossless type change for `{}`.`{}`",
+            type_name, prop_name
+        ),
+        None,
+    )
+}
+
+fn classify_schema_only_nullability_change(
+    type_name: &str,
+    prop_name: &str,
+    old_prop: &PropDef,
+    new_prop: &PropDef,
+) -> (SchemaCompatibility, String) {
+    if old_prop.nullable && !new_prop.nullable {
+        (
+            SchemaCompatibility::Breaking,
+            format!("nullability tightened for `{}`.`{}`", type_name, prop_name),
+        )
+    } else {
+        (
+            SchemaCompatibility::Additive,
+            format!("property `{}`.`{}` became nullable", type_name, prop_name),
+        )
+    }
+}
+
+fn overall_schema_compatibility(
+    steps: &[SchemaDiffStep],
+    blocked: &[String],
+) -> SchemaCompatibility {
+    let mut compatibility = if blocked.is_empty() {
+        SchemaCompatibility::Additive
+    } else {
+        SchemaCompatibility::Blocked
+    };
+    for step in steps {
+        compatibility = compatibility.max(step.classification);
+    }
+    compatibility
+}
+
+fn possible_node_rename_source<'a>(
+    new_node: &NodeTypeDef,
+    unmatched_old_nodes: &[&'a NodeTypeDef],
+) -> Option<&'a str> {
+    unmatched_old_nodes
+        .iter()
+        .copied()
+        .find(|old_node| same_node_signature(old_node, new_node))
+        .map(|node| node.name.as_str())
+}
+
+fn possible_node_rename_target<'a>(
+    old_node: &NodeTypeDef,
+    unmatched_new_nodes: &[&'a NodeTypeDef],
+) -> Option<&'a str> {
+    unmatched_new_nodes
+        .iter()
+        .copied()
+        .find(|new_node| same_node_signature(old_node, new_node))
+        .map(|node| node.name.as_str())
+}
+
+fn possible_edge_rename_source<'a>(
+    new_edge: &EdgeTypeDef,
+    unmatched_old_edges: &[&'a EdgeTypeDef],
+) -> Option<&'a str> {
+    unmatched_old_edges
+        .iter()
+        .copied()
+        .find(|old_edge| same_edge_signature(old_edge, new_edge))
+        .map(|edge| edge.name.as_str())
+}
+
+fn possible_edge_rename_target<'a>(
+    old_edge: &EdgeTypeDef,
+    unmatched_new_edges: &[&'a EdgeTypeDef],
+) -> Option<&'a str> {
+    unmatched_new_edges
+        .iter()
+        .copied()
+        .find(|new_edge| same_edge_signature(old_edge, new_edge))
+        .map(|edge| edge.name.as_str())
+}
+
+fn possible_property_rename_source<'a>(
+    new_prop: &PropDef,
+    unmatched_old_props: &[&'a PropDef],
+) -> Option<&'a str> {
+    unmatched_old_props
+        .iter()
+        .copied()
+        .find(|old_prop| same_property_signature(old_prop, new_prop))
+        .map(|prop| prop.name.as_str())
+}
+
+fn possible_property_rename_target<'a>(
+    old_prop: &PropDef,
+    unmatched_new_props: &[&'a PropDef],
+) -> Option<&'a str> {
+    unmatched_new_props
+        .iter()
+        .copied()
+        .find(|new_prop| same_property_signature(old_prop, new_prop))
+        .map(|prop| prop.name.as_str())
+}
+
+fn same_node_signature(old_node: &NodeTypeDef, new_node: &NodeTypeDef) -> bool {
+    same_property_collections(&old_node.properties, &new_node.properties)
+}
+
+fn same_edge_signature(old_edge: &EdgeTypeDef, new_edge: &EdgeTypeDef) -> bool {
+    old_edge.src_type_name == new_edge.src_type_name
+        && old_edge.dst_type_name == new_edge.dst_type_name
+        && same_property_collections(&old_edge.properties, &new_edge.properties)
+}
+
+fn same_property_collections(old_props: &[PropDef], new_props: &[PropDef]) -> bool {
+    if old_props.len() != new_props.len() {
+        return false;
+    }
+    old_props.iter().all(|old_prop| {
+        new_props
+            .iter()
+            .find(|new_prop| new_prop.name == old_prop.name)
+            .is_some_and(|new_prop| same_property_signature(old_prop, new_prop))
+    })
+}
+
+fn same_property_signature(old_prop: &PropDef, new_prop: &PropDef) -> bool {
+    old_prop.scalar_type == new_prop.scalar_type
+        && old_prop.list == new_prop.list
+        && old_prop.enum_values == new_prop.enum_values
+        && old_prop.nullable == new_prop.nullable
+        && old_prop.key == new_prop.key
+        && old_prop.unique == new_prop.unique
+        && old_prop.index == new_prop.index
+        && old_prop.embed_source == new_prop.embed_source
+}
+
+fn is_lossless_scalar_change(old_scalar: ScalarType, new_scalar: ScalarType) -> bool {
+    matches!(
+        (old_scalar, new_scalar),
+        (ScalarType::I32, ScalarType::I64)
+            | (ScalarType::U32, ScalarType::U64)
+            | (ScalarType::U32, ScalarType::I64)
+            | (ScalarType::F32, ScalarType::F64)
+    )
+}
+
+fn prop_display_type(prop: &PropDef) -> String {
+    let base = if prop.enum_values.is_empty() {
+        prop.scalar_type.clone()
+    } else {
+        format!("enum({})", prop.enum_values.join(", "))
+    };
+    let wrapped = if prop.list {
+        format!("[{}]", base)
+    } else {
+        base
+    };
+    if prop.nullable {
+        format!("{}?", wrapped)
+    } else {
+        wrapped
+    }
 }
 
 fn diff_schema(

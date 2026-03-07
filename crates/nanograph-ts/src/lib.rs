@@ -72,6 +72,9 @@ fn prop_def_to_json(prop: &nanograph::schema_ir::PropDef) -> serde_json::Value {
     if let Some(ref src) = prop.embed_source {
         obj["embedSource"] = serde_json::Value::String(src.clone());
     }
+    if let Some(ref description) = prop.description {
+        obj["description"] = serde_json::Value::String(description.clone());
+    }
     obj
 }
 
@@ -267,6 +270,12 @@ impl JsDatabase {
             node_types.push(serde_json::json!({
                 "name": nt.name,
                 "typeId": nt.type_id,
+                "description": nt.description,
+                "instruction": nt.instruction,
+                "keyProperty": nt.key_property_name(),
+                "uniqueProperties": nt.unique_properties().map(|prop| prop.name.clone()).collect::<Vec<_>>(),
+                "outgoingEdges": ir.edge_types().filter(|edge| edge.src_type_name == nt.name).map(|edge| serde_json::json!({"name": edge.name, "toType": edge.dst_type_name})).collect::<Vec<_>>(),
+                "incomingEdges": ir.edge_types().filter(|edge| edge.dst_type_name == nt.name).map(|edge| serde_json::json!({"name": edge.name, "fromType": edge.src_type_name})).collect::<Vec<_>>(),
                 "properties": props,
             }));
         }
@@ -280,6 +289,12 @@ impl JsDatabase {
                 "srcType": et.src_type_name,
                 "dstType": et.dst_type_name,
                 "typeId": et.type_id,
+                "description": et.description,
+                "instruction": et.instruction,
+                "endpointKeys": {
+                    "src": ir.node_key_property_name(&et.src_type_name),
+                    "dst": ir.node_key_property_name(&et.dst_type_name),
+                },
                 "properties": props,
             }));
         }

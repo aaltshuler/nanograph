@@ -14,6 +14,7 @@ nanograph <command> [options]
 | Option | Description |
 |--------|-------------|
 | `--json` | Emit machine-readable JSON output for supported commands |
+| `--config <nanograph.toml>` | Load CLI defaults from a project config file. If omitted, `./nanograph.toml` is used when present. Local secrets are loaded from `./.env.nano` and then `./.env` when present. |
 | `--help` | Show help |
 | `--version` | Show CLI version |
 
@@ -27,15 +28,29 @@ Show CLI version and optional database manifest/dataset version info.
 nanograph version [--db <db_path>]
 ```
 
-With `--db`, includes current manifest `db_version` and per-dataset Lance versions.
+With `--db` or `db.default_path`, includes current manifest `db_version` and per-dataset Lance versions.
 
 ### `describe`
 
 Describe schema + manifest summary for a database.
 
 ```bash
-nanograph describe --db <db_path> [--format table|json]
+nanograph describe --db <db_path> [--format table|json] [--type <TypeName>]
 ```
+
+If `db.default_path` is set in `nanograph.toml`, `--db` can be omitted.
+
+`--type` filters the output down to a single node or edge type. JSON output includes agent-facing schema metadata such as `description`, `instruction`, derived key properties, unique properties, relationship summaries, and edge endpoint keys.
+
+### `schema-diff`
+
+Compare two schema files without opening a database.
+
+```bash
+nanograph schema-diff --from <old_schema.pg> --to <new_schema.pg> [--format table|json]
+```
+
+This command classifies changes as `additive`, `compatible_with_confirmation`, `breaking`, or `blocked`, and emits remediation hints such as `@rename_from("...")` where applicable.
 
 ### `export`
 
@@ -45,15 +60,21 @@ Export the full graph (nodes first, then edges) to stdout.
 nanograph export --db <db_path> [--format jsonl|json]
 ```
 
+If `db.default_path` is set in `nanograph.toml`, `--db` can be omitted.
+
 ### `init`
 
 Create a new database from a schema file.
 
 ```bash
-nanograph init <db_path> --schema <schema.pg>
+nanograph init [db_path] --schema <schema.pg>
 ```
 
 Creates the `<db_path>/` directory with `schema.pg`, `schema.ir.json`, and an empty manifest.
+
+When missing, `init` also scaffolds `nanograph.toml` and `.env.nano` in the inferred project directory shared by the DB path and schema path. `nanograph.toml` is for shared defaults; `.env.nano` is for local secrets like `OPENAI_API_KEY`.
+
+If `db.default_path` and/or `schema.default_path` are set in `nanograph.toml`, `db_path` and/or `--schema` can be omitted.
 
 ### `load`
 
@@ -76,15 +97,18 @@ nanograph load <db_path> --data <data.jsonl> --mode <overwrite|append|merge>
 Parse and typecheck a query file without executing.
 
 ```bash
-nanograph check --db <db_path> --query <queries.gq>
+nanograph check [--db <db_path>] --query <queries.gq>
 ```
+
+If the provided query path is relative and not found directly, `nanograph` also searches the configured `query.roots` from `nanograph.toml`.
+If `db.default_path` is set in `nanograph.toml`, `--db` can be omitted.
 
 ### `run`
 
 Execute a named query.
 
 ```bash
-nanograph run --db <db_path> --query <queries.gq> --name <query_name> [options]
+nanograph run [alias] [--db <db_path>] [--query <queries.gq>] [--name <query_name>] [options]
 ```
 
 | Option | Description |
@@ -93,6 +117,53 @@ nanograph run --db <db_path> --query <queries.gq> --name <query_name> [options]
 | `--param key=value` | Query parameter (repeatable) |
 
 Supports both read queries and mutation queries (`insert`, `update`, `delete`) in DB mode.
+
+If the provided query path is relative and not found directly, `nanograph` also searches the configured `query.roots` from `nanograph.toml`.
+If `db.default_path` is set in `nanograph.toml`, `--db` can be omitted.
+
+When the selected query includes `@description("...")` and/or `@instruction("...")`, the default table output prints that context before the result rows. Machine-oriented formats like `json`, `jsonl`, and `csv` remain unchanged.
+
+### Query aliases
+
+`nanograph.toml` can define short aliases for `run`:
+
+```toml
+[db]
+default_path = "app.nano"
+
+[query_aliases.search]
+query = "queries/search.gq"
+name = "semantic_search"
+args = ["q"]
+format = "table"
+```
+
+Then you can run:
+
+```bash
+nanograph run search "vector databases"
+```
+
+Multi-parameter aliases work the same way:
+
+```toml
+[query_aliases.family]
+query = "queries/search.gq"
+name = "family_semantic"
+args = ["slug", "q"]
+format = "table"
+```
+
+```bash
+nanograph run family luke "chosen one prophecy"
+```
+
+Explicit `--param` values still work and override alias-derived positional params when both are provided.
+
+Precedence is:
+1. explicit CLI flags such as `--query`, `--name`, `--format`, `--db`
+2. `query_aliases.<alias>`
+3. shared defaults like `db.default_path` and `cli.output_format`
 
 ### `delete`
 

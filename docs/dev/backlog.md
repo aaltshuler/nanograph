@@ -20,7 +20,7 @@ See [docs/dev/embeddable-api.md](embeddable-api.md) for full design.
 - [ ] Structured JSON errors — when `--json` is set, emit `{"error": "...", "kind": "..."}` instead of stderr text. Critical for agent consumption.
 - [ ] `--dry-run` on `load` and mutation `run` — show type-checked plan, affected types, estimated row counts without writing. (`migrate --dry-run` already exists.)
 - [ ] Consistent `--json` vs `--format` — pick one mechanism. Currently `--json` is global and `--format` is per-command; some commands check both. Unify so `--json` globally switches all output (including errors) to structured JSON.
-- [ ] Schema introspection — `nanograph describe --type Person` to dump a single type's properties, annotations, and Arrow schema. Current `describe` shows manifest-level info only.
+- [x] Schema introspection — `nanograph describe --type Person` for single-type schema introspection with agent metadata and derived relationship hints.
 - [ ] Inline query — `--query-inline 'insert Person { name: $name }'` or `--query -` for stdin, so one-liners don't need a `.gq` file.
 - [ ] Stdin for load — `--data -` reads JSONL from stdin for pipeline composition (`cat data.jsonl | nanograph load my.nano --data - --mode append`).
 

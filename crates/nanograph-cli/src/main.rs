@@ -10,6 +10,9 @@ use color_eyre::eyre::{Result, WrapErr, eyre};
 use tracing::{debug, info, instrument, warn};
 use tracing_subscriber::EnvFilter;
 
+mod config;
+
+use config::LoadedConfig;
 use nanograph::ParamMap;
 use nanograph::error::{NanoError, ParseDiagnostic};
 use nanograph::query::ast::Literal;
@@ -22,7 +25,8 @@ use nanograph::store::database::{
 };
 use nanograph::store::manifest::GraphManifest;
 use nanograph::store::migration::{
-    MigrationExecution, MigrationPlan, MigrationStatus, MigrationStep, execute_schema_migration,
+    MigrationExecution, MigrationPlan, MigrationStatus, MigrationStep, SchemaCompatibility,
+    SchemaDiffReport, analyze_schema_diff, execute_schema_migration,
 };
 use nanograph::store::txlog::{CdcLogEntry, read_visible_cdc_entries};
 
@@ -36,6 +40,9 @@ struct Cli {
     /// Emit machine-readable JSON output.
     #[arg(long, global = true)]
     json: bool,
+    /// Load defaults from the given nanograph.toml file.
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -52,31 +59,46 @@ enum Commands {
     Describe {
         /// Database directory
         #[arg(long)]
-        db: PathBuf,
+        db: Option<PathBuf>,
         /// Output format: table or json
-        #[arg(long, default_value = "table")]
-        format: String,
+        #[arg(long)]
+        format: Option<String>,
+        /// Show a single node or edge type
+        #[arg(long = "type")]
+        type_name: Option<String>,
     },
     /// Export full graph as JSONL or JSON (nodes first, then edges)
     Export {
         /// Database directory
         #[arg(long)]
-        db: PathBuf,
+        db: Option<PathBuf>,
         /// Output format: jsonl or json
-        #[arg(long, default_value = "jsonl")]
-        format: String,
+        #[arg(long)]
+        format: Option<String>,
+    },
+    /// Compare two schema files without opening a database
+    SchemaDiff {
+        /// Existing schema file
+        #[arg(long = "from")]
+        from_schema: PathBuf,
+        /// Desired schema file
+        #[arg(long = "to")]
+        to_schema: PathBuf,
+        /// Output format: table or json
+        #[arg(long)]
+        format: Option<String>,
     },
     /// Initialize a new database
     Init {
         /// Path to the database directory
-        db_path: PathBuf,
+        db_path: Option<PathBuf>,
         #[arg(long)]
-        schema: PathBuf,
+        schema: Option<PathBuf>,
     },
     /// Load data into an existing database
     Load {
         /// Path to the database directory
-        db_path: PathBuf,
+        db_path: Option<PathBuf>,
         #[arg(long)]
         data: PathBuf,
         /// Load mode: overwrite, append, or merge
@@ -86,7 +108,7 @@ enum Commands {
     /// Delete nodes by predicate, cascading incident edges
     Delete {
         /// Path to the database directory
-        db_path: PathBuf,
+        db_path: Option<PathBuf>,
         /// Node type name
         #[arg(long = "type")]
         type_name: String,
@@ -97,7 +119,7 @@ enum Commands {
     /// Stream CDC events from committed transactions
     Changes {
         /// Path to the database directory
-        db_path: PathBuf,
+        db_path: Option<PathBuf>,
         /// Return changes with db_version strictly greater than this value
         #[arg(long, conflicts_with_all = ["from_version", "to_version"])]
         since: Option<u64>,
@@ -108,13 +130,13 @@ enum Commands {
         #[arg(long = "to", requires = "from_version", conflicts_with = "since")]
         to_version: Option<u64>,
         /// Output format: jsonl or json
-        #[arg(long, default_value = "jsonl")]
-        format: String,
+        #[arg(long)]
+        format: Option<String>,
     },
     /// Compact Lance datasets and commit updated pinned dataset versions
     Compact {
         /// Path to the database directory
-        db_path: PathBuf,
+        db_path: Option<PathBuf>,
         /// Target row count per compacted fragment
         #[arg(long, default_value_t = 1_048_576)]
         target_rows_per_fragment: usize,
@@ -128,7 +150,7 @@ enum Commands {
     /// Prune old tx/CDC history and old Lance versions while keeping replay window
     Cleanup {
         /// Path to the database directory
-        db_path: PathBuf,
+        db_path: Option<PathBuf>,
         /// Keep this many latest tx versions for CDC replay
         #[arg(long, default_value_t = 128)]
         retain_tx_versions: u64,
@@ -139,12 +161,12 @@ enum Commands {
     /// Run consistency checks on manifest, datasets, logs, and graph integrity
     Doctor {
         /// Path to the database directory
-        db_path: PathBuf,
+        db_path: Option<PathBuf>,
     },
     /// Materialize visible CDC into a derived Lance analytics dataset
     CdcMaterialize {
         /// Path to the database directory
-        db_path: PathBuf,
+        db_path: Option<PathBuf>,
         /// Minimum number of new visible CDC rows required to run materialization
         #[arg(long, default_value_t = 0)]
         min_new_rows: usize,
@@ -155,13 +177,13 @@ enum Commands {
     /// Diff and apply schema migration from <db>/schema.pg
     Migrate {
         /// Path to the database directory
-        db_path: PathBuf,
+        db_path: Option<PathBuf>,
         /// Show migration plan without applying writes
         #[arg(long)]
         dry_run: bool,
         /// Output format: table or json
-        #[arg(long, default_value = "table")]
-        format: String,
+        #[arg(long)]
+        format: Option<String>,
         /// Apply confirm-level steps without interactive prompts
         #[arg(long)]
         auto_approve: bool,
@@ -170,21 +192,25 @@ enum Commands {
     Check {
         /// Database directory
         #[arg(long)]
-        db: PathBuf,
+        db: Option<PathBuf>,
         #[arg(long)]
         query: PathBuf,
     },
     /// Run a named query against data
     Run {
+        /// Optional query alias defined under [query_aliases] in nanograph.toml
+        alias: Option<String>,
+        /// Positional values for alias-declared query params
+        args: Vec<String>,
         /// Database directory
         #[arg(long)]
-        db: PathBuf,
+        db: Option<PathBuf>,
         #[arg(long)]
-        query: PathBuf,
+        query: Option<PathBuf>,
         #[arg(long)]
-        name: String,
-        #[arg(long, default_value = "table")]
-        format: String,
+        name: Option<String>,
+        #[arg(long)]
+        format: Option<String>,
         /// Query parameters (repeatable), e.g. --param name="Alice"
         #[arg(long = "param", value_parser = parse_param)]
         params: Vec<(String, String)>,
@@ -212,44 +238,82 @@ impl From<LoadModeArg> for LoadMode {
 async fn main() -> Result<()> {
     color_eyre::install()?;
     init_tracing();
-    load_dotenv_for_process();
 
     let cli = Cli::parse();
+    let config = LoadedConfig::load(cli.config.as_deref())?;
+    load_dotenv_for_process(&config.base_dir);
+    config.apply_embedding_env_for_process()?;
+    let json = config.effective_json(cli.json);
 
     match cli.command {
-        Commands::Version { db } => cmd_version(db, cli.json).await,
-        Commands::Describe { db, format } => cmd_describe(db, &format, cli.json).await,
-        Commands::Export { db, format } => cmd_export(db, &format, cli.json).await,
-        Commands::Init { db_path, schema } => cmd_init(&db_path, &schema, cli.json).await,
+        Commands::Version { db } => cmd_version(config.resolve_optional_db_path(db), json).await,
+        Commands::Describe {
+            db,
+            format,
+            type_name,
+        } => {
+            let db = config.resolve_db_path(db)?;
+            let format = config.resolve_format(format.as_deref(), "table", &["table", "json"])?;
+            cmd_describe(db, &format, json, type_name.as_deref()).await
+        }
+        Commands::Export { db, format } => {
+            let db = config.resolve_db_path(db)?;
+            let format = config.resolve_format(format.as_deref(), "jsonl", &["jsonl", "json"])?;
+            cmd_export(db, &format, json).await
+        }
+        Commands::SchemaDiff {
+            from_schema,
+            to_schema,
+            format,
+        } => {
+            let format = config.resolve_format(format.as_deref(), "table", &["table", "json"])?;
+            cmd_schema_diff(&from_schema, &to_schema, &format, json).await
+        }
+        Commands::Init { db_path, schema } => {
+            let db_path = config.resolve_db_path(db_path)?;
+            let schema = config.resolve_schema_path(schema)?;
+            cmd_init(&db_path, &schema, json).await
+        }
         Commands::Load {
             db_path,
             data,
             mode,
-        } => cmd_load(&db_path, &data, mode, cli.json).await,
+        } => {
+            let db_path = config.resolve_db_path(db_path)?;
+            cmd_load(&db_path, &data, mode, json).await
+        }
         Commands::Delete {
             db_path,
             type_name,
             predicate,
-        } => cmd_delete(&db_path, &type_name, &predicate, cli.json).await,
+        } => {
+            let db_path = config.resolve_db_path(db_path)?;
+            cmd_delete(&db_path, &type_name, &predicate, json).await
+        }
         Commands::Changes {
             db_path,
             since,
             from_version,
             to_version,
             format,
-        } => cmd_changes(&db_path, since, from_version, to_version, &format, cli.json).await,
+        } => {
+            let db_path = config.resolve_db_path(db_path)?;
+            let format = config.resolve_format(format.as_deref(), "jsonl", &["jsonl", "json"])?;
+            cmd_changes(&db_path, since, from_version, to_version, &format, json).await
+        }
         Commands::Compact {
             db_path,
             target_rows_per_fragment,
             materialize_deletions,
             materialize_deletions_threshold,
         } => {
+            let db_path = config.resolve_db_path(db_path)?;
             cmd_compact(
                 &db_path,
                 target_rows_per_fragment,
                 materialize_deletions,
                 materialize_deletions_threshold,
-                cli.json,
+                json,
             )
             .await
         }
@@ -258,34 +322,64 @@ async fn main() -> Result<()> {
             retain_tx_versions,
             retain_dataset_versions,
         } => {
-            cmd_cleanup(
-                &db_path,
-                retain_tx_versions,
-                retain_dataset_versions,
-                cli.json,
-            )
-            .await
+            let db_path = config.resolve_db_path(db_path)?;
+            cmd_cleanup(&db_path, retain_tx_versions, retain_dataset_versions, json).await
         }
-        Commands::Doctor { db_path } => cmd_doctor(&db_path, cli.json).await,
+        Commands::Doctor { db_path } => {
+            let db_path = config.resolve_db_path(db_path)?;
+            cmd_doctor(&db_path, json).await
+        }
         Commands::CdcMaterialize {
             db_path,
             min_new_rows,
             force,
-        } => cmd_cdc_materialize(&db_path, min_new_rows, force, cli.json).await,
+        } => {
+            let db_path = config.resolve_db_path(db_path)?;
+            cmd_cdc_materialize(&db_path, min_new_rows, force, json).await
+        }
         Commands::Migrate {
             db_path,
             dry_run,
             format,
             auto_approve,
-        } => cmd_migrate(&db_path, dry_run, &format, auto_approve, cli.json).await,
-        Commands::Check { db, query } => cmd_check(db, &query, cli.json).await,
+        } => {
+            let db_path = config.resolve_db_path(db_path)?;
+            let format = config.resolve_format(format.as_deref(), "table", &["table", "json"])?;
+            cmd_migrate(&db_path, dry_run, &format, auto_approve, json).await
+        }
+        Commands::Check { db, query } => {
+            let db = config.resolve_db_path(db)?;
+            let query = config.resolve_query_path(&query)?;
+            cmd_check(db, &query, json).await
+        }
         Commands::Run {
+            alias,
+            args,
             db,
             query,
             name,
             format,
             params,
-        } => cmd_run(db, &query, &name, &format, params, cli.json).await,
+        } => {
+            let db = config.resolve_db_path(db)?;
+            let run = config.resolve_run_config(
+                alias.as_deref(),
+                query,
+                name.as_deref(),
+                format.as_deref(),
+            )?;
+            let params =
+                merge_run_params(alias.as_deref(), &run.positional_param_names, args, params)?;
+            cmd_run(
+                db,
+                &run.query_path,
+                &run.query_name,
+                &run.format,
+                params,
+                json,
+            )
+            .await
+        }
     }?;
 
     Ok(())
@@ -398,7 +492,94 @@ fn migration_step_kind(step: &MigrationStep) -> &'static str {
         MigrationStep::RenameProperty { .. } => "RenameProperty",
         MigrationStep::AlterPropertyType { .. } => "AlterPropertyType",
         MigrationStep::AlterPropertyNullability { .. } => "AlterPropertyNullability",
+        MigrationStep::AlterPropertyKey { .. } => "AlterPropertyKey",
+        MigrationStep::AlterPropertyUnique { .. } => "AlterPropertyUnique",
+        MigrationStep::AlterPropertyIndex { .. } => "AlterPropertyIndex",
+        MigrationStep::AlterPropertyEnumValues { .. } => "AlterPropertyEnumValues",
+        MigrationStep::AlterMetadata { .. } => "AlterMetadata",
         MigrationStep::RebindEdgeEndpoints { .. } => "RebindEdgeEndpoints",
+    }
+}
+
+#[instrument(skip(format), fields(from_schema = %from_schema.display(), to_schema = %to_schema.display(), format = format))]
+async fn cmd_schema_diff(
+    from_schema: &PathBuf,
+    to_schema: &PathBuf,
+    format: &str,
+    json: bool,
+) -> Result<()> {
+    let old_source = std::fs::read_to_string(from_schema)
+        .wrap_err_with(|| format!("failed to read schema: {}", from_schema.display()))?;
+    let new_source = std::fs::read_to_string(to_schema)
+        .wrap_err_with(|| format!("failed to read schema: {}", to_schema.display()))?;
+    let old_schema = parse_schema_or_report(from_schema, &old_source)?;
+    let new_schema = parse_schema_or_report(to_schema, &new_source)?;
+    let report = analyze_schema_diff(&old_schema, &new_schema)?;
+    let effective_format = if json { "json" } else { format };
+    render_schema_diff_report(&report, effective_format)
+}
+
+fn render_schema_diff_report(report: &SchemaDiffReport, format: &str) -> Result<()> {
+    match format {
+        "json" => {
+            let out = serde_json::to_string_pretty(report)
+                .wrap_err("failed to serialize schema diff JSON")?;
+            println!("{}", out);
+        }
+        "table" => {
+            println!("Schema Diff");
+            println!("  Old schema hash: {}", report.old_schema_hash);
+            println!("  New schema hash: {}", report.new_schema_hash);
+            println!(
+                "  Compatibility: {}",
+                schema_compatibility_label(report.compatibility)
+            );
+            println!("  Has breaking: {}", report.has_breaking);
+            println!();
+
+            if report.steps.is_empty() {
+                println!("No schema changes.");
+            } else {
+                println!("{:<28} {:<30} {}", "CLASSIFICATION", "STEP", "DETAIL");
+                for step in &report.steps {
+                    println!(
+                        "{:<28} {:<30} {}",
+                        schema_compatibility_label(step.classification),
+                        migration_step_kind(&step.step),
+                        step.reason
+                    );
+                    if let Some(remediation) = &step.remediation {
+                        println!("  remediation: {}", remediation);
+                    }
+                }
+            }
+
+            if !report.warnings.is_empty() {
+                println!();
+                println!("Warnings:");
+                for warning in &report.warnings {
+                    println!("- {}", warning);
+                }
+            }
+            if !report.blocked.is_empty() {
+                println!();
+                println!("Blocked:");
+                for item in &report.blocked {
+                    println!("- {}", item);
+                }
+            }
+        }
+        other => return Err(eyre!("unknown format: {} (supported: table, json)", other)),
+    }
+    Ok(())
+}
+
+fn schema_compatibility_label(value: SchemaCompatibility) -> &'static str {
+    match value {
+        SchemaCompatibility::Additive => "additive",
+        SchemaCompatibility::CompatibleWithConfirmation => "compatible_with_confirmation",
+        SchemaCompatibility::Breaking => "breaking",
+        SchemaCompatibility::Blocked => "blocked",
     }
 }
 
@@ -503,10 +684,15 @@ fn print_version_table(payload: &serde_json::Value) {
 }
 
 #[instrument(fields(db_path = %db_path.display(), format = format))]
-async fn cmd_describe(db_path: PathBuf, format: &str, json: bool) -> Result<()> {
+async fn cmd_describe(
+    db_path: PathBuf,
+    format: &str,
+    json: bool,
+    type_name: Option<&str>,
+) -> Result<()> {
     let db = Database::open(&db_path).await?;
     let manifest = GraphManifest::read(&db_path)?;
-    let payload = build_describe_payload(&db_path, &db, &manifest)?;
+    let payload = build_describe_payload(&db_path, &db, &manifest, type_name)?;
     let effective_format = if json { "json" } else { format };
 
     match effective_format {
@@ -526,6 +712,7 @@ fn build_describe_payload(
     db_path: &Path,
     db: &Database,
     manifest: &GraphManifest,
+    type_name: Option<&str>,
 ) -> Result<serde_json::Value> {
     let storage = db.snapshot();
     let dataset_map = manifest
@@ -536,6 +723,11 @@ fn build_describe_payload(
 
     let mut nodes = Vec::new();
     for node in db.schema_ir.node_types() {
+        if let Some(type_name) = type_name {
+            if node.name != type_name {
+                continue;
+            }
+        }
         let rows = storage
             .get_all_nodes(&node.name)?
             .map(|b| b.num_rows() as u64)
@@ -553,12 +745,41 @@ fn build_describe_payload(
                     "unique": prop.unique,
                     "index": prop.index,
                     "embed_source": prop.embed_source,
+                    "description": prop.description,
+                })
+            })
+            .collect::<Vec<_>>();
+        let outgoing_edges = db
+            .schema_ir
+            .edge_types()
+            .filter(|edge| edge.src_type_name == node.name)
+            .map(|edge| {
+                serde_json::json!({
+                    "name": edge.name,
+                    "to_type": edge.dst_type_name,
+                })
+            })
+            .collect::<Vec<_>>();
+        let incoming_edges = db
+            .schema_ir
+            .edge_types()
+            .filter(|edge| edge.dst_type_name == node.name)
+            .map(|edge| {
+                serde_json::json!({
+                    "name": edge.name,
+                    "from_type": edge.src_type_name,
                 })
             })
             .collect::<Vec<_>>();
         nodes.push(serde_json::json!({
             "name": node.name,
             "type_id": node.type_id,
+            "description": node.description,
+            "instruction": node.instruction,
+            "key_property": node.key_property_name(),
+            "unique_properties": node.unique_properties().map(|prop| prop.name.clone()).collect::<Vec<_>>(),
+            "outgoing_edges": outgoing_edges,
+            "incoming_edges": incoming_edges,
             "rows": rows,
             "dataset_path": dataset.map(|d| d.dataset_path.clone()),
             "dataset_version": dataset.map(|d| d.dataset_version),
@@ -568,6 +789,11 @@ fn build_describe_payload(
 
     let mut edges = Vec::new();
     for edge in db.schema_ir.edge_types() {
+        if let Some(type_name) = type_name {
+            if edge.name != type_name {
+                continue;
+            }
+        }
         let rows = storage
             .edge_batch_for_save(&edge.name)?
             .map(|b| b.num_rows() as u64)
@@ -581,6 +807,7 @@ fn build_describe_payload(
                     "name": prop.name,
                     "prop_id": prop.prop_id,
                     "type": prop_type_string(prop),
+                    "description": prop.description,
                 })
             })
             .collect::<Vec<_>>();
@@ -589,6 +816,12 @@ fn build_describe_payload(
             "type_id": edge.type_id,
             "src_type": edge.src_type_name,
             "dst_type": edge.dst_type_name,
+            "description": edge.description,
+            "instruction": edge.instruction,
+            "endpoint_keys": {
+                "src": db.schema_ir.node_key_property_name(&edge.src_type_name),
+                "dst": db.schema_ir.node_key_property_name(&edge.dst_type_name),
+            },
             "rows": rows,
             "dataset_path": dataset.map(|d| d.dataset_path.clone()),
             "dataset_version": dataset.map(|d| d.dataset_version),
@@ -596,9 +829,16 @@ fn build_describe_payload(
         }));
     }
 
+    if let Some(type_name) = type_name {
+        if nodes.is_empty() && edges.is_empty() {
+            return Err(eyre!("type `{}` not found in schema", type_name));
+        }
+    }
+
     Ok(serde_json::json!({
         "db_path": db_path.display().to_string(),
         "binary_version": env!("CARGO_PKG_VERSION"),
+        "type_filter": type_name,
         "manifest": {
             "format_version": manifest.format_version,
             "db_version": manifest.db_version,
@@ -656,6 +896,57 @@ fn print_describe_table(payload: &serde_json::Value) {
                 node["rows"].as_u64().unwrap_or(0),
                 version,
             );
+            if let Some(description) = node["description"].as_str() {
+                println!("  description: {}", description);
+            }
+            if let Some(instruction) = node["instruction"].as_str() {
+                println!("  instruction: {}", instruction);
+            }
+            if let Some(key_property) = node["key_property"].as_str() {
+                println!("  key: {}", key_property);
+            }
+            if let Some(unique_properties) = node["unique_properties"].as_array() {
+                if !unique_properties.is_empty() {
+                    let joined = unique_properties
+                        .iter()
+                        .filter_map(|value| value.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    println!("  unique: {}", joined);
+                }
+            }
+            if let Some(outgoing) = node["outgoing_edges"].as_array() {
+                if !outgoing.is_empty() {
+                    let joined = outgoing
+                        .iter()
+                        .map(|edge| {
+                            format!(
+                                "{} -> {}",
+                                edge["name"].as_str().unwrap_or_default(),
+                                edge["to_type"].as_str().unwrap_or_default()
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    println!("  outgoing: {}", joined);
+                }
+            }
+            if let Some(incoming) = node["incoming_edges"].as_array() {
+                if !incoming.is_empty() {
+                    let joined = incoming
+                        .iter()
+                        .map(|edge| {
+                            format!(
+                                "{} <- {}",
+                                edge["name"].as_str().unwrap_or_default(),
+                                edge["from_type"].as_str().unwrap_or_default()
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    println!("  incoming: {}", joined);
+                }
+            }
             if let Some(props) = node["properties"].as_array() {
                 for prop in props {
                     let mut anns: Vec<String> = Vec::new();
@@ -682,6 +973,9 @@ fn print_describe_table(payload: &serde_json::Value) {
                         prop["type"].as_str().unwrap_or_default(),
                         ann_suffix
                     );
+                    if let Some(description) = prop["description"].as_str() {
+                        println!("    description: {}", description);
+                    }
                 }
             }
         }
@@ -704,6 +998,25 @@ fn print_describe_table(payload: &serde_json::Value) {
                 edge["rows"].as_u64().unwrap_or(0),
                 version,
             );
+            if let Some(description) = edge["description"].as_str() {
+                println!("  description: {}", description);
+            }
+            if let Some(instruction) = edge["instruction"].as_str() {
+                println!("  instruction: {}", instruction);
+            }
+            if let Some(endpoint_keys) = edge["endpoint_keys"].as_object() {
+                println!(
+                    "  endpoint keys: {} -> {}",
+                    endpoint_keys
+                        .get("src")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("-"),
+                    endpoint_keys
+                        .get("dst")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("-")
+                );
+            }
             if let Some(props) = edge["properties"].as_array() {
                 for prop in props {
                     println!(
@@ -711,6 +1024,9 @@ fn print_describe_table(payload: &serde_json::Value) {
                         prop["name"].as_str().unwrap_or_default(),
                         prop["type"].as_str().unwrap_or_default()
                     );
+                    if let Some(description) = prop["description"].as_str() {
+                        println!("    description: {}", description);
+                    }
                 }
             }
         }
@@ -939,47 +1255,66 @@ struct DotenvLoadStats {
     skipped_existing: usize,
 }
 
-fn load_dotenv_for_process() {
-    let cwd = match std::env::current_dir() {
-        Ok(path) => path,
-        Err(err) => {
-            warn!(
-                "failed to resolve current directory for .env loading: {}",
-                err
-            );
-            return;
-        }
-    };
-
-    match load_dotenv_from_dir_with(
-        &cwd,
+fn load_dotenv_for_process(base_dir: &Path) {
+    let results = load_project_dotenv_from_dir_with(
+        base_dir,
         |key| std::env::var_os(key).is_some(),
         |key, value| {
             // SAFETY: this runs once during CLI process bootstrap before command execution.
             unsafe { std::env::set_var(key, value) };
         },
-    ) {
-        Ok(Some(stats)) => {
-            debug!(
-                loaded = stats.loaded,
-                skipped_existing = stats.skipped_existing,
-                dotenv_path = %cwd.join(".env").display(),
-                "loaded .env entries"
-            );
+    );
+    let mut loaded_any = false;
+    for (file_name, result) in results {
+        match result {
+            Ok(Some(stats)) => {
+                loaded_any = true;
+                debug!(
+                    loaded = stats.loaded,
+                    skipped_existing = stats.skipped_existing,
+                    dotenv_path = %base_dir.join(file_name).display(),
+                    "loaded env file entries"
+                );
+            }
+            Ok(None) => {}
+            Err(err) => {
+                warn!(
+                    dotenv_path = %base_dir.join(file_name).display(),
+                    "failed to load {}: {}",
+                    file_name,
+                    err
+                );
+            }
         }
-        Ok(None) => {
-            debug!(cwd = %cwd.display(), "no .env file found");
-        }
-        Err(err) => {
-            warn!(
-                dotenv_path = %cwd.join(".env").display(),
-                "failed to load .env: {}",
-                err
-            );
-        }
+    }
+    if !loaded_any {
+        debug!(cwd = %base_dir.display(), "no .env.nano or .env file found");
     }
 }
 
+fn load_project_dotenv_from_dir_with<FExists, FSet>(
+    dir: &Path,
+    mut exists: FExists,
+    mut set: FSet,
+) -> Vec<(
+    &'static str,
+    std::result::Result<Option<DotenvLoadStats>, String>,
+)>
+where
+    FExists: FnMut(&str) -> bool,
+    FSet: FnMut(&str, &str),
+{
+    let mut results = Vec::with_capacity(2);
+    for file_name in [".env.nano", ".env"] {
+        results.push((
+            file_name,
+            load_named_dotenv_from_dir_with(dir, file_name, &mut exists, &mut set),
+        ));
+    }
+    results
+}
+
+#[cfg(test)]
 fn load_dotenv_from_dir_with<FExists, FSet>(
     dir: &Path,
     exists: FExists,
@@ -989,7 +1324,20 @@ where
     FExists: FnMut(&str) -> bool,
     FSet: FnMut(&str, &str),
 {
-    let path = dir.join(".env");
+    load_named_dotenv_from_dir_with(dir, ".env", exists, set)
+}
+
+fn load_named_dotenv_from_dir_with<FExists, FSet>(
+    dir: &Path,
+    file_name: &str,
+    exists: FExists,
+    set: FSet,
+) -> std::result::Result<Option<DotenvLoadStats>, String>
+where
+    FExists: FnMut(&str) -> bool,
+    FSet: FnMut(&str, &str),
+{
+    let path = dir.join(file_name);
     if !path.exists() {
         return Ok(None);
     }
@@ -1179,6 +1527,9 @@ async fn cmd_init(db_path: &PathBuf, schema_path: &PathBuf, json: bool) -> Resul
     let _ = parse_schema_or_report(schema_path, &schema_src)?;
 
     Database::init(db_path, &schema_src).await?;
+    let current_dir = std::env::current_dir().wrap_err("failed to resolve current directory")?;
+    let project_dir = infer_init_project_dir(&current_dir, db_path, schema_path);
+    let generated_files = scaffold_project_files(&project_dir, db_path, schema_path)?;
 
     info!("database initialized");
     if json {
@@ -1188,13 +1539,128 @@ async fn cmd_init(db_path: &PathBuf, schema_path: &PathBuf, json: bool) -> Resul
                 "status": "ok",
                 "db_path": db_path.display().to_string(),
                 "schema_path": schema_path.display().to_string(),
+                "generated_files": generated_files
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>(),
             })
         );
     } else {
         println!("Initialized database at {}", db_path.display());
+        for path in &generated_files {
+            println!("Generated {}", path.display());
+        }
     }
     Ok(())
 }
+
+fn scaffold_project_files(
+    project_dir: &Path,
+    db_path: &Path,
+    schema_path: &Path,
+) -> Result<Vec<PathBuf>> {
+    let mut generated = Vec::new();
+    let config_path = project_dir.join("nanograph.toml");
+    if write_file_if_missing(
+        &config_path,
+        &default_nanograph_toml(project_dir, db_path, schema_path),
+    )? {
+        generated.push(config_path);
+    }
+
+    let dotenv_path = project_dir.join(".env.nano");
+    if write_file_if_missing(&dotenv_path, DEFAULT_DOTENV_NANO)? {
+        generated.push(dotenv_path);
+    }
+
+    Ok(generated)
+}
+
+fn infer_init_project_dir(current_dir: &Path, db_path: &Path, schema_path: &Path) -> PathBuf {
+    let resolved_db = resolve_against_dir(current_dir, db_path);
+    let resolved_schema = resolve_against_dir(current_dir, schema_path);
+    common_ancestor(&resolved_db, &resolved_schema)
+        .filter(|path| path.parent().is_some())
+        .unwrap_or_else(|| current_dir.to_path_buf())
+}
+
+fn resolve_against_dir(base_dir: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base_dir.join(path)
+    }
+}
+
+fn common_ancestor(left: &Path, right: &Path) -> Option<PathBuf> {
+    let left_components: Vec<_> = left.components().collect();
+    let right_components: Vec<_> = right.components().collect();
+    let mut shared = PathBuf::new();
+    let mut matched_any = false;
+
+    for (left_component, right_component) in left_components.iter().zip(right_components.iter()) {
+        if left_component != right_component {
+            break;
+        }
+        shared.push(left_component.as_os_str());
+        matched_any = true;
+    }
+
+    matched_any.then_some(shared)
+}
+
+fn write_file_if_missing(path: &Path, contents: &str) -> Result<bool> {
+    if path.exists() {
+        return Ok(false);
+    }
+    std::fs::write(path, contents)
+        .wrap_err_with(|| format!("failed to write {}", path.display()))?;
+    Ok(true)
+}
+
+fn default_nanograph_toml(project_dir: &Path, db_path: &Path, schema_path: &Path) -> String {
+    let schema_value = toml_basic_string(&render_project_relative_path(project_dir, schema_path));
+    let db_value = toml_basic_string(&render_project_relative_path(project_dir, db_path));
+    format!(
+        "# Shared nanograph project defaults.\n\
+         # Keep secrets in .env.nano, not in this file.\n\n\
+         [db]\n\
+         default_path = {db_value}\n\n\
+         [schema]\n\
+         default_path = {schema_value}\n\n\
+         [query]\n\
+         roots = [\"queries\"]\n\n\
+         [embedding]\n\
+         provider = \"openai\"\n\
+         model = \"text-embedding-3-small\"\n\
+         batch_size = 64\n\
+         chunk_size = 0\n\
+         chunk_overlap_chars = 128\n\n\
+         # Example:\n\
+         # [query_aliases.search]\n\
+         # query = \"queries/search.gq\"\n\
+         # name = \"semantic_search\"\n\
+         # args = [\"q\"]\n\
+         # format = \"table\"\n"
+    )
+}
+
+fn render_project_relative_path(project_dir: &Path, path: &Path) -> String {
+    path.strip_prefix(project_dir)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+fn toml_basic_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+const DEFAULT_DOTENV_NANO: &str = "\
+# Local-only nanograph secrets and overrides.\n\
+# Do not commit this file.\n\
+# OPENAI_API_KEY=sk-...\n\
+# NANOGRAPH_EMBEDDINGS_MOCK=1\n";
 
 #[instrument(skip(data_path), fields(db_path = %db_path.display(), mode = ?mode))]
 async fn cmd_load(
@@ -1701,10 +2167,36 @@ async fn cmd_run(
     let param_map = build_param_map(&query.params, &raw_params)?;
 
     let effective_format = if json { "json" } else { format };
+    if let Some(preamble) = query_execution_preamble(query, effective_format, json) {
+        print!("{}", preamble);
+    }
     let db = Database::open(&db_path).await?;
     let run_result = db.run_query(query, &param_map).await?;
     let results = run_result.into_record_batches()?;
     render_results(effective_format, &results)
+}
+
+fn query_execution_preamble(
+    query: &nanograph::query::ast::QueryDecl,
+    format: &str,
+    json: bool,
+) -> Option<String> {
+    if json || format != "table" {
+        return None;
+    }
+    let has_metadata = query.description.is_some() || query.instruction.is_some();
+    if !has_metadata {
+        return None;
+    }
+
+    let mut lines = vec![format!("Query: {}", query.name)];
+    if let Some(description) = &query.description {
+        lines.push(format!("Description: {}", description));
+    }
+    if let Some(instruction) = &query.instruction {
+        lines.push(format!("Instruction: {}", instruction));
+    }
+    Some(format!("{}\n\n", lines.join("\n")))
 }
 
 fn render_results(format: &str, results: &[RecordBatch]) -> Result<()> {
@@ -1956,6 +2448,45 @@ fn parse_vector_dim_type(type_name: &str) -> Option<usize> {
     if dim == 0 { None } else { Some(dim) }
 }
 
+fn merge_run_params(
+    alias: Option<&str>,
+    positional_param_names: &[String],
+    positional_args: Vec<String>,
+    explicit_params: Vec<(String, String)>,
+) -> Result<Vec<(String, String)>> {
+    if positional_args.is_empty() {
+        return Ok(explicit_params);
+    }
+
+    let alias_name = alias
+        .ok_or_else(|| eyre!("positional query arguments require a configured query alias"))?;
+    if positional_param_names.is_empty() {
+        return Err(eyre!(
+            "query alias `{}` does not declare args = [...] in nanograph.toml; use --param or add args",
+            alias_name
+        ));
+    }
+    if positional_args.len() > positional_param_names.len() {
+        return Err(eyre!(
+            "query alias `{}` accepts {} positional argument(s) ({}) but received {}",
+            alias_name,
+            positional_param_names.len(),
+            positional_param_names.join(", "),
+            positional_args.len()
+        ));
+    }
+
+    let mut merged = Vec::with_capacity(positional_args.len() + explicit_params.len());
+    for (name, value) in positional_param_names
+        .iter()
+        .zip(positional_args.into_iter())
+    {
+        merged.push((name.clone(), value));
+    }
+    merged.extend(explicit_params);
+    Ok(merged)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2023,6 +2554,112 @@ mod tests {
     }
 
     #[test]
+    fn project_dotenv_loader_prefers_env_nano_before_env() {
+        let dir = TempDir::new().unwrap();
+        write_file(&dir.path().join(".env.nano"), "OPENAI_API_KEY=from_nano\n");
+        write_file(&dir.path().join(".env"), "OPENAI_API_KEY=from_env\n");
+
+        let env = RefCell::new(HashMap::<String, String>::new());
+        let results = load_project_dotenv_from_dir_with(
+            dir.path(),
+            |key| env.borrow().contains_key(key),
+            |key, value| {
+                env.borrow_mut().insert(key.to_string(), value.to_string());
+            },
+        );
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            env.borrow().get("OPENAI_API_KEY").map(String::as_str),
+            Some("from_nano")
+        );
+    }
+
+    #[test]
+    fn scaffold_project_files_creates_shared_config_and_env_template() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("demo.nano");
+        let schema_path = dir.path().join("schema.pg");
+        write_file(
+            &schema_path,
+            r#"node Person {
+    name: String @key
+}"#,
+        );
+
+        let generated = scaffold_project_files(dir.path(), &db_path, &schema_path).unwrap();
+        assert_eq!(generated.len(), 2);
+
+        let config = std::fs::read_to_string(dir.path().join("nanograph.toml")).unwrap();
+        assert!(config.contains("[db]"));
+        assert!(config.contains("default_path = \"demo.nano\""));
+        assert!(config.contains("[schema]"));
+        assert!(config.contains("default_path = \"schema.pg\""));
+        assert!(config.contains("[embedding]"));
+        assert!(config.contains("provider = \"openai\""));
+
+        let dotenv = std::fs::read_to_string(dir.path().join(".env.nano")).unwrap();
+        assert!(dotenv.contains("OPENAI_API_KEY=sk-..."));
+        assert!(dotenv.contains("Do not commit this file."));
+
+        let generated_again = scaffold_project_files(dir.path(), &db_path, &schema_path).unwrap();
+        assert!(generated_again.is_empty());
+    }
+
+    #[test]
+    fn infer_init_project_dir_prefers_shared_parent_of_db_and_schema() {
+        let cwd = Path::new("/workspace");
+        let project_dir = infer_init_project_dir(
+            cwd,
+            Path::new("/tmp/demo/db"),
+            Path::new("/tmp/demo/schema.pg"),
+        );
+        assert_eq!(project_dir, PathBuf::from("/tmp/demo"));
+    }
+
+    #[test]
+    fn query_execution_preamble_renders_description_and_instruction() {
+        let query = nanograph::query::ast::QueryDecl {
+            name: "semantic_search".to_string(),
+            description: Some("Find semantically similar documents.".to_string()),
+            instruction: Some(
+                "Use for conceptual search. Prefer keyword_search for exact terms.".to_string(),
+            ),
+            params: Vec::new(),
+            match_clause: Vec::new(),
+            return_clause: Vec::new(),
+            order_clause: Vec::new(),
+            limit: None,
+            mutation: None,
+        };
+
+        assert_eq!(
+            query_execution_preamble(&query, "table", false).as_deref(),
+            Some(
+                "Query: semantic_search\nDescription: Find semantically similar documents.\nInstruction: Use for conceptual search. Prefer keyword_search for exact terms.\n\n"
+            )
+        );
+    }
+
+    #[test]
+    fn query_execution_preamble_skips_machine_formats() {
+        let query = nanograph::query::ast::QueryDecl {
+            name: "semantic_search".to_string(),
+            description: Some("Find semantically similar documents.".to_string()),
+            instruction: None,
+            params: Vec::new(),
+            match_clause: Vec::new(),
+            return_clause: Vec::new(),
+            order_clause: Vec::new(),
+            limit: None,
+            mutation: None,
+        };
+
+        assert!(query_execution_preamble(&query, "json", false).is_none());
+        assert!(query_execution_preamble(&query, "table", true).is_none());
+    }
+
+    #[test]
     fn default_log_filter_matches_build_mode() {
         assert_eq!(default_log_filter(), "error");
     }
@@ -2066,7 +2703,7 @@ mod tests {
             } => {
                 assert_eq!(from_version, Some(2));
                 assert_eq!(to_version, Some(4));
-                assert_eq!(format, "json");
+                assert_eq!(format.as_deref(), Some("json"));
             }
             _ => panic!("expected changes command"),
         }
@@ -2154,9 +2791,14 @@ mod tests {
             "json",
         ]);
         match describe.command {
-            Commands::Describe { db, format } => {
-                assert_eq!(db, PathBuf::from("/tmp/db"));
-                assert_eq!(format, "json");
+            Commands::Describe {
+                db,
+                format,
+                type_name,
+            } => {
+                assert_eq!(db, Some(PathBuf::from("/tmp/db")));
+                assert_eq!(format.as_deref(), Some("json"));
+                assert!(type_name.is_none());
             }
             _ => panic!("expected describe command"),
         }
@@ -2171,10 +2813,33 @@ mod tests {
         ]);
         match export.command {
             Commands::Export { db, format } => {
-                assert_eq!(db, PathBuf::from("/tmp/db"));
-                assert_eq!(format, "jsonl");
+                assert_eq!(db, Some(PathBuf::from("/tmp/db")));
+                assert_eq!(format.as_deref(), Some("jsonl"));
             }
             _ => panic!("expected export command"),
+        }
+
+        let schema_diff = Cli::parse_from([
+            "nanograph",
+            "schema-diff",
+            "--from",
+            "/tmp/old.pg",
+            "--to",
+            "/tmp/new.pg",
+            "--format",
+            "json",
+        ]);
+        match schema_diff.command {
+            Commands::SchemaDiff {
+                from_schema,
+                to_schema,
+                format,
+            } => {
+                assert_eq!(from_schema, PathBuf::from("/tmp/old.pg"));
+                assert_eq!(to_schema, PathBuf::from("/tmp/new.pg"));
+                assert_eq!(format.as_deref(), Some("json"));
+            }
+            _ => panic!("expected schema-diff command"),
         }
     }
 
@@ -2300,17 +2965,95 @@ mod tests {
     }
 
     #[test]
-    fn check_and_run_require_db_mode() {
-        let check_err = Cli::try_parse_from(["nanograph", "check", "--query", "/tmp/q.gq"])
-            .err()
-            .expect("check without --db should fail");
-        assert!(check_err.to_string().contains("--db"));
+    fn check_and_run_allow_db_to_be_resolved_later() {
+        let check = Cli::try_parse_from(["nanograph", "check", "--query", "/tmp/q.gq"]).unwrap();
+        match check.command {
+            Commands::Check { db, query } => {
+                assert!(db.is_none());
+                assert_eq!(query, PathBuf::from("/tmp/q.gq"));
+            }
+            _ => panic!("expected check command"),
+        }
 
-        let run_err =
-            Cli::try_parse_from(["nanograph", "run", "--query", "/tmp/q.gq", "--name", "q"])
-                .err()
-                .expect("run without --db should fail");
-        assert!(run_err.to_string().contains("--db"));
+        let run =
+            Cli::try_parse_from(["nanograph", "run", "search", "--param", "q=hello"]).unwrap();
+        match run.command {
+            Commands::Run {
+                alias,
+                args,
+                db,
+                query,
+                name,
+                ..
+            } => {
+                assert_eq!(alias.as_deref(), Some("search"));
+                assert!(args.is_empty());
+                assert!(db.is_none());
+                assert!(query.is_none());
+                assert!(name.is_none());
+            }
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn parse_run_alias_with_positional_args() {
+        let run = Cli::try_parse_from([
+            "nanograph",
+            "run",
+            "search",
+            "vector databases",
+            "--param",
+            "limit=5",
+        ])
+        .unwrap();
+        match run.command {
+            Commands::Run {
+                alias,
+                args,
+                params,
+                ..
+            } => {
+                assert_eq!(alias.as_deref(), Some("search"));
+                assert_eq!(args, vec!["vector databases".to_string()]);
+                assert_eq!(params, vec![("limit".to_string(), "5".to_string())]);
+            }
+            _ => panic!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn merge_run_params_maps_alias_positionals_and_preserves_explicit_overrides() {
+        let merged = merge_run_params(
+            Some("search"),
+            &[String::from("q"), String::from("limit")],
+            vec!["vector databases".to_string()],
+            vec![
+                ("q".to_string(), "override".to_string()),
+                ("format".to_string(), "json".to_string()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            merged,
+            vec![
+                ("q".to_string(), "vector databases".to_string()),
+                ("q".to_string(), "override".to_string()),
+                ("format".to_string(), "json".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_run_params_rejects_positional_args_without_alias_mapping() {
+        let err = merge_run_params(
+            Some("search"),
+            &[],
+            vec!["vector databases".to_string()],
+            Vec::new(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("does not declare args"));
     }
 
     #[test]
@@ -2571,11 +3314,16 @@ edge Knows: Person -> Person"#,
 
         let db = Database::open(&db_path).await.unwrap();
         let manifest = GraphManifest::read(&db_path).unwrap();
-        let describe = build_describe_payload(&db_path, &db, &manifest).unwrap();
+        let describe = build_describe_payload(&db_path, &db, &manifest, None).unwrap();
         assert_eq!(describe["nodes"].as_array().unwrap().len(), 1);
         assert_eq!(describe["edges"].as_array().unwrap().len(), 1);
         assert_eq!(describe["nodes"][0]["rows"].as_u64(), Some(2));
         assert_eq!(describe["edges"][0]["rows"].as_u64(), Some(1));
+        assert_eq!(describe["nodes"][0]["key_property"].as_str(), Some("name"));
+        assert_eq!(
+            describe["edges"][0]["endpoint_keys"]["src"].as_str(),
+            Some("name")
+        );
         let embedding_prop = describe["nodes"][0]["properties"]
             .as_array()
             .unwrap()
@@ -2593,6 +3341,55 @@ edge Knows: Person -> Person"#,
         assert!(
             rows.iter()
                 .any(|row| row["edge"] == "Knows" && row["from"] == "Alice" && row["to"] == "Bob")
+        );
+    }
+
+    #[tokio::test]
+    async fn describe_type_filter_and_metadata_fields_are_present() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("db");
+        let schema_path = dir.path().join("schema.pg");
+
+        write_file(
+            &schema_path,
+            r#"node Task @description("Tracked work item") @instruction("Query by slug") {
+    slug: String @key @description("Stable external identifier")
+    title: String
+}
+edge DependsOn: Task -> Task @description("Hard dependency") @instruction("Use only for blockers")
+"#,
+        );
+
+        cmd_init(&db_path, &schema_path, false).await.unwrap();
+
+        let db = Database::open(&db_path).await.unwrap();
+        let manifest = GraphManifest::read(&db_path).unwrap();
+        let task = build_describe_payload(&db_path, &db, &manifest, Some("Task")).unwrap();
+        assert_eq!(task["nodes"].as_array().unwrap().len(), 1);
+        assert!(task["edges"].as_array().unwrap().is_empty());
+        assert_eq!(
+            task["nodes"][0]["description"].as_str(),
+            Some("Tracked work item")
+        );
+        assert_eq!(
+            task["nodes"][0]["instruction"].as_str(),
+            Some("Query by slug")
+        );
+        assert_eq!(
+            task["nodes"][0]["properties"][0]["description"].as_str(),
+            Some("Stable external identifier")
+        );
+        assert_eq!(
+            task["nodes"][0]["outgoing_edges"][0]["name"].as_str(),
+            Some("DependsOn")
+        );
+
+        let edge = build_describe_payload(&db_path, &db, &manifest, Some("DependsOn")).unwrap();
+        assert!(edge["nodes"].as_array().unwrap().is_empty());
+        assert_eq!(edge["edges"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            edge["edges"][0]["endpoint_keys"]["src"].as_str(),
+            Some("slug")
         );
     }
 

@@ -7,10 +7,14 @@ use lance::Dataset;
 use lance_index::DatasetIndexExt;
 use tempfile::TempDir;
 
+use nanograph::schema::parser::parse_schema;
 use nanograph::schema_ir::SchemaIR;
 use nanograph::store::database::Database;
 use nanograph::store::manifest::GraphManifest;
-use nanograph::store::migration::{MigrationStatus, MigrationStep, execute_schema_migration};
+use nanograph::store::migration::{
+    MigrationStatus, MigrationStep, SchemaCompatibility, analyze_schema_diff,
+    execute_schema_migration,
+};
 use nanograph::store::scalar_index_name;
 use nanograph::store::txlog::read_tx_catalog_entries;
 
@@ -27,7 +31,7 @@ edge Knows: User -> User
 fn rename_schema() -> &'static str {
     r#"
 node Account @rename_from("User") {
-    full_name: String @rename_from("name")
+    full_name: String @key @rename_from("name")
     age: I32?
 }
 edge ConnectedTo: Account -> Account @rename_from("Knows")
@@ -104,6 +108,45 @@ fn rebind_data() -> &'static str {
 {"type":"User","data":{"name":"Bob"}}
 {"type":"Company","data":{"name":"Acme"}}
 {"edge":"rel","from":"Alice","to":"Bob"}
+"#
+}
+
+fn schema_with_agent_metadata() -> &'static str {
+    r#"
+node User @description("Tracked person") @instruction("Query by slug") {
+    name: String @key @description("Stable slug")
+    age: I32?
+}
+edge Knows: User -> User @description("Social tie")
+"#
+}
+
+fn schema_with_enum_addition() -> &'static str {
+    r#"
+node Ticket {
+    slug: String @key
+    status: enum(open, closed, blocked)
+}
+"#
+}
+
+fn schema_with_enum_removal() -> &'static str {
+    r#"
+node Ticket {
+    slug: String @key
+    status: enum(open, closed)
+}
+"#
+}
+
+fn schema_with_key_change() -> &'static str {
+    r#"
+node User {
+    name: String
+    email: String? @key
+    age: I32?
+}
+edge Knows: User -> User
 "#
 }
 
@@ -711,4 +754,93 @@ async fn migration_refuses_orphan_backup_sidecar() {
         "unexpected error: {}",
         err
     );
+}
+
+#[test]
+fn schema_diff_reports_additive_agent_metadata_and_enum_growth() {
+    let old_schema = parse_schema(base_schema()).unwrap();
+    let new_schema = parse_schema(schema_with_agent_metadata()).unwrap();
+    let report = analyze_schema_diff(&old_schema, &new_schema).unwrap();
+
+    assert_eq!(
+        report.compatibility,
+        SchemaCompatibility::Additive,
+        "unexpected report: {:?}",
+        report
+    );
+    assert!(report.steps.iter().any(|step| matches!(
+        step.step,
+        MigrationStep::AlterMetadata { ref annotation, .. } if annotation == "description"
+    )));
+
+    let enum_report = analyze_schema_diff(
+        &parse_schema(
+            r#"
+node Ticket {
+    slug: String @key
+    status: enum(open, closed)
+}
+"#,
+        )
+        .unwrap(),
+        &parse_schema(schema_with_enum_addition()).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        enum_report
+            .steps
+            .iter()
+            .any(|step| matches!(step.step, MigrationStep::AlterPropertyEnumValues { .. }))
+    );
+    assert_eq!(enum_report.compatibility, SchemaCompatibility::Additive);
+}
+
+#[test]
+fn schema_diff_flags_breaking_key_and_enum_removal_changes() {
+    let key_report = analyze_schema_diff(
+        &parse_schema(base_schema()).unwrap(),
+        &parse_schema(schema_with_key_change()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(key_report.compatibility, SchemaCompatibility::Breaking);
+    assert!(key_report.has_breaking);
+    assert!(
+        key_report
+            .steps
+            .iter()
+            .any(|step| matches!(step.step, MigrationStep::AlterPropertyKey { .. }))
+    );
+
+    let enum_report = analyze_schema_diff(
+        &parse_schema(schema_with_enum_addition()).unwrap(),
+        &parse_schema(schema_with_enum_removal()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(enum_report.compatibility, SchemaCompatibility::Breaking);
+    assert!(
+        enum_report
+            .steps
+            .iter()
+            .any(|step| matches!(step.step, MigrationStep::AlterPropertyEnumValues { .. }))
+    );
+}
+
+#[test]
+fn schema_diff_uses_rename_from_to_reduce_false_positive_renames() {
+    let report = analyze_schema_diff(
+        &parse_schema(base_schema()).unwrap(),
+        &parse_schema(rename_schema()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(report.compatibility, SchemaCompatibility::Additive);
+    assert!(report.steps.iter().any(|step| matches!(
+        step.step,
+        MigrationStep::RenameType { ref old_name, ref new_name, .. }
+            if old_name == "User" && new_name == "Account"
+    )));
+    assert!(report.steps.iter().any(|step| matches!(
+        step.step,
+        MigrationStep::RenameProperty { ref old_name, ref new_name, .. }
+            if old_name == "name" && new_name == "full_name"
+    )));
 }

@@ -371,6 +371,34 @@ Each chunk is embedded separately, then all chunk vectors are averaged and L2-no
 | `NANOGRAPH_EMBED_CACHE_MAX_ENTRIES` | `50000` | Max records retained in `_embedding_cache.jsonl` |
 | `NANOGRAPH_EMBED_CACHE_LOCK_STALE_SECS` | `60` | Stale-lock timeout for cache file lock recovery |
 
+### Config file support
+
+Shared embedding defaults can live in `nanograph.toml`:
+
+```toml
+[embedding]
+provider = "openai"
+model = "text-embedding-3-small"
+batch_size = 64
+chunk_size = 0
+chunk_overlap_chars = 128
+```
+
+Put local secrets in `.env.nano`:
+
+```bash
+# .env.nano
+OPENAI_API_KEY=sk-...
+```
+
+Precedence is:
+1. Existing process environment
+2. `.env.nano`
+3. `.env`
+4. `nanograph.toml`
+
+`nanograph init` scaffolds both `nanograph.toml` and `.env.nano` when they are missing, so new projects start with the shared/default split by default.
+
 ### Choosing dimensions
 
 Match the `Vector(dim)` to the model's output:

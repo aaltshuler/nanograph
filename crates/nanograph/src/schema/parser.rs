@@ -234,6 +234,39 @@ fn parse_annotation(pair: pest::iterators::Pair<Rule>) -> Result<Annotation> {
     Ok(Annotation { name, value })
 }
 
+fn validate_string_annotation(
+    annotations: &[Annotation],
+    annotation: &str,
+    target: &str,
+) -> Result<()> {
+    let mut seen = false;
+    for ann in annotations {
+        if ann.name != annotation {
+            continue;
+        }
+        if seen {
+            return Err(NanoError::Parse(format!(
+                "{} declares @{} multiple times",
+                target, annotation
+            )));
+        }
+        let value = ann.value.as_deref().ok_or_else(|| {
+            NanoError::Parse(format!(
+                "@{} on {} requires a non-empty value",
+                annotation, target
+            ))
+        })?;
+        if value.trim().is_empty() {
+            return Err(NanoError::Parse(format!(
+                "@{} on {} requires a non-empty value",
+                annotation, target
+            )));
+        }
+        seen = true;
+    }
+    Ok(())
+}
+
 fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
     for decl in &schema.declarations {
         match decl {
@@ -250,6 +283,16 @@ fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
                         )));
                     }
                 }
+                validate_string_annotation(
+                    &node.annotations,
+                    "description",
+                    &format!("node {}", node.name),
+                )?;
+                validate_string_annotation(
+                    &node.annotations,
+                    "instruction",
+                    &format!("node {}", node.name),
+                )?;
 
                 let mut key_count = 0usize;
                 for prop in &node.properties {
@@ -258,6 +301,11 @@ fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
                     let mut index_seen = false;
                     let mut embed_seen = false;
                     let is_vector = matches!(prop.prop_type.scalar, ScalarType::Vector(_));
+                    validate_string_annotation(
+                        &prop.annotations,
+                        "description",
+                        &format!("property {}.{}", node.name, prop.name),
+                    )?;
                     for ann in &prop.annotations {
                         if prop.prop_type.list
                             && (ann.name == "key"
@@ -274,6 +322,12 @@ fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
                             return Err(NanoError::Parse(format!(
                                 "@{} is not supported on vector property {}.{}",
                                 ann.name, node.name, prop.name
+                            )));
+                        }
+                        if ann.name == "instruction" {
+                            return Err(NanoError::Parse(format!(
+                                "@instruction is only supported on node and edge types (property {}.{})",
+                                node.name, prop.name
                             )));
                         }
                         if ann.name == "key" {
@@ -390,8 +444,23 @@ fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
                         )));
                     }
                 }
+                validate_string_annotation(
+                    &edge.annotations,
+                    "description",
+                    &format!("edge {}", edge.name),
+                )?;
+                validate_string_annotation(
+                    &edge.annotations,
+                    "instruction",
+                    &format!("edge {}", edge.name),
+                )?;
 
                 for prop in &edge.properties {
+                    validate_string_annotation(
+                        &prop.annotations,
+                        "description",
+                        &format!("property {}.{}", edge.name, prop.name),
+                    )?;
                     for ann in &prop.annotations {
                         if ann.name == "key"
                             || ann.name == "unique"
@@ -401,6 +470,12 @@ fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
                             return Err(NanoError::Parse(format!(
                                 "@{} is not supported on edge properties (edge {}.{})",
                                 ann.name, edge.name, prop.name
+                            )));
+                        }
+                        if ann.name == "instruction" {
+                            return Err(NanoError::Parse(format!(
+                                "@instruction is only supported on node and edge types (property {}.{})",
+                                edge.name, prop.name
                             )));
                         }
                     }
@@ -773,6 +848,91 @@ node Ticket {
 "#;
         let err = parse_schema(input).unwrap_err();
         assert!(err.to_string().contains("duplicate values"));
+    }
+
+    #[test]
+    fn test_parse_description_and_instruction_annotations() {
+        let input = r#"
+node Task @description("Tracked work item") @instruction("Prefer querying by slug") {
+    slug: String @key @description("Stable external identifier")
+}
+edge DependsOn: Task -> Task @description("Hard dependency") @instruction("Use only for blockers")
+"#;
+        let schema = parse_schema(input).unwrap();
+        match &schema.declarations[0] {
+            SchemaDecl::Node(node) => {
+                assert_eq!(
+                    node.annotations
+                        .iter()
+                        .find(|ann| ann.name == "description")
+                        .and_then(|ann| ann.value.as_deref()),
+                    Some("Tracked work item")
+                );
+                assert_eq!(
+                    node.annotations
+                        .iter()
+                        .find(|ann| ann.name == "instruction")
+                        .and_then(|ann| ann.value.as_deref()),
+                    Some("Prefer querying by slug")
+                );
+                assert_eq!(
+                    node.properties[0]
+                        .annotations
+                        .iter()
+                        .find(|ann| ann.name == "description")
+                        .and_then(|ann| ann.value.as_deref()),
+                    Some("Stable external identifier")
+                );
+            }
+            _ => panic!("expected node"),
+        }
+        match &schema.declarations[1] {
+            SchemaDecl::Edge(edge) => {
+                assert_eq!(
+                    edge.annotations
+                        .iter()
+                        .find(|ann| ann.name == "description")
+                        .and_then(|ann| ann.value.as_deref()),
+                    Some("Hard dependency")
+                );
+                assert_eq!(
+                    edge.annotations
+                        .iter()
+                        .find(|ann| ann.name == "instruction")
+                        .and_then(|ann| ann.value.as_deref()),
+                    Some("Use only for blockers")
+                );
+            }
+            _ => panic!("expected edge"),
+        }
+    }
+
+    #[test]
+    fn test_reject_duplicate_description_annotations() {
+        let input = r#"
+node Task @description("a") @description("b") {
+    slug: String @key
+}
+"#;
+        let err = parse_schema(input).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("declares @description multiple times")
+        );
+    }
+
+    #[test]
+    fn test_reject_instruction_on_property() {
+        let input = r#"
+node Task {
+    slug: String @instruction("bad")
+}
+"#;
+        let err = parse_schema(input).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("@instruction is only supported on node and edge types")
+        );
     }
 
     #[test]

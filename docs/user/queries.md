@@ -25,10 +25,31 @@ query friends_of($name: String) {
 Every query has:
 - **Name** — identifier for `--name` when running
 - **Parameters** — typed inputs passed via `--param key=value`
+- **Metadata** — optional `@description("...")` and `@instruction("...")` annotations for human/agent context
 - **match** — conjunctive clauses that define what to find (required)
 - **return** — projections and aggregations (required for read queries)
 - **order** — sort order (optional)
 - **limit** — max rows (optional, required with `nearest()` or `rrf()` ordering)
+
+### Query metadata
+
+Queries can carry optional human/agent-facing metadata:
+
+```graphql
+query semantic_search($q: String)
+    @description("Find the closest matching documents by semantic similarity.")
+    @instruction("Use for conceptual search. Prefer keyword_search for exact terms.")
+{
+    match {
+        $d: Doc
+    }
+    return { $d.slug, $d.title, nearest($d.embedding, $q) as score }
+    order { nearest($d.embedding, $q) }
+    limit 5
+}
+```
+
+`nanograph run` prints this metadata before results in the default table output. It is advisory only and does not change planning or execution semantics.
 
 ## Parameters
 

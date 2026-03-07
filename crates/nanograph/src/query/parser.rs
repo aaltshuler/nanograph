@@ -46,6 +46,8 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
     let mut inner = pair.into_inner();
     let name = inner.next().unwrap().as_str().to_string();
 
+    let mut description = None;
+    let mut instruction = None;
     let mut params = Vec::new();
     let mut match_clause = Vec::new();
     let mut return_clause = Vec::new();
@@ -59,6 +61,33 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
                 for p in item.into_inner() {
                     if let Rule::param = p.as_rule() {
                         params.push(parse_param(p)?);
+                    }
+                }
+            }
+            Rule::query_annotation => {
+                let (annotation_name, value) = parse_query_annotation(item)?;
+                match annotation_name {
+                    "description" => {
+                        if description.replace(value).is_some() {
+                            return Err(NanoError::Parse(format!(
+                                "query `{}` cannot include duplicate @description annotations",
+                                name
+                            )));
+                        }
+                    }
+                    "instruction" => {
+                        if instruction.replace(value).is_some() {
+                            return Err(NanoError::Parse(format!(
+                                "query `{}` cannot include duplicate @instruction annotations",
+                                name
+                            )));
+                        }
+                    }
+                    other => {
+                        return Err(NanoError::Parse(format!(
+                            "unsupported query annotation: @{}",
+                            other
+                        )));
                     }
                 }
             }
@@ -118,6 +147,8 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
 
     Ok(QueryDecl {
         name,
+        description,
+        instruction,
         params,
         match_clause,
         return_clause,
@@ -125,6 +156,39 @@ fn parse_query_decl(pair: pest::iterators::Pair<Rule>) -> Result<QueryDecl> {
         limit,
         mutation,
     })
+}
+
+fn parse_query_annotation(pair: pest::iterators::Pair<Rule>) -> Result<(&'static str, String)> {
+    let inner = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| NanoError::Parse("query annotation cannot be empty".to_string()))?;
+    match inner.as_rule() {
+        Rule::description_annotation => {
+            let value = inner
+                .into_inner()
+                .next()
+                .ok_or_else(|| {
+                    NanoError::Parse("@description requires a string literal".to_string())
+                })
+                .map(|value| parse_string_lit(value.as_str()))?;
+            Ok(("description", value))
+        }
+        Rule::instruction_annotation => {
+            let value = inner
+                .into_inner()
+                .next()
+                .ok_or_else(|| {
+                    NanoError::Parse("@instruction requires a string literal".to_string())
+                })
+                .map(|value| parse_string_lit(value.as_str()))?;
+            Ok(("instruction", value))
+        }
+        other => Err(NanoError::Parse(format!(
+            "unexpected query annotation rule: {:?}",
+            other
+        ))),
+    }
 }
 
 fn parse_param(pair: pest::iterators::Pair<Rule>) -> Result<Param> {
@@ -726,6 +790,48 @@ query get_person($name: String) {
         assert_eq!(q.params[0].name, "name");
         assert_eq!(q.match_clause.len(), 1);
         assert_eq!(q.return_clause.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_query_metadata_annotations() {
+        let input = r#"
+query semantic_search($q: String)
+    @description("Find semantically similar documents.")
+    @instruction("Use for conceptual search; prefer keyword_search for exact terms.")
+{
+    match {
+        $d: Doc
+    }
+    return { $d.slug }
+}
+"#;
+        let qf = parse_query(input).unwrap();
+        let q = &qf.queries[0];
+        assert_eq!(
+            q.description.as_deref(),
+            Some("Find semantically similar documents.")
+        );
+        assert_eq!(
+            q.instruction.as_deref(),
+            Some("Use for conceptual search; prefer keyword_search for exact terms.")
+        );
+    }
+
+    #[test]
+    fn test_duplicate_query_description_is_rejected() {
+        let input = r#"
+query q()
+    @description("one")
+    @description("two")
+{
+    match {
+        $p: Person
+    }
+    return { $p.name }
+}
+"#;
+        let err = parse_query(input).unwrap_err();
+        assert!(err.to_string().contains("duplicate @description"));
     }
 
     #[test]

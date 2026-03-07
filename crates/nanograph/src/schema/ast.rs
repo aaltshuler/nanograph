@@ -40,3 +40,14 @@ pub struct Annotation {
     pub name: String,
     pub value: Option<String>,
 }
+
+pub fn has_annotation(annotations: &[Annotation], name: &str) -> bool {
+    annotations.iter().any(|ann| ann.name == name)
+}
+
+pub fn annotation_value<'a>(annotations: &'a [Annotation], name: &str) -> Option<&'a str> {
+    annotations
+        .iter()
+        .find(|ann| ann.name == name)
+        .and_then(|ann| ann.value.as_deref())
+}

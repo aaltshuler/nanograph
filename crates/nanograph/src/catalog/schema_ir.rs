@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::catalog::{Catalog, EdgeType, NodeType};
 use crate::error::{NanoError, Result};
-use crate::schema::ast::SchemaFile;
+use crate::schema::ast::{SchemaFile, annotation_value, has_annotation};
 use crate::types::{PropType, ScalarType};
 
 // ── IR types ────────────────────────────────────────────────────────────────
@@ -30,6 +30,10 @@ pub enum TypeDef {
 pub struct NodeTypeDef {
     pub name: String,
     pub type_id: u32,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub instruction: Option<String>,
     pub properties: Vec<PropDef>,
 }
 
@@ -41,6 +45,10 @@ pub struct EdgeTypeDef {
     pub dst_type_id: u32,
     pub src_type_name: String,
     pub dst_type_name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub instruction: Option<String>,
     pub properties: Vec<PropDef>,
 }
 
@@ -63,6 +71,8 @@ pub struct PropDef {
     pub index: bool,
     #[serde(default)]
     pub embed_source: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 // ── FNV-1a hashing ──────────────────────────────────────────────────────────
@@ -134,15 +144,14 @@ pub fn build_schema_ir(schema: &SchemaFile) -> Result<SchemaIR> {
                             list: p.prop_type.list,
                             enum_values: p.prop_type.enum_values.clone().unwrap_or_default(),
                             nullable: p.prop_type.nullable,
-                            key: p.annotations.iter().any(|a| a.name == "key"),
-                            unique: p.annotations.iter().any(|a| a.name == "unique"),
-                            index: p.annotations.iter().any(|a| a.name == "key")
-                                || p.annotations.iter().any(|a| a.name == "index"),
-                            embed_source: p
-                                .annotations
-                                .iter()
-                                .find(|a| a.name == "embed")
-                                .and_then(|a| a.value.clone()),
+                            key: has_annotation(&p.annotations, "key"),
+                            unique: has_annotation(&p.annotations, "unique"),
+                            index: has_annotation(&p.annotations, "key")
+                                || has_annotation(&p.annotations, "index"),
+                            embed_source: annotation_value(&p.annotations, "embed")
+                                .map(str::to_string),
+                            description: annotation_value(&p.annotations, "description")
+                                .map(str::to_string),
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -150,6 +159,10 @@ pub fn build_schema_ir(schema: &SchemaFile) -> Result<SchemaIR> {
                 types.push(TypeDef::Node(NodeTypeDef {
                     name: node.name.clone(),
                     type_id,
+                    description: annotation_value(&node.annotations, "description")
+                        .map(str::to_string),
+                    instruction: annotation_value(&node.annotations, "instruction")
+                        .map(str::to_string),
                     properties,
                 }));
             }
@@ -199,6 +212,8 @@ pub fn build_schema_ir(schema: &SchemaFile) -> Result<SchemaIR> {
                             unique: false,
                             index: false,
                             embed_source: None,
+                            description: annotation_value(&p.annotations, "description")
+                                .map(str::to_string),
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -210,6 +225,10 @@ pub fn build_schema_ir(schema: &SchemaFile) -> Result<SchemaIR> {
                     dst_type_id,
                     src_type_name: edge.from_type.clone(),
                     dst_type_name: edge.to_type.clone(),
+                    description: annotation_value(&edge.annotations, "description")
+                        .map(str::to_string),
+                    instruction: annotation_value(&edge.annotations, "instruction")
+                        .map(str::to_string),
                     properties,
                 }));
             }
@@ -343,6 +362,20 @@ pub fn validate_schema_match(ir: &SchemaIR, schema: &SchemaFile) -> Result<()> {
 // ── Lookup helpers ──────────────────────────────────────────────────────────
 
 impl SchemaIR {
+    pub fn node_type(&self, name: &str) -> Option<&NodeTypeDef> {
+        self.types.iter().find_map(|t| match t {
+            TypeDef::Node(n) if n.name == name => Some(n),
+            _ => None,
+        })
+    }
+
+    pub fn edge_type(&self, name: &str) -> Option<&EdgeTypeDef> {
+        self.types.iter().find_map(|t| match t {
+            TypeDef::Edge(e) if e.name == name => Some(e),
+            _ => None,
+        })
+    }
+
     pub fn node_type_id(&self, name: &str) -> Option<u32> {
         self.types.iter().find_map(|t| match t {
             TypeDef::Node(n) if n.name == name => Some(n.type_id),
@@ -384,6 +417,25 @@ impl SchemaIR {
             TypeDef::Edge(e) => Some(e),
             _ => None,
         })
+    }
+
+    pub fn node_key_property_name(&self, type_name: &str) -> Option<&str> {
+        self.node_type(type_name)
+            .and_then(NodeTypeDef::key_property_name)
+    }
+}
+
+impl NodeTypeDef {
+    pub fn key_property(&self) -> Option<&PropDef> {
+        self.properties.iter().find(|prop| prop.key)
+    }
+
+    pub fn key_property_name(&self) -> Option<&str> {
+        self.key_property().map(|prop| prop.name.as_str())
+    }
+
+    pub fn unique_properties(&self) -> impl Iterator<Item = &PropDef> {
+        self.properties.iter().filter(|prop| prop.unique)
     }
 }
 
@@ -452,10 +504,13 @@ node Person {
             .unwrap();
         let age_prop = person.properties.iter().find(|p| p.name == "age").unwrap();
 
+        assert!(person.description.is_none());
+        assert!(person.instruction.is_none());
         assert!(id_prop.key);
         assert!(!id_prop.unique);
         assert!(id_prop.index);
         assert!(id_prop.embed_source.is_none());
+        assert!(id_prop.description.is_none());
         assert!(!email_prop.key);
         assert!(email_prop.unique);
         assert!(!email_prop.index);
@@ -542,6 +597,38 @@ node Person {
         assert!(!prop.unique);
         assert!(!prop.index);
         assert!(prop.embed_source.is_none());
+        assert!(prop.description.is_none());
+        assert!(person.description.is_none());
+        assert!(person.instruction.is_none());
+    }
+
+    #[test]
+    fn test_build_schema_ir_preserves_agent_metadata() {
+        let schema = parse_schema(
+            r#"
+node Task @description("Tracked work item") @instruction("Prefer querying by slug") {
+    slug: String @key @description("Stable external identifier")
+}
+edge DependsOn: Task -> Task @description("Hard dependency") @instruction("Use only for blockers")
+"#,
+        )
+        .unwrap();
+        let ir = build_schema_ir(&schema).unwrap();
+        let task = ir.node_type("Task").unwrap();
+        let depends_on = ir.edge_type("DependsOn").unwrap();
+
+        assert_eq!(task.description.as_deref(), Some("Tracked work item"));
+        assert_eq!(task.instruction.as_deref(), Some("Prefer querying by slug"));
+        assert_eq!(task.key_property_name(), Some("slug"));
+        assert_eq!(
+            task.properties[0].description.as_deref(),
+            Some("Stable external identifier")
+        );
+        assert_eq!(depends_on.description.as_deref(), Some("Hard dependency"));
+        assert_eq!(
+            depends_on.instruction.as_deref(),
+            Some("Use only for blockers")
+        );
     }
 
     #[test]
@@ -613,6 +700,8 @@ node Person {
                 TypeDef::Node(NodeTypeDef {
                     name: "Person".to_string(),
                     type_id: 100,
+                    description: None,
+                    instruction: None,
                     properties: vec![],
                 }),
                 TypeDef::Edge(EdgeTypeDef {
@@ -622,6 +711,8 @@ node Person {
                     dst_type_id: 100,
                     src_type_name: "Person".to_string(),
                     dst_type_name: "Person".to_string(),
+                    description: None,
+                    instruction: None,
                     properties: vec![],
                 }),
             ],

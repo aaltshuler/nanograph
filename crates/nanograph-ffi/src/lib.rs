@@ -5,7 +5,7 @@ use std::mem;
 use std::os::raw::{c_char, c_int};
 use std::ptr;
 use std::slice;
-use std::sync::{Mutex, OnceLock, RwLock};
+use std::sync::RwLock;
 
 use arrow_ipc::reader::StreamReader;
 use tokio::runtime::Runtime;
@@ -38,26 +38,26 @@ impl NanoGraphBytes {
 }
 
 thread_local! {
+    // FFI callers fetch the last error after a null/-1 return, so the slot must
+    // stay isolated per thread to avoid concurrent calls clobbering diagnostics.
     static LAST_ERROR_CSTR: RefCell<Option<CString>> = const { RefCell::new(None) };
-}
-
-static LAST_ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
-
-fn last_error_slot() -> &'static Mutex<Option<String>> {
-    LAST_ERROR.get_or_init(|| Mutex::new(None))
 }
 
 fn set_last_error(message: impl Into<String>) {
     let next = message.into().replace('\0', "\\0");
-    if let Ok(mut slot) = last_error_slot().lock() {
-        *slot = Some(next);
-    }
+    let cstr = CString::new(next).unwrap_or_else(|_| {
+        CString::new("nanograph-ffi: error contained interior null byte")
+            .expect("static string must be valid CString")
+    });
+    LAST_ERROR_CSTR.with(|slot| {
+        *slot.borrow_mut() = Some(cstr);
+    });
 }
 
 fn clear_last_error() {
-    if let Ok(mut slot) = last_error_slot().lock() {
-        *slot = None;
-    }
+    LAST_ERROR_CSTR.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
 }
 
 fn to_status(result: FfiResult<()>) -> c_int {
@@ -259,6 +259,9 @@ fn prop_def_to_json(prop: &nanograph::schema_ir::PropDef) -> serde_json::Value {
     if let Some(ref src) = prop.embed_source {
         obj["embedSource"] = serde_json::Value::String(src.clone());
     }
+    if let Some(ref description) = prop.description {
+        obj["description"] = serde_json::Value::String(description.clone());
+    }
     obj
 }
 
@@ -372,20 +375,8 @@ fn arrow_bytes_to_json(data: *const u8, len: usize) -> FfiResult<serde_json::Val
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nanograph_last_error_message() -> *const c_char {
-    let message = match last_error_slot().lock() {
-        Ok(guard) => guard.clone(),
-        Err(_) => None,
-    };
-    let Some(message) = message else {
-        return ptr::null();
-    };
-
     LAST_ERROR_CSTR.with(|slot| {
-        let fallback = CString::new("nanograph-ffi: error contained interior null byte")
-            .expect("static string must be valid CString");
-        let next = CString::new(message).unwrap_or(fallback);
-        let mut slot = slot.borrow_mut();
-        *slot = Some(next);
+        let slot = slot.borrow();
         slot.as_ref().map_or(ptr::null(), |s| s.as_ptr())
     })
 }
@@ -670,6 +661,12 @@ pub extern "C" fn nanograph_db_describe(handle: *mut NanoGraphHandle) -> *mut c_
                 serde_json::json!({
                     "name": nt.name,
                     "typeId": nt.type_id,
+                    "description": nt.description,
+                    "instruction": nt.instruction,
+                    "keyProperty": nt.key_property_name(),
+                    "uniqueProperties": nt.unique_properties().map(|prop| prop.name.clone()).collect::<Vec<_>>(),
+                    "outgoingEdges": ir.edge_types().filter(|edge| edge.src_type_name == nt.name).map(|edge| serde_json::json!({"name": edge.name, "toType": edge.dst_type_name})).collect::<Vec<_>>(),
+                    "incomingEdges": ir.edge_types().filter(|edge| edge.dst_type_name == nt.name).map(|edge| serde_json::json!({"name": edge.name, "fromType": edge.src_type_name})).collect::<Vec<_>>(),
                     "properties": nt.properties.iter().map(prop_def_to_json).collect::<Vec<_>>(),
                 })
             })
@@ -683,6 +680,12 @@ pub extern "C" fn nanograph_db_describe(handle: *mut NanoGraphHandle) -> *mut c_
                     "srcType": et.src_type_name,
                     "dstType": et.dst_type_name,
                     "typeId": et.type_id,
+                    "description": et.description,
+                    "instruction": et.instruction,
+                    "endpointKeys": {
+                        "src": ir.node_key_property_name(&et.src_type_name),
+                        "dst": ir.node_key_property_name(&et.dst_type_name),
+                    },
                     "properties": et.properties.iter().map(prop_def_to_json).collect::<Vec<_>>(),
                 })
             })
@@ -792,31 +795,63 @@ pub extern "C" fn nanograph_db_is_in_memory(handle: *mut NanoGraphHandle) -> c_i
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::CStr;
+    use std::ffi::{CStr, CString};
     use std::ptr;
     use std::thread;
 
-    use super::{clear_last_error, nanograph_db_open, nanograph_last_error_message};
+    use super::{
+        clear_last_error, nanograph_db_close, nanograph_db_destroy, nanograph_db_open,
+        nanograph_db_open_in_memory, nanograph_last_error_message,
+    };
 
     #[test]
-    fn last_error_is_visible_across_threads() {
+    fn last_error_is_visible_on_the_same_thread() {
         clear_last_error();
 
+        let _ = nanograph_db_open(ptr::null());
+        let ptr = nanograph_last_error_message();
+        assert!(!ptr.is_null(), "expected error pointer");
+        // SAFETY: pointer originates from `nanograph_last_error_message`.
+        let msg = unsafe { CStr::from_ptr(ptr).to_string_lossy().into_owned() };
+
+        assert!(
+            msg.contains("db_path must not be null"),
+            "unexpected error message: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn last_error_is_isolated_per_thread() {
+        clear_last_error();
+
+        let _ = nanograph_db_open(ptr::null());
+
         thread::spawn(|| {
-            let _ = nanograph_db_open(ptr::null());
+            let schema = CString::new("node Person { name: String @key }")
+                .expect("schema must be a valid CString");
+            let handle = nanograph_db_open_in_memory(schema.as_ptr());
+            assert!(!handle.is_null(), "expected in-memory database handle");
+            assert!(
+                nanograph_last_error_message().is_null(),
+                "successful call on another thread should not inherit caller error"
+            );
+            assert_eq!(nanograph_db_close(handle), 0, "expected close to succeed");
+            // SAFETY: pointer originates from `nanograph_db_open_in_memory`.
+            unsafe {
+                nanograph_db_destroy(handle);
+            }
         })
         .join()
-        .expect("error producer thread panicked");
+        .expect("isolation thread panicked");
 
-        let msg = thread::spawn(|| {
-            let ptr = nanograph_last_error_message();
-            assert!(!ptr.is_null(), "expected error pointer");
-            // SAFETY: pointer originates from `nanograph_last_error_message`.
-            unsafe { CStr::from_ptr(ptr).to_string_lossy().into_owned() }
-        })
-        .join()
-        .expect("error reader thread panicked");
-
+        let ptr = nanograph_last_error_message();
+        assert!(
+            !ptr.is_null(),
+            "error from originating thread should remain visible"
+        );
+        // SAFETY: pointer originates from `nanograph_last_error_message`.
+        let msg = unsafe { CStr::from_ptr(ptr).to_string_lossy().into_owned() };
         assert!(
             msg.contains("db_path must not be null"),
             "unexpected error message: {}",

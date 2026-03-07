@@ -6,6 +6,8 @@ pub struct QueryFile {
 #[derive(Debug, Clone)]
 pub struct QueryDecl {
     pub name: String,
+    pub description: Option<String>,
+    pub instruction: Option<String>,
     pub params: Vec<Param>,
     pub match_clause: Vec<Clause>,
     pub return_clause: Vec<Projection>,

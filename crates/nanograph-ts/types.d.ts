@@ -26,6 +26,7 @@ export interface PropDescription {
   propId: number
   type: string
   nullable: boolean
+  description?: string
   list?: true
   key?: true
   unique?: true
@@ -34,9 +35,21 @@ export interface PropDescription {
   embedSource?: string
 }
 
+export interface EdgeEndpointSummary {
+  name: string
+  toType?: string
+  fromType?: string
+}
+
 export interface NodeTypeDescription {
   name: string
   typeId: number
+  description?: string
+  instruction?: string
+  keyProperty?: string
+  uniqueProperties: string[]
+  outgoingEdges: EdgeEndpointSummary[]
+  incomingEdges: EdgeEndpointSummary[]
   properties: PropDescription[]
 }
 
@@ -45,6 +58,12 @@ export interface EdgeTypeDescription {
   srcType: string
   dstType: string
   typeId: number
+  description?: string
+  instruction?: string
+  endpointKeys: {
+    src?: string
+    dst?: string
+  }
   properties: PropDescription[]
 }
 

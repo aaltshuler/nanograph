@@ -108,6 +108,7 @@ name: String @unique
 email: String @index
 embedding: Vector(1536) @embed(bio) @index
 old_name: String @rename_from("previous_name")
+title: String @description("Short human-readable label")
 ```
 
 | Annotation | Description |
@@ -117,8 +118,24 @@ old_name: String @rename_from("previous_name")
 | `@index` | Creates an index for the property: scalar index for scalar fields, vector index for `Vector(dim)` fields. |
 | `@embed(source_prop)` | Auto-generates embeddings from a String property when the vector field is missing/null during load/mutation processing. Target must be `Vector(dim)`. See [search.md](search.md#embedding-workflow) for details. |
 | `@rename_from("old")` | Tracks property/type renames for schema migration. |
+| `@description("...")` | Optional semantic description for node types, edge types, and properties. Intended for `describe --format json`, SDK introspection, and agent context. |
+| `@instruction("...")` | Optional agent-facing guidance for node and edge types. Advisory only; it does not change query execution semantics. |
 
-**Restrictions**: List properties cannot have `@key`, `@unique`, `@index`, or `@embed`.
+**Restrictions**: List properties cannot have `@key`, `@unique`, `@index`, or `@embed`. `@instruction` is only valid on node and edge types, not on properties.
+
+Example with agent-facing metadata:
+
+```graphql
+node Task @description("Tracked work item") @instruction("Prefer querying by slug.") {
+    slug: String @key @description("Stable external identifier")
+    title: String @description("Short human-readable summary")
+    status: enum(todo, doing, done) @description("Workflow state")
+}
+
+edge DependsOn: Task -> Task
+  @description("Hard execution dependency")
+  @instruction("Use only for direct blockers, not loose relatedness")
+```
 
 ## Naming conventions
 
