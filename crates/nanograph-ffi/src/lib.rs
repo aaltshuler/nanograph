@@ -391,7 +391,7 @@ pub extern "C" fn nanograph_last_error_message() -> *const c_char {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn nanograph_string_free(value: *mut c_char) {
+pub unsafe extern "C" fn nanograph_string_free(value: *mut c_char) {
     if value.is_null() {
         return;
     }
@@ -504,7 +504,7 @@ pub extern "C" fn nanograph_db_close(handle: *mut NanoGraphHandle) -> c_int {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn nanograph_db_destroy(handle: *mut NanoGraphHandle) {
+pub unsafe extern "C" fn nanograph_db_destroy(handle: *mut NanoGraphHandle) {
     if handle.is_null() {
         return;
     }

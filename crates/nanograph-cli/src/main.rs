@@ -1960,11 +1960,7 @@ mod tests {
 
     #[test]
     fn default_log_filter_matches_build_mode() {
-        if cfg!(debug_assertions) {
-            assert_eq!(default_log_filter(), "info");
-        } else {
-            assert_eq!(default_log_filter(), "error");
-        }
+        assert_eq!(default_log_filter(), "error");
     }
 
     #[test]
