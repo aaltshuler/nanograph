@@ -316,13 +316,7 @@ impl GraphStorage {
         }
 
         // Extract property columns (everything after id, src, dst)
-        let batch_schema = batch.schema();
-        let prop_col_indices: Vec<usize> = (0..batch.num_columns())
-            .filter(|&i| {
-                let name = batch_schema.field(i).name();
-                name != "id" && name != "src" && name != "dst"
-            })
-            .collect();
+        let prop_col_indices: Vec<usize> = (3..batch.num_columns()).collect();
 
         if !prop_col_indices.is_empty() {
             let prop_fields: Vec<Field> = prop_col_indices

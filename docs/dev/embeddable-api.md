@@ -1,26 +1,52 @@
 ---
 audience: dev
 status: draft
-updated: 2026-03-06
+updated: 2026-03-07
 ---
 
 # Embeddable API + Embedding Refactor
 
-Canonical plan for the embeddable Rust API and the remaining large-embedding work.
+Canonical plan and status doc for the embeddable Rust API, streaming embedding ingest, and SDK surface.
 
 ## Summary
 
-The query-side refactor is mostly done:
-- shared query lookup and typed JSON param conversion exist in core
-- `Database::run()` / `run_query()` exist in core
-- `RunResult` / `QueryResult` / `MutationResult` exist in core
-- TS, FFI, and CLI now use the shared execution path
-- `runArrow()` and Arrow IPC are already landed
+The embeddable refactor is now largely landed:
+- shared query lookup, typed param conversion, and the core `RunResult` / `QueryResult` / `MutationResult` surface are in `nanograph`
+- `Database` is a cheap shared handle with an internal single-writer mutation path
+- `open_in_memory()` is landed as the tempdir-backed variant
+- streaming ingest for large embedding graphs is landed, including streaming `@embed` materialization
+- TS and Swift now expose the current embeddable surface (`runArrow`, file-based load, in-memory open)
+- Arrow IPC remains the preferred path for large returned vectors
 
-What is still open is the work that actually finishes the refactor:
-- `open_in_memory()`
-- streaming ingest for large embedding graphs, including streaming `@embed` materialization
-- optional JSON vector serialization optimization
+What remains is mostly deferred or optional follow-up:
+- event callbacks / reactivity
+- extension / custom rule APIs
+- a pure in-memory backend that bypasses Lance / filesystem metadata
+- any further JSON vector optimization only if profiling proves it is worth doing
+
+## Current Shipped Status
+
+### In-memory open
+
+- `Database::open_in_memory(schema_source)` is landed in core as the tempdir-backed variant
+- cloned handles keep the temp backing directory alive
+- the temp backing directory is removed when the last shared handle drops
+- TS exposes `Database.openInMemory(...)` and `db.isInMemory()`
+- Swift exposes `Database.openInMemory(schemaSource:)` and `db.isInMemory()`
+
+### Embeddings and streaming ingest
+
+- reader-based loading is landed in core
+- `Database::load_file(...)` is landed
+- CLI, TS, and FFI all expose file-based load paths
+- large embedding loads no longer require a whole-buffer rewrite just to materialize `@embed`
+- JSON has a narrow vector fast path, but `runArrow()` is still the recommended transport for large vector-heavy result sets
+
+### SDK status
+
+- TS is on the shared execution path and exposes `runArrow()`, `decodeArrow()`, `loadFile()`, and `openInMemory()`
+- Swift is on the FFI-based shared execution path and exposes `runArrow()`, `decodeArrow()`, `loadFile()`, and `openInMemory()`
+- PR CI now covers core checks, TS tests, TS consumer smoke, and Swift tests
 
 Current Phase 0 status:
 - schemas with a user `id` property now load, persist, reopen, append, and merge correctly
@@ -93,12 +119,13 @@ So the intended surface is:
 - [x] Arrow IPC transport and TS `runArrow()`
 - [x] JS-side Arrow decode helper
 - [x] Shareable `Database` handle (`Clone + Send + Sync`, internal single-writer mutation path, cheap live snapshots)
+- [x] Tempdir-backed `open_in_memory()` in core plus TS / Swift exposure
+- [x] Streaming ingest for large embedding graphs across core, CLI, TS, and FFI
+- [x] Swift SDK parity for the current embeddable surface
 
-### Open
+### Landed Evaluation / Follow-through
 
-- [x] Phase 3: add `open_in_memory()` on top of the shareable handle design
-- [x] Phase 4: expose streaming ingest in TS / FFI / CLI after the landed core reader path
-- [x] Phase 5: evaluate JSON vector fast path after streaming ingest
+- [x] JSON vector fast path evaluation after streaming ingest
 
 ### Deferred
 

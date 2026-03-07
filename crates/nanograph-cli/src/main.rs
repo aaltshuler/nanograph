@@ -4,7 +4,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use ariadne::{Color, Label, Report, ReportKind, Source};
-use arrow_array::RecordBatch;
+use arrow_array::{ArrayRef, RecordBatch};
 use clap::{Parser, Subcommand};
 use color_eyre::eyre::{Result, WrapErr, eyre};
 use tracing::{debug, info, instrument, warn};
@@ -29,7 +29,7 @@ use nanograph::store::txlog::{CdcLogEntry, read_visible_cdc_entries};
 #[derive(Parser)]
 #[command(
     name = "nanograph",
-    about = "NanoGraph — embedded typed property graph DB",
+    about = "nanograph — on-device typed property graph DB",
     version
 )]
 struct Cli {
@@ -720,8 +720,9 @@ fn print_describe_table(payload: &serde_json::Value) {
 #[instrument(fields(db_path = %db_path.display(), format = format))]
 async fn cmd_export(db_path: PathBuf, format: &str, json: bool) -> Result<()> {
     let db = Database::open(&db_path).await?;
-    let rows = build_export_rows(&db)?;
     let effective_format = if json { "json" } else { format };
+    let include_internal_fields = effective_format == "json";
+    let rows = build_export_rows(&db, include_internal_fields)?;
 
     match effective_format {
         "jsonl" => {
@@ -743,12 +744,15 @@ async fn cmd_export(db_path: PathBuf, format: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn build_export_rows(db: &Database) -> Result<Vec<serde_json::Value>> {
-    use arrow_array::{Array, StringArray, UInt64Array};
+fn build_export_rows(
+    db: &Database,
+    include_internal_fields: bool,
+) -> Result<Vec<serde_json::Value>> {
+    use arrow_array::{Array, UInt64Array};
 
     let storage = db.snapshot();
     let mut rows = Vec::new();
-    let mut node_labels: HashMap<String, HashMap<u64, String>> = HashMap::new();
+    let mut node_key_tokens: HashMap<String, HashMap<u64, String>> = HashMap::new();
 
     for node in db.schema_ir.node_types() {
         let Some(batch) = storage.get_all_nodes(&node.name)? else {
@@ -758,27 +762,47 @@ fn build_export_rows(db: &Database) -> Result<Vec<serde_json::Value>> {
             .column_by_name("id")
             .and_then(|col| col.as_any().downcast_ref::<UInt64Array>())
             .ok_or_else(|| eyre!("node batch '{}' missing UInt64 id column", node.name))?;
-        let name_arr = batch
-            .column_by_name("name")
-            .and_then(|col| col.as_any().downcast_ref::<StringArray>());
+        let key_prop = node
+            .properties
+            .iter()
+            .find(|prop| prop.key)
+            .map(|prop| prop.name.as_str());
+        let key_col = match key_prop {
+            Some(prop_name) => {
+                let key_idx =
+                    node_property_index(batch.schema().as_ref(), prop_name).ok_or_else(|| {
+                        eyre!(
+                            "node batch '{}' missing @key property '{}'",
+                            node.name,
+                            prop_name
+                        )
+                    })?;
+                Some((prop_name.to_string(), batch.column(key_idx).clone()))
+            }
+            None => None,
+        };
 
-        let mut labels = HashMap::new();
+        let mut key_tokens = HashMap::new();
         for row_idx in 0..batch.num_rows() {
             let id = id_arr.value(row_idx);
-            let label = name_arr
-                .filter(|arr| !arr.is_null(row_idx))
-                .map(|arr| arr.value(row_idx).to_string())
-                .unwrap_or_else(|| id.to_string());
-            labels.insert(id, label);
+            if let Some((prop_name, key_array)) = key_col.as_ref() {
+                let key_token = export_key_token(key_array, row_idx, prop_name)?;
+                key_tokens.insert(id, key_token);
+            }
 
-            let data = export_data_map(&batch, row_idx, &["id"]);
-            rows.push(serde_json::json!({
+            let data = export_data_map(&batch, row_idx, &[0]);
+            let mut row = serde_json::json!({
                 "type": node.name,
-                "id": id,
                 "data": data,
-            }));
+            });
+            if include_internal_fields {
+                row["id"] = serde_json::Value::Number(id.into());
+            }
+            rows.push(row);
         }
-        node_labels.insert(node.name.clone(), labels);
+        if !key_tokens.is_empty() {
+            node_key_tokens.insert(node.name.clone(), key_tokens);
+        }
     }
 
     for edge in db.schema_ir.edge_types() {
@@ -802,45 +826,85 @@ fn build_export_rows(db: &Database) -> Result<Vec<serde_json::Value>> {
             let id = id_arr.value(row_idx);
             let src = src_arr.value(row_idx);
             let dst = dst_arr.value(row_idx);
-            let from = node_labels
+            let from = node_key_tokens
                 .get(&edge.src_type_name)
                 .and_then(|m| m.get(&src))
                 .cloned()
-                .unwrap_or_else(|| src.to_string());
-            let to = node_labels
+                .ok_or_else(|| {
+                    eyre!(
+                        "cannot export portable edge '{}': source {} node {} is missing an @key token",
+                        edge.name,
+                        edge.src_type_name,
+                        src
+                    )
+                })?;
+            let to = node_key_tokens
                 .get(&edge.dst_type_name)
                 .and_then(|m| m.get(&dst))
                 .cloned()
-                .unwrap_or_else(|| dst.to_string());
-            let data = export_data_map(&batch, row_idx, &["id", "src", "dst"]);
+                .ok_or_else(|| {
+                    eyre!(
+                        "cannot export portable edge '{}': destination {} node {} is missing an @key token",
+                        edge.name,
+                        edge.dst_type_name,
+                        dst
+                    )
+                })?;
+            let data = export_data_map(&batch, row_idx, &[0, 1, 2]);
 
-            rows.push(serde_json::json!({
+            let mut row = serde_json::json!({
                 "edge": edge.name,
-                "id": id,
                 "from": from,
                 "to": to,
-                "src": src,
-                "dst": dst,
                 "data": data,
-            }));
+            });
+            if include_internal_fields {
+                row["id"] = serde_json::Value::Number(id.into());
+                row["src"] = serde_json::Value::Number(src.into());
+                row["dst"] = serde_json::Value::Number(dst.into());
+            }
+            rows.push(row);
         }
     }
 
     Ok(rows)
 }
 
+fn node_property_index(schema: &arrow_schema::Schema, prop_name: &str) -> Option<usize> {
+    schema
+        .fields()
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find_map(|(idx, field)| (field.name() == prop_name).then_some(idx))
+}
+
+fn export_key_token(array: &ArrayRef, row_idx: usize, prop_name: &str) -> Result<String> {
+    match nanograph::json_output::array_value_to_json(array, row_idx) {
+        serde_json::Value::Null => Err(eyre!("@key property {} cannot be null", prop_name)),
+        serde_json::Value::String(value) => Ok(value),
+        serde_json::Value::Bool(value) => Ok(value.to_string()),
+        serde_json::Value::Number(value) => Ok(value.to_string()),
+        other => Err(eyre!(
+            "unsupported @key export value for {}: {}",
+            prop_name,
+            other
+        )),
+    }
+}
+
 fn export_data_map(
     batch: &RecordBatch,
     row_idx: usize,
-    excluded_fields: &[&str],
+    excluded_indices: &[usize],
 ) -> serde_json::Value {
-    let excluded = excluded_fields
+    let excluded = excluded_indices
         .iter()
-        .map(|s| (*s).to_string())
+        .copied()
         .collect::<std::collections::HashSet<_>>();
     let mut data = serde_json::Map::new();
     for (col_idx, field) in batch.schema().fields().iter().enumerate() {
-        if excluded.contains(field.name()) {
+        if excluded.contains(&col_idx) {
             continue;
         }
         data.insert(
@@ -2520,7 +2584,7 @@ edge Knows: Person -> Person"#,
             .expect("embedding property present in describe payload");
         assert_eq!(embedding_prop["embed_source"].as_str(), Some("summary"));
 
-        let rows = build_export_rows(&db).unwrap();
+        let rows = build_export_rows(&db, false).unwrap();
         assert_eq!(rows.len(), 3);
         assert!(
             rows.iter()
@@ -2530,5 +2594,156 @@ edge Knows: Person -> Person"#,
             rows.iter()
                 .any(|row| row["edge"] == "Knows" && row["from"] == "Alice" && row["to"] == "Bob")
         );
+    }
+
+    #[tokio::test]
+    async fn export_uses_key_properties_for_edge_endpoints_and_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("db");
+        let roundtrip_db_path = dir.path().join("roundtrip-db");
+        let schema_path = dir.path().join("schema.pg");
+        let export_path = dir.path().join("export.jsonl");
+        let data_path = dir.path().join("data.jsonl");
+
+        write_file(
+            &schema_path,
+            r#"node ActionItem {
+    slug: String @key
+    title: String
+}
+node Person {
+    slug: String @key
+    name: String
+}
+edge MadeBy: ActionItem -> Person"#,
+        );
+        write_file(
+            &data_path,
+            r#"{"type":"ActionItem","data":{"slug":"dec-build-mcp","title":"Build MCP"}}
+{"type":"Person","data":{"slug":"act-andrew","name":"Andrew"}}
+{"edge":"MadeBy","from":"dec-build-mcp","to":"act-andrew"}"#,
+        );
+
+        cmd_init(&db_path, &schema_path, false).await.unwrap();
+        cmd_load(&db_path, &data_path, LoadModeArg::Overwrite, false)
+            .await
+            .unwrap();
+
+        let db = Database::open(&db_path).await.unwrap();
+        let rows = build_export_rows(&db, false).unwrap();
+        let edge = rows
+            .iter()
+            .find(|row| row["edge"] == "MadeBy")
+            .expect("made by edge row");
+        assert_eq!(edge["from"].as_str(), Some("dec-build-mcp"));
+        assert_eq!(edge["to"].as_str(), Some("act-andrew"));
+        assert!(edge.get("id").is_none());
+        assert!(edge.get("src").is_none());
+        assert!(edge.get("dst").is_none());
+
+        let export_jsonl = rows
+            .iter()
+            .map(|row| serde_json::to_string(row).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        write_file(&export_path, &(export_jsonl + "\n"));
+
+        cmd_init(&roundtrip_db_path, &schema_path, false)
+            .await
+            .unwrap();
+        cmd_load(
+            &roundtrip_db_path,
+            &export_path,
+            LoadModeArg::Overwrite,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let roundtrip_db = Database::open(&roundtrip_db_path).await.unwrap();
+        let roundtrip_rows = build_export_rows(&roundtrip_db, false).unwrap();
+        let roundtrip_edge = roundtrip_rows
+            .iter()
+            .find(|row| row["edge"] == "MadeBy")
+            .expect("made by edge row after roundtrip");
+        assert_eq!(roundtrip_edge["from"].as_str(), Some("dec-build-mcp"));
+        assert_eq!(roundtrip_edge["to"].as_str(), Some("act-andrew"));
+        assert!(roundtrip_edge.get("id").is_none());
+        assert!(roundtrip_edge.get("src").is_none());
+        assert!(roundtrip_edge.get("dst").is_none());
+    }
+
+    #[tokio::test]
+    async fn export_preserves_user_property_named_id_for_nodes_and_edges() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("db");
+        let roundtrip_db_path = dir.path().join("roundtrip-db");
+        let schema_path = dir.path().join("schema.pg");
+        let export_path = dir.path().join("export.jsonl");
+        let data_path = dir.path().join("data.jsonl");
+
+        write_file(
+            &schema_path,
+            r#"node User {
+    id: String @key
+    name: String
+}
+edge Follows: User -> User"#,
+        );
+        write_file(
+            &data_path,
+            r#"{"type":"User","data":{"id":"usr_01","name":"Alice"}}
+{"type":"User","data":{"id":"usr_02","name":"Bob"}}
+{"edge":"Follows","from":"usr_01","to":"usr_02"}"#,
+        );
+
+        cmd_init(&db_path, &schema_path, false).await.unwrap();
+        cmd_load(&db_path, &data_path, LoadModeArg::Overwrite, false)
+            .await
+            .unwrap();
+
+        let db = Database::open(&db_path).await.unwrap();
+        let rows = build_export_rows(&db, false).unwrap();
+        assert!(
+            rows.iter()
+                .any(|row| row["type"] == "User" && row["data"]["id"] == "usr_01")
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row["type"] == "User" && row["data"]["id"] == "usr_02")
+        );
+        assert!(rows.iter().any(|row| {
+            row["edge"] == "Follows" && row["from"] == "usr_01" && row["to"] == "usr_02"
+        }));
+
+        let export_jsonl = rows
+            .iter()
+            .map(|row| serde_json::to_string(row).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        write_file(&export_path, &(export_jsonl + "\n"));
+
+        cmd_init(&roundtrip_db_path, &schema_path, false)
+            .await
+            .unwrap();
+        cmd_load(
+            &roundtrip_db_path,
+            &export_path,
+            LoadModeArg::Overwrite,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let roundtrip_db = Database::open(&roundtrip_db_path).await.unwrap();
+        let roundtrip_rows = build_export_rows(&roundtrip_db, false).unwrap();
+        assert!(
+            roundtrip_rows
+                .iter()
+                .any(|row| { row["type"] == "User" && row["data"]["id"] == "usr_01" })
+        );
+        assert!(roundtrip_rows.iter().any(|row| {
+            row["edge"] == "Follows" && row["from"] == "usr_01" && row["to"] == "usr_02"
+        }));
     }
 }

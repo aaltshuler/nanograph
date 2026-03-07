@@ -4,38 +4,16 @@
 
 See [docs/dev/embeddable-api.md](embeddable-api.md) for full design.
 
-Current status:
-- Core execution facade, adapter migration, Arrow IPC, and the Rust embeddable ergonomics (`num_rows`, `concat_batches`, `to_rust_json`, `deserialize`, `params!`, `ToParam`) are landed.
-- Duplicate logical field names are correct for load / persist / reopen / append / merge, but they currently opt out of the CDC-derived append / merge fast path and fall back to full dataset rewrites.
-- The shareable `Database` refactor is landed: `Database` is `Clone + Send + Sync`, mutations serialize through one internal writer path, and TS / FFI no longer hold external read mutexes.
-- Prepared reads freeze an in-memory snapshot for isolation across later mutations; one-shot reads still use the live snapshot and Lance pushdown.
-- Streaming ingest is landed across core and adapters: reader-based loading, `Database::load_file(...)`, TS `loadFile(...)`, FFI `nanograph_db_load_file(...)`, CLI file-based load, edge spooling for forward references, and streaming `@embed` materialization now avoid the extra whole-buffer rewrite.
-- Tempdir-backed `Database::open_in_memory(schema_source)` is landed in core and now exposed in TS as `Database.openInMemory(...)`.
-- JSON vector fast path evaluation is landed: there is now a vector-heavy transport perf harness plus a targeted `FixedSizeList<Float32>` serializer fast path, but Arrow IPC is still the preferred path for large returned vectors.
-
-### Phase 2: Shareability
-- [x] Refactor `Database` internals to Arc + RwLock, implement `Clone + Send + Sync`
-- [x] Move read APIs toward `&self` with cheap prepared-read snapshots
-- [x] Serialize mutations through one internal writer path
-- [x] Simplify FFI/TS to drop external Mutex wrappers for reads
-
-### Phase 3: In-memory open
-- [x] `Database::open_in_memory(schema_source)` (tempdir-backed)
-
-### Phase 4: Streaming ingest
-- [x] Reader-based loading in core
-- [x] `Database::load_file(...)`
-- [x] TS `loadFile(...)`
-- [x] FFI `nanograph_db_load_file(...)`
-- [x] CLI file-based load path
-- [x] Bounded-memory batching, edge spooling, and streaming `@embed` materialization
-
-### Phase 5: JSON vector fast path
-- [x] Evaluate post-streaming-ingest JSON vector serialization optimization
+- [x] Core embeddable API and shareable `Database` handle
+- [x] Tempdir-backed in-memory open
+- [x] Streaming ingest and large-embedding load path
+- [x] TypeScript SDK on the current embeddable surface
+- [x] Swift SDK on the current embeddable surface
 
 ### Deferred
 - [ ] `on_change()` callback registration (broadcast channel)
 - [ ] Custom UDF registration via DataFusion (separate design doc)
+- [ ] Pure in-memory backend that bypasses Lance / filesystem metadata
 
 ## CLI Ergonomics
 

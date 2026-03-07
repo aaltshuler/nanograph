@@ -210,6 +210,8 @@ Edges with properties:
 {"edge": "Knows", "from": "Alice", "to": "Bob", "data": {"since": "2020-01-01"}}
 ```
 
+`nanograph export --format jsonl` emits this same portable seed shape. It does not include internal storage fields like node `id` or edge `id` / `src` / `dst`.
+
 ## Debug logging
 
 ```bash
