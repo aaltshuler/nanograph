@@ -15,7 +15,7 @@
     ]
   },
   "scripts": {
-    "install": "napi build --platform --js index.js --release",
+    "install": "node scripts/install.cjs",
     "build": "napi build --platform --js index.js --release",
     "build:debug": "napi build --platform --js index.js",
     "test": "node --test __test__/index.spec.mjs"
@@ -35,6 +35,8 @@
   "files": [
     "index.js",
     "types.d.ts",
+    "*.node",
+    "scripts/",
     "src/",
     "build.rs",
     "Cargo.toml"

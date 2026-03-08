@@ -17,6 +17,7 @@ mkdir -p "${PACKAGE_WORK_DIR}" "${CONSUMER_DIR}" "${DATA_DIR}" "${NPM_CACHE_DIR}
 echo "Packing nanograph-db"
 (
   cd "${PACKAGE_DIR}"
+  NPM_CONFIG_CACHE="${NPM_CACHE_DIR}" npm run build >/dev/null
   NPM_CONFIG_CACHE="${NPM_CACHE_DIR}" npm pack --pack-destination "${PACKAGE_WORK_DIR}" >/dev/null
 )
 
