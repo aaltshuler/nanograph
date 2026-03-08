@@ -124,29 +124,24 @@ Rationale:
 
 ## XCFramework build
 
-CI produces a universal static library and packages it as an XCFramework:
+CI currently produces a macOS arm64 XCFramework by default and keeps Intel macOS as an explicit opt-in until the upstream `lance` x86_64 build path is stable again:
 
 ```bash
-# 1. Build for both macOS architectures
+# 1. Build for macOS arm64
 cargo build -p nanograph-ffi --release --target aarch64-apple-darwin
-cargo build -p nanograph-ffi --release --target x86_64-apple-darwin
 
-# 2. Merge into universal binary
-lipo -create \
-  target/aarch64-apple-darwin/release/libnanograph_ffi.a \
-  target/x86_64-apple-darwin/release/libnanograph_ffi.a \
-  -output libnanograph_ffi.a
-
-# 3. Package as XCFramework
+# 2. Package as XCFramework
 xcodebuild -create-xcframework \
-  -library libnanograph_ffi.a \
+  -library target/aarch64-apple-darwin/release/libnanograph_ffi.a \
   -headers crates/nanograph-ffi/include \
   -output NanoGraphFFI.xcframework
 
-# 4. Zip and upload to GitHub release
+# 3. Zip and upload to GitHub release
 zip -r NanoGraphFFI.xcframework.zip NanoGraphFFI.xcframework
 # Upload as release asset, compute sha256 for Package.swift checksum
 ```
+
+If/when Intel macOS support is restored, the build script can include a second `-library ... -headers ...` pair for `x86_64-apple-darwin`.
 
 Also include:
 - the canonical header from `crates/nanograph-ffi/include/nanograph_ffi.h`
@@ -158,8 +153,7 @@ Also include:
 Triggered by tag push (`v*`) in the nanograph monorepo:
 
 1. **Build job** (macOS runner):
-   - Build `nanograph-ffi` for `aarch64-apple-darwin` and `x86_64-apple-darwin`
-   - `lipo` into universal binary
+   - Build `nanograph-ffi` for `aarch64-apple-darwin`
    - Package XCFramework, zip, compute sha256
    - Upload zip as GitHub release asset
 

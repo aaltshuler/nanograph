@@ -5,7 +5,7 @@
 - `CI` runs on PRs and pushes to `main` via [ci.yml](/Users/andrew/code/nanograph/.github/workflows/ci.yml). It covers `cargo check --workspace --all-targets`, TS SDK tests, the TS consumer smoke test, and Swift SDK tests.
 - `Release` runs on tag pushes via [release.yml](/Users/andrew/code/nanograph/.github/workflows/release.yml). It currently automates:
   - macOS ARM CLI binary build + `.sha256`
-  - Swift XCFramework build + `.sha256`
+  - Swift XCFramework build for macOS arm64 + `.sha256`
   - render + smoke test of a publishable Swift package from monorepo sources
   - GitHub Release creation
   - Homebrew tap update dispatch
@@ -34,7 +34,7 @@ git push origin main --tags
 
 This automatically:
 - Builds macOS ARM binary on `macos-14` runner
-- Builds Swift XCFramework artifacts for macOS (`NanoGraphFFI.xcframework.zip` + checksum)
+- Builds Swift XCFramework artifacts for macOS arm64 (`NanoGraphFFI.xcframework.zip` + checksum)
 - Renders a publishable Swift package from monorepo sources and smoke-tests it with `swift test`
 - Creates GitHub Release with `nanograph-vX.Y.Z-aarch64-apple-darwin.tar.gz` + `.sha256`
 - Dispatches formula update to `nanograph/homebrew-tap`
@@ -88,7 +88,7 @@ This is not automated yet. If the external Swift package repo exists, update it 
 |-------|----------|
 | GitHub Release | `github.com/nanograph/nanograph/releases` |
 | macOS ARM binary | `nanograph-vX.Y.Z-aarch64-apple-darwin.tar.gz` on release |
-| Swift XCFramework | `NanoGraphFFI.xcframework.zip` on release |
+| Swift XCFramework (macOS arm64) | `NanoGraphFFI.xcframework.zip` on release |
 | Homebrew tap | `github.com/nanograph/homebrew-tap` |
 | crates.io (core) | `crates.io/crates/nanograph` |
 | crates.io (CLI) | `crates.io/crates/nanograph-cli` |
