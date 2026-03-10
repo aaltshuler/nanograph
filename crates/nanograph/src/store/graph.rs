@@ -65,25 +65,11 @@ impl GraphStorage {
         }
 
         for (name, edge_type) in &catalog.edge_types {
-            let mut fields = vec![
-                Field::new("id", DataType::UInt64, false),
-                Field::new("src", DataType::UInt64, false),
-                Field::new("dst", DataType::UInt64, false),
-            ];
-            for (prop_name, prop_type) in &edge_type.properties {
-                fields.push(Field::new(
-                    prop_name,
-                    prop_type.to_arrow(),
-                    prop_type.nullable,
-                ));
-            }
-            let schema = Arc::new(Schema::new(fields));
-
             edge_segments.insert(
                 name.clone(),
                 EdgeSegment {
                     type_name: name.clone(),
-                    schema,
+                    schema: edge_type.arrow_schema.clone(),
                     src_ids: Vec::new(),
                     dst_ids: Vec::new(),
                     edge_ids: Vec::new(),

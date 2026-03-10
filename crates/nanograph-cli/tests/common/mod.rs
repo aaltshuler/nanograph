@@ -160,12 +160,7 @@ impl ExampleWorkspace {
     }
 
     pub fn jsonl_rows(&self, args: &[&str]) -> Vec<Value> {
-        self.run_ok(args)
-            .stdout
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect()
+        parse_jsonl_rows(&self.run_ok(args).stdout)
     }
 
     pub fn init(&self) {
@@ -215,7 +210,27 @@ pub fn parse_json_value(output: &str) -> Value {
 
 pub fn parse_json_array(output: &str) -> Vec<Value> {
     let value = parse_json_value(output);
+    if let Some(rows) = value.get("rows").and_then(Value::as_array) {
+        return rows.clone();
+    }
     value.as_array().cloned().unwrap_or_default()
+}
+
+pub fn parse_jsonl_rows(output: &str) -> Vec<Value> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let value: Value = serde_json::from_str(trimmed).unwrap();
+            if value.get("$nanograph").is_some() {
+                return None;
+            }
+            Some(value)
+        })
+        .collect()
 }
 
 pub fn scalar_string(value: &Value) -> String {

@@ -5,11 +5,12 @@ use arrow_array::{ArrayRef, RecordBatch};
 use color_eyre::eyre::{Result, WrapErr, eyre};
 use tracing::instrument;
 
+use crate::ui::{stdout_supports_color, style_label};
 use nanograph::store::database::Database;
 use nanograph::store::manifest::GraphManifest;
 
 #[instrument(fields(db = ?db_path.as_ref().map(|p| p.display().to_string())))]
-pub(crate) async fn cmd_version(db_path: Option<PathBuf>, json: bool) -> Result<()> {
+pub(crate) async fn cmd_version(db_path: Option<PathBuf>, json: bool, quiet: bool) -> Result<()> {
     let payload = build_version_payload(db_path.as_deref())?;
 
     if json {
@@ -19,7 +20,9 @@ pub(crate) async fn cmd_version(db_path: Option<PathBuf>, json: bool) -> Result<
         return Ok(());
     }
 
-    print_version_table(&payload);
+    if !quiet {
+        print_version_table(&payload);
+    }
     Ok(())
 }
 
@@ -65,35 +68,49 @@ pub(crate) fn build_version_payload(db_path: Option<&Path>) -> Result<serde_json
 }
 
 fn print_version_table(payload: &serde_json::Value) {
+    let color = stdout_supports_color();
     println!(
-        "nanograph {}",
+        "{} {}",
+        style_label("nanograph", color),
         payload["binary_version"].as_str().unwrap_or_default()
     );
     if let Some(db) = payload.get("db") {
-        println!("Database: {}", db["path"].as_str().unwrap_or_default());
         println!(
-            "Manifest: format v{}, db_version {}",
+            "{} {}",
+            style_label("Database:", color),
+            db["path"].as_str().unwrap_or_default()
+        );
+        println!(
+            "{} format v{}, db_version {}",
+            style_label("Manifest:", color),
             db["format_version"].as_u64().unwrap_or(0),
             db["db_version"].as_u64().unwrap_or(0)
         );
         println!(
-            "Last TX: {} @ {}",
+            "{} {} @ {}",
+            style_label("Last TX:", color),
             db["last_tx_id"].as_str().unwrap_or_default(),
             db["committed_at"].as_str().unwrap_or_default()
         );
         println!(
-            "Schema hash: {} (identity v{})",
+            "{} {} (identity v{})",
+            style_label("Schema hash:", color),
             db["schema_ir_hash"].as_str().unwrap_or_default(),
             db["schema_identity_version"].as_u64().unwrap_or(0)
         );
         println!(
-            "Next IDs: node={} edge={} type={} prop={}",
+            "{} node={} edge={} type={} prop={}",
+            style_label("Next IDs:", color),
             db["next_node_id"].as_u64().unwrap_or(0),
             db["next_edge_id"].as_u64().unwrap_or(0),
             db["next_type_id"].as_u64().unwrap_or(0),
             db["next_prop_id"].as_u64().unwrap_or(0)
         );
-        println!("Datasets: {}", db["dataset_count"].as_u64().unwrap_or(0));
+        println!(
+            "{} {}",
+            style_label("Datasets:", color),
+            db["dataset_count"].as_u64().unwrap_or(0)
+        );
         if let Some(entries) = db["dataset_versions"].as_array() {
             for entry in entries {
                 println!(
@@ -114,6 +131,8 @@ pub(crate) async fn cmd_describe(
     format: &str,
     json: bool,
     type_name: Option<&str>,
+    verbose: bool,
+    quiet: bool,
 ) -> Result<()> {
     let db = Database::open(&db_path).await?;
     let manifest = GraphManifest::read(&db_path)?;
@@ -126,7 +145,11 @@ pub(crate) async fn cmd_describe(
                 .wrap_err("failed to serialize describe JSON")?;
             println!("{}", out);
         }
-        "table" => print_describe_table(&payload),
+        "table" => {
+            if !quiet {
+                print_describe_table(&payload, verbose);
+            }
+        }
         other => return Err(eyre!("unknown format: {} (supported: table, json)", other)),
     }
 
@@ -280,56 +303,84 @@ pub(crate) fn build_describe_payload(
     }))
 }
 
-fn print_describe_table(payload: &serde_json::Value) {
+fn print_describe_table(payload: &serde_json::Value, verbose: bool) {
+    let color = stdout_supports_color();
+    let node_count = payload["nodes"]
+        .as_array()
+        .map(|items| items.len())
+        .unwrap_or(0);
+    let edge_count = payload["edges"]
+        .as_array()
+        .map(|items| items.len())
+        .unwrap_or(0);
+
     println!(
-        "Database: {}",
+        "{} {}",
+        style_label("Database:", color),
         payload["db_path"].as_str().unwrap_or_default()
     );
     println!(
-        "Manifest: format v{}, db_version {}",
-        payload["manifest"]["format_version"].as_u64().unwrap_or(0),
-        payload["manifest"]["db_version"].as_u64().unwrap_or(0)
-    );
-    println!(
-        "Last TX: {} @ {}",
+        "{} db_version {}, last tx {}, {} node type(s), {} edge type(s)",
+        style_label("Summary:", color),
+        payload["manifest"]["db_version"].as_u64().unwrap_or(0),
         payload["manifest"]["last_tx_id"]
             .as_str()
             .unwrap_or_default(),
-        payload["manifest"]["committed_at"]
-            .as_str()
-            .unwrap_or_default()
+        node_count,
+        edge_count
     );
-    println!(
-        "Schema: ir_version {}, hash {}",
-        payload["schema_ir_version"].as_u64().unwrap_or(0),
-        payload["manifest"]["schema_ir_hash"]
-            .as_str()
-            .unwrap_or_default()
-    );
+    if verbose {
+        println!(
+            "{} format v{}, committed_at {}, schema ir v{}",
+            style_label("Manifest:", color),
+            payload["manifest"]["format_version"].as_u64().unwrap_or(0),
+            payload["manifest"]["committed_at"]
+                .as_str()
+                .unwrap_or_default(),
+            payload["schema_ir_version"].as_u64().unwrap_or(0)
+        );
+        println!(
+            "{} {} (identity v{}, datasets={})",
+            style_label("Schema hash:", color),
+            payload["manifest"]["schema_ir_hash"]
+                .as_str()
+                .unwrap_or_default(),
+            payload["manifest"]["schema_identity_version"]
+                .as_u64()
+                .unwrap_or(0),
+            payload["manifest"]["datasets"].as_u64().unwrap_or(0)
+        );
+    }
     println!();
 
-    println!("Node Types");
+    println!("{}", style_label("Node Types", color));
     if let Some(nodes) = payload["nodes"].as_array() {
         for node in nodes {
-            let version = node["dataset_version"]
-                .as_u64()
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "-".to_string());
-            println!(
-                "- {} (type_id={}, rows={}, dataset_version={})",
+            print!(
+                "- {} (rows={}",
                 node["name"].as_str().unwrap_or_default(),
-                node["type_id"].as_u64().unwrap_or(0),
                 node["rows"].as_u64().unwrap_or(0),
-                version,
             );
+            if let Some(key_property) = node["key_property"].as_str() {
+                print!(", key={}", key_property);
+            }
+            if verbose {
+                let version = node["dataset_version"]
+                    .as_u64()
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                print!(
+                    ", type_id={}, dataset_version={}",
+                    node["type_id"].as_u64().unwrap_or(0),
+                    version
+                );
+            }
+            println!(")");
             if let Some(description) = node["description"].as_str() {
                 println!("  description: {}", description);
             }
             if let Some(instruction) = node["instruction"].as_str() {
                 println!("  instruction: {}", instruction);
-            }
-            if let Some(key_property) = node["key_property"].as_str() {
-                println!("  key: {}", key_property);
             }
             if let Some(unique_properties) = node["unique_properties"].as_array()
                 && !unique_properties.is_empty()
@@ -373,6 +424,9 @@ fn print_describe_table(payload: &serde_json::Value) {
                     .join(", ");
                 println!("  incoming: {}", joined);
             }
+            if verbose && let Some(dataset_path) = node["dataset_path"].as_str() {
+                println!("  dataset: {}", dataset_path);
+            }
             if let Some(props) = node["properties"].as_array() {
                 for prop in props {
                     let mut anns: Vec<String> = Vec::new();
@@ -408,22 +462,28 @@ fn print_describe_table(payload: &serde_json::Value) {
     }
     println!();
 
-    println!("Edge Types");
+    println!("{}", style_label("Edge Types", color));
     if let Some(edges) = payload["edges"].as_array() {
         for edge in edges {
-            let version = edge["dataset_version"]
-                .as_u64()
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "-".to_string());
-            println!(
-                "- {}: {} -> {} (type_id={}, rows={}, dataset_version={})",
+            print!(
+                "- {}: {} -> {} (rows={}",
                 edge["name"].as_str().unwrap_or_default(),
                 edge["src_type"].as_str().unwrap_or_default(),
                 edge["dst_type"].as_str().unwrap_or_default(),
-                edge["type_id"].as_u64().unwrap_or(0),
                 edge["rows"].as_u64().unwrap_or(0),
-                version,
             );
+            if verbose {
+                let version = edge["dataset_version"]
+                    .as_u64()
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                print!(
+                    ", type_id={}, dataset_version={}",
+                    edge["type_id"].as_u64().unwrap_or(0),
+                    version
+                );
+            }
+            println!(")");
             if let Some(description) = edge["description"].as_str() {
                 println!("  description: {}", description);
             }
@@ -442,6 +502,9 @@ fn print_describe_table(payload: &serde_json::Value) {
                         .and_then(|value| value.as_str())
                         .unwrap_or("-")
                 );
+            }
+            if verbose && let Some(dataset_path) = edge["dataset_path"].as_str() {
+                println!("  dataset: {}", dataset_path);
             }
             if let Some(props) = edge["properties"].as_array() {
                 for prop in props {

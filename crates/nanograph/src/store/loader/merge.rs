@@ -432,15 +432,14 @@ fn merge_edge_batches(
     // Existing rows are loaded first and incoming rows overwrite duplicates.
     let mut row_order: Vec<(u64, u64)> = Vec::new();
     let mut row_props: HashMap<(u64, u64), Vec<serde_json::Value>> = HashMap::new();
-    let prop_indices: Vec<usize> = schema
+    let prop_field_names: Vec<String> = schema
         .fields()
         .iter()
-        .enumerate()
-        .filter_map(|(idx, field)| {
+        .filter_map(|field| {
             if field.name() == "id" || field.name() == "src" || field.name() == "dst" {
                 None
             } else {
-                Some(idx)
+                Some(field.name().clone())
             }
         })
         .collect();
@@ -461,10 +460,20 @@ fn merge_edge_batches(
 
         for row in 0..batch.num_rows() {
             let key = (src_arr.value(row), dst_arr.value(row));
-            let props = prop_indices
+            let props = prop_field_names
                 .iter()
-                .map(|&idx| array_value_to_json(batch.column(idx), row))
-                .collect::<Vec<_>>();
+                .map(|name| {
+                    batch
+                        .column_by_name(name)
+                        .ok_or_else(|| {
+                            NanoError::Storage(format!(
+                                "missing edge property column {} for {}",
+                                name, edge_name
+                            ))
+                        })
+                        .map(|col| array_value_to_json(col, row))
+                })
+                .collect::<Result<Vec<_>>>()?;
             match row_props.entry(key) {
                 std::collections::hash_map::Entry::Occupied(mut entry) => {
                     if overwrite {
@@ -494,7 +503,7 @@ fn merge_edge_batches(
     let mut id_builder = UInt64Builder::with_capacity(row_order.len());
     let mut src_builder = UInt64Builder::with_capacity(row_order.len());
     let mut dst_builder = UInt64Builder::with_capacity(row_order.len());
-    let mut prop_values: Vec<Vec<serde_json::Value>> = (0..prop_indices.len())
+    let mut prop_values: Vec<Vec<serde_json::Value>> = (0..prop_field_names.len())
         .map(|_| Vec::with_capacity(row_order.len()))
         .collect();
 
@@ -517,14 +526,19 @@ fn merge_edge_batches(
     }
 
     let mut built_props: HashMap<String, ArrayRef> = HashMap::new();
-    for (prop_pos, &col_idx) in prop_indices.iter().enumerate() {
-        let field = schema.field(col_idx);
+    for (prop_pos, field_name) in prop_field_names.iter().enumerate() {
+        let field = schema.field_with_name(field_name).map_err(|e| {
+            NanoError::Storage(format!(
+                "missing merged edge property field {} for {}: {}",
+                field_name, edge_name, e
+            ))
+        })?;
         let arr = json_values_to_array(
             &prop_values[prop_pos],
             field.data_type(),
             field.is_nullable(),
         )?;
-        built_props.insert(field.name().clone(), arr);
+        built_props.insert(field_name.clone(), arr);
     }
 
     let id_arr: ArrayRef = Arc::new(id_builder.finish());
@@ -725,6 +739,45 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    fn edge_batch_with_role_and_started_at(
+        ids: Vec<u64>,
+        src: Vec<u64>,
+        dst: Vec<u64>,
+        role: Vec<&str>,
+        started_at: Vec<i32>,
+        role_first: bool,
+    ) -> RecordBatch {
+        let mut fields = vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new("src", DataType::UInt64, false),
+            Field::new("dst", DataType::UInt64, false),
+        ];
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(UInt64Array::from(ids)) as ArrayRef,
+            Arc::new(UInt64Array::from(src)) as ArrayRef,
+            Arc::new(UInt64Array::from(dst)) as ArrayRef,
+        ];
+
+        let role_field = Field::new("role", DataType::Utf8, false);
+        let role_col = Arc::new(StringArray::from(role)) as ArrayRef;
+        let started_at_field = Field::new("startedAt", DataType::Date32, false);
+        let started_at_col = Arc::new(Date32Array::from(started_at)) as ArrayRef;
+
+        if role_first {
+            fields.push(role_field);
+            fields.push(started_at_field);
+            columns.push(role_col);
+            columns.push(started_at_col);
+        } else {
+            fields.push(started_at_field);
+            fields.push(role_field);
+            columns.push(started_at_col);
+            columns.push(role_col);
+        }
+
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
     }
 
     fn node_batch_with_age(ids: Vec<u64>, names: Vec<&str>, ages: Vec<i32>) -> RecordBatch {
@@ -962,6 +1015,81 @@ mod tests {
         assert_eq!(by_endpoint.get(&(10, 20)), Some(&2024));
         assert_eq!(by_endpoint.get(&(10, 30)), Some(&2000));
         assert_eq!(by_endpoint.get(&(12, 32)), Some(&2025));
+    }
+
+    #[test]
+    fn merge_edge_batches_matches_properties_by_name_not_column_position() {
+        let existing = edge_batch_with_role_and_started_at(
+            vec![1],
+            vec![10],
+            vec![20],
+            vec!["lead"],
+            vec![20_000],
+            false,
+        );
+        let incoming = edge_batch_with_role_and_started_at(
+            vec![2],
+            vec![30],
+            vec![40],
+            vec!["contributor"],
+            vec![20_100],
+            true,
+        );
+
+        let mut next_edge_id = 100;
+        let merged = merge_edge_batches(
+            Some(&existing),
+            Some(&incoming),
+            &HashMap::new(),
+            &HashMap::new(),
+            "WorksOn",
+            true,
+            &mut next_edge_id,
+        )
+        .unwrap()
+        .unwrap();
+
+        let src = merged
+            .column_by_name("src")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let dst = merged
+            .column_by_name("dst")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let role = merged
+            .column_by_name("role")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let started_at = merged
+            .column_by_name("startedAt")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .unwrap();
+
+        let mut by_endpoint = HashMap::new();
+        for row in 0..merged.num_rows() {
+            by_endpoint.insert(
+                (src.value(row), dst.value(row)),
+                (role.value(row).to_string(), started_at.value(row)),
+            );
+        }
+
+        assert_eq!(
+            by_endpoint.get(&(10, 20)),
+            Some(&("lead".to_string(), 20_000))
+        );
+        assert_eq!(
+            by_endpoint.get(&(30, 40)),
+            Some(&("contributor".to_string(), 20_100))
+        );
     }
 
     #[test]

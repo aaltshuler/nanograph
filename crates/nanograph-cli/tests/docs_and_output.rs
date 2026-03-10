@@ -103,11 +103,15 @@ fn human_oriented_command_outputs_smoke_cleanly() {
 
     let describe = workspace.run_ok(&["describe", "--type", "Signal"]).stdout;
     assert!(describe.contains("Database:"));
+    assert!(describe.contains("Summary:"));
     assert!(describe.contains("Node Types"));
     assert!(describe.contains("Signal"));
+    assert!(!describe.contains("dataset_version="));
+    assert!(!describe.contains("type_id="));
 
     let check = workspace.run_ok(&["check", "--query", "revops.gq"]).stdout;
     assert!(check.contains("OK: query `decision_trace` (read)"));
+    assert!(check.contains("INFO: Check complete:"));
     assert!(check.contains("Check complete:"));
 
     let compact = workspace
@@ -127,5 +131,43 @@ fn human_oriented_command_outputs_smoke_cleanly() {
     assert!(cleanup.contains("Cleanup complete"));
 
     let doctor = workspace.run_ok(&["doctor"]).stdout;
-    assert!(doctor.contains("Doctor OK"));
+    assert!(doctor.contains("OK: Doctor OK"));
+}
+
+#[test]
+fn describe_verbose_shows_manifest_and_dataset_internals() {
+    let workspace = ExampleWorkspace::copy(ExampleProject::Revops);
+    workspace.init();
+    workspace.load();
+
+    let output = workspace
+        .run_ok(&["describe", "--type", "Signal", "--verbose"])
+        .stdout;
+    assert!(output.contains("Manifest:"));
+    assert!(output.contains("Schema hash:"));
+    assert!(output.contains("dataset_version="));
+    assert!(output.contains("type_id="));
+}
+
+#[test]
+fn quiet_suppresses_human_output_but_not_machine_formats() {
+    let workspace = ExampleWorkspace::copy(ExampleProject::Revops);
+    workspace.init();
+    workspace.load();
+
+    let version = workspace.run_ok(&["--quiet", "version"]).stdout;
+    assert!(version.trim().is_empty());
+
+    let describe = workspace
+        .run_ok(&["--quiet", "describe", "--type", "Signal"])
+        .stdout;
+    assert!(describe.trim().is_empty());
+
+    let run = workspace.run_ok(&["--quiet", "run", "pipeline"]).stdout;
+    assert!(run.trim().is_empty());
+
+    let json_rows = workspace
+        .run_ok(&["--quiet", "run", "pipeline", "--format", "json"])
+        .stdout;
+    assert!(json_rows.contains('['));
 }

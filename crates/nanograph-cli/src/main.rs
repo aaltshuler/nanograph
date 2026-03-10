@@ -1,22 +1,33 @@
+use std::io::{self, IsTerminal};
 use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
+use std::{error::Error as StdError, fmt};
 
 use ariadne::{Color, Label, Report, ReportKind, Source};
 use arrow_array::RecordBatch;
+use arrow_schema::DataType;
 use clap::{Parser, Subcommand};
 use color_eyre::eyre::{Result, WrapErr, eyre};
+use comfy_table::modifiers::UTF8_ROUND_CORNERS;
+use comfy_table::presets::{ASCII_BORDERS_ONLY_CONDENSED, UTF8_FULL_CONDENSED};
+use comfy_table::{
+    Attribute, Cell, CellAlignment, Color as TableColor, ColumnConstraint, ContentArrangement,
+    Table, Width,
+};
 use tracing::{debug, info, instrument, warn};
 use tracing_subscriber::EnvFilter;
 
 mod config;
 mod metadata;
 mod schema_ops;
+mod ui;
 
 #[cfg(test)]
 mod tests;
 
-use config::LoadedConfig;
+use config::{LoadedConfig, ResolvedRunConfig, TableCellLayout};
 use metadata::{cmd_describe, cmd_export, cmd_version};
 use nanograph::ParamMap;
 use nanograph::error::{NanoError, ParseDiagnostic};
@@ -30,6 +41,10 @@ use nanograph::store::database::{
 };
 use nanograph::store::txlog::{CdcLogEntry, read_visible_cdc_entries};
 use schema_ops::{cmd_migrate, cmd_schema_diff};
+use ui::{
+    StatusTone, format_status_line, stderr_supports_color, stdout_supports_color, style_key,
+    style_label, style_scalar,
+};
 
 #[derive(Parser)]
 #[command(
@@ -41,6 +56,9 @@ struct Cli {
     /// Emit machine-readable JSON output.
     #[arg(long, global = true)]
     json: bool,
+    /// Suppress human-readable stdout output.
+    #[arg(long, short = 'q', global = true)]
+    quiet: bool,
     /// Load defaults from the given nanograph.toml file.
     #[arg(long, global = true)]
     config: Option<PathBuf>,
@@ -67,6 +85,9 @@ enum Commands {
         /// Show a single node or edge type
         #[arg(long = "type")]
         type_name: Option<String>,
+        /// Show manifest and dataset internals in table mode
+        #[arg(long)]
+        verbose: bool,
     },
     /// Export full graph as JSONL or JSON (nodes first, then edges)
     Export {
@@ -210,6 +231,7 @@ enum Commands {
         query: Option<PathBuf>,
         #[arg(long)]
         name: Option<String>,
+        /// Output format: table, kv, csv, jsonl, or json
         #[arg(long)]
         format: Option<String>,
         /// Query parameters (repeatable), e.g. --param name="Alice"
@@ -241,21 +263,45 @@ async fn main() -> Result<()> {
     init_tracing();
 
     let cli = Cli::parse();
-    let config = LoadedConfig::load(cli.config.as_deref())?;
+    let config = match LoadedConfig::load(cli.config.as_deref()) {
+        Ok(config) => config,
+        Err(error) => return finish_cli_failure(CliFailure::new(cli.json, false, error)),
+    };
     load_dotenv_for_process(&config.base_dir);
-    config.apply_embedding_env_for_process()?;
+    if let Err(error) = config.apply_embedding_env_for_process() {
+        return finish_cli_failure(CliFailure::new(cli.json, false, error));
+    }
     let json = config.effective_json(cli.json);
+    let quiet = cli.quiet;
 
-    match cli.command {
-        Commands::Version { db } => cmd_version(config.resolve_optional_db_path(db), json).await,
+    match dispatch_cli(cli.command, &config, json, quiet).await {
+        Ok(()) => Ok(()),
+        Err(failure) => {
+            let rendered = failure.downcast_ref::<RenderedJsonError>().is_some();
+            finish_cli_failure(CliFailure::new(json, rendered, failure))
+        }
+    }
+}
+
+async fn dispatch_cli(
+    command: Commands,
+    config: &LoadedConfig,
+    json: bool,
+    quiet: bool,
+) -> Result<()> {
+    match command {
+        Commands::Version { db } => {
+            cmd_version(config.resolve_optional_db_path(db), json, quiet).await
+        }
         Commands::Describe {
             db,
             format,
             type_name,
+            verbose,
         } => {
             let db = config.resolve_db_path(db)?;
             let format = config.resolve_format(format.as_deref(), "table", &["table", "json"])?;
-            cmd_describe(db, &format, json, type_name.as_deref()).await
+            cmd_describe(db, &format, json, type_name.as_deref(), verbose, quiet).await
         }
         Commands::Export { db, format } => {
             let db = config.resolve_db_path(db)?;
@@ -268,12 +314,12 @@ async fn main() -> Result<()> {
             format,
         } => {
             let format = config.resolve_format(format.as_deref(), "table", &["table", "json"])?;
-            cmd_schema_diff(&from_schema, &to_schema, &format, json).await
+            cmd_schema_diff(&from_schema, &to_schema, &format, json, quiet).await
         }
         Commands::Init { db_path, schema } => {
             let db_path = config.resolve_db_path(db_path)?;
             let schema = config.resolve_schema_path(schema)?;
-            cmd_init(&db_path, &schema, json).await
+            cmd_init(&db_path, &schema, json, quiet).await
         }
         Commands::Load {
             db_path,
@@ -281,7 +327,7 @@ async fn main() -> Result<()> {
             mode,
         } => {
             let db_path = config.resolve_db_path(db_path)?;
-            cmd_load(&db_path, &data, mode, json).await
+            cmd_load(&db_path, &data, mode, json, quiet).await
         }
         Commands::Delete {
             db_path,
@@ -289,7 +335,7 @@ async fn main() -> Result<()> {
             predicate,
         } => {
             let db_path = config.resolve_db_path(db_path)?;
-            cmd_delete(&db_path, &type_name, &predicate, json).await
+            cmd_delete(&db_path, &type_name, &predicate, json, quiet).await
         }
         Commands::Changes {
             db_path,
@@ -315,6 +361,7 @@ async fn main() -> Result<()> {
                 materialize_deletions,
                 materialize_deletions_threshold,
                 json,
+                quiet,
             )
             .await
         }
@@ -324,11 +371,18 @@ async fn main() -> Result<()> {
             retain_dataset_versions,
         } => {
             let db_path = config.resolve_db_path(db_path)?;
-            cmd_cleanup(&db_path, retain_tx_versions, retain_dataset_versions, json).await
+            cmd_cleanup(
+                &db_path,
+                retain_tx_versions,
+                retain_dataset_versions,
+                json,
+                quiet,
+            )
+            .await
         }
         Commands::Doctor { db_path } => {
             let db_path = config.resolve_db_path(db_path)?;
-            cmd_doctor(&db_path, json).await
+            cmd_doctor(&db_path, json, quiet).await
         }
         Commands::CdcMaterialize {
             db_path,
@@ -336,7 +390,7 @@ async fn main() -> Result<()> {
             force,
         } => {
             let db_path = config.resolve_db_path(db_path)?;
-            cmd_cdc_materialize(&db_path, min_new_rows, force, json).await
+            cmd_cdc_materialize(&db_path, min_new_rows, force, json, quiet).await
         }
         Commands::Migrate {
             db_path,
@@ -346,12 +400,12 @@ async fn main() -> Result<()> {
         } => {
             let db_path = config.resolve_db_path(db_path)?;
             let format = config.resolve_format(format.as_deref(), "table", &["table", "json"])?;
-            cmd_migrate(&db_path, dry_run, &format, auto_approve, json).await
+            cmd_migrate(&db_path, dry_run, &format, auto_approve, json, quiet).await
         }
         Commands::Check { db, query } => {
             let db = config.resolve_db_path(db)?;
             let query = config.resolve_query_path(&query)?;
-            cmd_check(db, &query, json).await
+            cmd_check(db, &query, json, quiet).await
         }
         Commands::Run {
             alias,
@@ -373,18 +427,60 @@ async fn main() -> Result<()> {
                 merge_run_params(alias.as_deref(), &run.positional_param_names, args, params)?;
             cmd_run(
                 db,
-                &run.query_path,
-                &run.query_name,
-                &run.format,
+                &run,
+                config.effective_table_max_column_width(),
+                config.effective_table_cell_layout(),
                 params,
                 json,
+                quiet,
             )
             .await
         }
-    }?;
-
-    Ok(())
+    }
 }
+
+fn finish_cli_failure(failure: CliFailure) -> Result<()> {
+    if failure.json {
+        if !failure.rendered {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "status": "error",
+                    "message": failure.error.to_string(),
+                })
+            );
+        }
+        std::process::exit(1);
+    }
+    Err(failure.error)
+}
+
+struct CliFailure {
+    json: bool,
+    rendered: bool,
+    error: color_eyre::eyre::Report,
+}
+
+impl CliFailure {
+    fn new(json: bool, rendered: bool, error: color_eyre::eyre::Report) -> Self {
+        Self {
+            json,
+            rendered,
+            error,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RenderedJsonError(String);
+
+impl fmt::Display for RenderedJsonError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl StdError for RenderedJsonError {}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct DotenvLoadStats {
@@ -658,7 +754,7 @@ fn parse_query_or_report(path: &Path, source: &str) -> Result<nanograph::query::
 }
 
 #[instrument(skip(schema_path), fields(db_path = %db_path.display()))]
-async fn cmd_init(db_path: &Path, schema_path: &Path, json: bool) -> Result<()> {
+async fn cmd_init(db_path: &Path, schema_path: &Path, json: bool, quiet: bool) -> Result<()> {
     let schema_src = std::fs::read_to_string(schema_path)
         .wrap_err_with(|| format!("failed to read schema: {}", schema_path.display()))?;
     let _ = parse_schema_or_report(schema_path, &schema_src)?;
@@ -682,10 +778,25 @@ async fn cmd_init(db_path: &Path, schema_path: &Path, json: bool) -> Result<()> 
                     .collect::<Vec<_>>(),
             })
         );
-    } else {
-        println!("Initialized database at {}", db_path.display());
+    } else if !quiet {
+        let color = stdout_supports_color();
+        println!(
+            "{}",
+            format_status_line(
+                StatusTone::Ok,
+                &format!("Initialized database at {}", db_path.display()),
+                color
+            )
+        );
         for path in &generated_files {
-            println!("Generated {}", path.display());
+            println!(
+                "{}",
+                format_status_line(
+                    StatusTone::Info,
+                    &format!("Generated {}", path.display()),
+                    color
+                )
+            );
         }
     }
     Ok(())
@@ -773,6 +884,9 @@ fn default_nanograph_toml(project_dir: &Path, db_path: &Path, schema_path: &Path
          batch_size = 64\n\
          chunk_size = 0\n\
          chunk_overlap_chars = 128\n\n\
+         [cli]\n\
+         table_max_column_width = 80\n\n\
+         table_cell_layout = \"truncate\"\n\n\
          # Example:\n\
          # [query_aliases.search]\n\
          # query = \"queries/search.gq\"\n\
@@ -800,7 +914,13 @@ const DEFAULT_DOTENV_NANO: &str = "\
 # NANOGRAPH_EMBEDDINGS_MOCK=1\n";
 
 #[instrument(skip(data_path), fields(db_path = %db_path.display(), mode = ?mode))]
-async fn cmd_load(db_path: &Path, data_path: &Path, mode: LoadModeArg, json: bool) -> Result<()> {
+async fn cmd_load(
+    db_path: &Path,
+    data_path: &Path,
+    mode: LoadModeArg,
+    json: bool,
+    quiet: bool,
+) -> Result<()> {
     let db = Database::open(db_path).await?;
 
     if let Err(err) = db.load_file_with_mode(data_path, mode.into()).await {
@@ -819,8 +939,15 @@ async fn cmd_load(db_path: &Path, data_path: &Path, mode: LoadModeArg, json: boo
                 "mode": format!("{:?}", mode).to_lowercase(),
             })
         );
-    } else {
-        println!("Loaded data into {}", db_path.display());
+    } else if !quiet {
+        println!(
+            "{}",
+            format_status_line(
+                StatusTone::Ok,
+                &format!("Loaded data into {}", db_path.display()),
+                stdout_supports_color()
+            )
+        );
     }
     Ok(())
 }
@@ -833,37 +960,36 @@ fn render_load_error(db_path: &Path, err: &NanoError, json: bool) {
         first_row,
         second_row,
     } = err
+        && !json
     {
-        if json {
-            eprintln!(
-                "{}",
-                serde_json::json!({
-                    "status": "error",
-                    "error_kind": "unique_constraint",
-                    "db_path": db_path.display().to_string(),
-                    "type_name": type_name,
-                    "property": property,
-                    "value": value,
-                    "first_row": first_row,
-                    "second_row": second_row,
-                })
-            );
-        } else {
-            eprintln!("Load failed for {}.", db_path.display());
-            eprintln!(
-                "Unique constraint violation: {}.{} has duplicate value '{}'.",
-                type_name, property, value
-            );
-            eprintln!(
-                "Conflicting rows in loaded dataset: {} and {}.",
-                first_row, second_row
-            );
-        }
+        let color = stderr_supports_color();
+        eprintln!(
+            "{}",
+            format_status_line(
+                StatusTone::Error,
+                &format!("Load failed for {}.", db_path.display()),
+                color
+            )
+        );
+        eprintln!(
+            "  Unique constraint violation: {}.{} has duplicate value '{}'.",
+            type_name, property, value
+        );
+        eprintln!(
+            "  Conflicting rows in loaded dataset: {} and {}.",
+            first_row, second_row
+        );
     }
 }
 
 #[instrument(skip(type_name, predicate), fields(db_path = %db_path.display(), type_name = type_name))]
-async fn cmd_delete(db_path: &Path, type_name: &str, predicate: &str, json: bool) -> Result<()> {
+async fn cmd_delete(
+    db_path: &Path,
+    type_name: &str,
+    predicate: &str,
+    json: bool,
+    quiet: bool,
+) -> Result<()> {
     let pred = parse_delete_predicate(predicate)?;
     let db = Database::open(db_path).await?;
     let result = db.delete_nodes(type_name, &pred).await?;
@@ -884,12 +1010,19 @@ async fn cmd_delete(db_path: &Path, type_name: &str, predicate: &str, json: bool
                 "deleted_edges": result.deleted_edges,
             })
         );
-    } else {
+    } else if !quiet {
         println!(
-            "Deleted {} node(s) and {} edge(s) in {}",
-            result.deleted_nodes,
-            result.deleted_edges,
-            db_path.display()
+            "{}",
+            format_status_line(
+                StatusTone::Ok,
+                &format!(
+                    "Deleted {} node(s) and {} edge(s) in {}",
+                    result.deleted_nodes,
+                    result.deleted_edges,
+                    db_path.display()
+                ),
+                stdout_supports_color()
+            )
         );
     }
     Ok(())
@@ -998,6 +1131,7 @@ async fn cmd_compact(
     materialize_deletions: bool,
     materialize_deletions_threshold: f32,
     json: bool,
+    quiet: bool,
 ) -> Result<()> {
     let db = Database::open(db_path).await?;
     let result = db
@@ -1023,16 +1157,23 @@ async fn cmd_compact(
                 "manifest_committed": result.manifest_committed,
             })
         );
-    } else {
+    } else if !quiet {
         println!(
-            "Compaction complete for {} (datasets compacted: {}, fragments -{} +{}, files -{} +{}, manifest committed: {})",
-            db_path.display(),
-            result.datasets_compacted,
-            result.fragments_removed,
-            result.fragments_added,
-            result.files_removed,
-            result.files_added,
-            result.manifest_committed
+            "{}",
+            format_status_line(
+                StatusTone::Ok,
+                &format!(
+                    "Compaction complete for {} (datasets compacted: {}, fragments -{} +{}, files -{} +{}, manifest committed: {})",
+                    db_path.display(),
+                    result.datasets_compacted,
+                    result.fragments_removed,
+                    result.fragments_added,
+                    result.files_removed,
+                    result.files_added,
+                    result.manifest_committed
+                ),
+                stdout_supports_color()
+            )
         );
     }
     Ok(())
@@ -1050,6 +1191,7 @@ async fn cmd_cleanup(
     retain_tx_versions: u64,
     retain_dataset_versions: usize,
     json: bool,
+    quiet: bool,
 ) -> Result<()> {
     let db = Database::open(db_path).await?;
     let result = db
@@ -1074,15 +1216,22 @@ async fn cmd_cleanup(
                 "dataset_bytes_removed": result.dataset_bytes_removed,
             })
         );
-    } else {
+    } else if !quiet {
         println!(
-            "Cleanup complete for {} (tx removed {}, cdc removed {}, datasets cleaned {}, old versions removed {}, bytes removed {})",
-            db_path.display(),
-            result.tx_rows_removed,
-            result.cdc_rows_removed,
-            result.datasets_cleaned,
-            result.dataset_old_versions_removed,
-            result.dataset_bytes_removed
+            "{}",
+            format_status_line(
+                StatusTone::Ok,
+                &format!(
+                    "Cleanup complete for {} (tx removed {}, cdc removed {}, datasets cleaned {}, old versions removed {}, bytes removed {})",
+                    db_path.display(),
+                    result.tx_rows_removed,
+                    result.cdc_rows_removed,
+                    result.datasets_cleaned,
+                    result.dataset_old_versions_removed,
+                    result.dataset_bytes_removed
+                ),
+                stdout_supports_color()
+            )
         );
     }
 
@@ -1101,6 +1250,7 @@ async fn cmd_cdc_materialize(
     min_new_rows: usize,
     force: bool,
     json: bool,
+    quiet: bool,
 ) -> Result<()> {
     let db = Database::open(db_path).await?;
     let result = db
@@ -1125,28 +1275,38 @@ async fn cmd_cdc_materialize(
                 "dataset_version": result.dataset_version,
             })
         );
-    } else if result.skipped_by_threshold {
-        println!(
-            "CDC analytics materialization skipped for {} (new rows {}, threshold {})",
-            db_path.display(),
-            result.new_rows_since_last_run,
-            min_new_rows
-        );
-    } else {
-        println!(
-            "CDC analytics materialized for {} (rows {}, dataset written {}, version {:?})",
-            db_path.display(),
-            result.materialized_rows,
-            result.dataset_written,
-            result.dataset_version
-        );
+    } else if !quiet {
+        let color = stdout_supports_color();
+        let (tone, message) = if result.skipped_by_threshold {
+            (
+                StatusTone::Skip,
+                format!(
+                    "CDC analytics materialization skipped for {} (new rows {}, threshold {})",
+                    db_path.display(),
+                    result.new_rows_since_last_run,
+                    min_new_rows
+                ),
+            )
+        } else {
+            (
+                StatusTone::Ok,
+                format!(
+                    "CDC analytics materialized for {} (rows {}, dataset written {}, version {:?})",
+                    db_path.display(),
+                    result.materialized_rows,
+                    result.dataset_written,
+                    result.dataset_version
+                ),
+            )
+        };
+        println!("{}", format_status_line(tone, &message, color));
     }
 
     Ok(())
 }
 
 #[instrument(fields(db_path = %db_path.display()))]
-async fn cmd_doctor(db_path: &Path, json: bool) -> Result<()> {
+async fn cmd_doctor(db_path: &Path, json: bool, quiet: bool) -> Result<()> {
     let db = Database::open(db_path).await?;
     let report = db.doctor().await?;
 
@@ -1166,30 +1326,63 @@ async fn cmd_doctor(db_path: &Path, json: bool) -> Result<()> {
             })
         );
     } else {
-        if report.healthy {
-            println!(
-                "Doctor OK for {} (db_version {}, datasets checked {}, tx rows {}, cdc rows {})",
-                db_path.display(),
-                report.manifest_db_version,
-                report.datasets_checked,
-                report.tx_rows,
-                report.cdc_rows
-            );
+        let use_stderr = quiet && !report.healthy;
+        let color = if use_stderr {
+            stderr_supports_color()
         } else {
-            println!(
-                "Doctor found issues for {} (db_version {}, datasets checked {}, tx rows {}, cdc rows {})",
-                db_path.display(),
-                report.manifest_db_version,
-                report.datasets_checked,
-                report.tx_rows,
-                report.cdc_rows
-            );
-            for issue in &report.issues {
-                println!("ISSUE: {}", issue);
+            stdout_supports_color()
+        };
+        if report.healthy {
+            if !quiet {
+                println!(
+                    "{}",
+                    format_status_line(
+                        StatusTone::Ok,
+                        &format!(
+                            "Doctor OK for {} (db_version {}, datasets checked {}, tx rows {}, cdc rows {})",
+                            db_path.display(),
+                            report.manifest_db_version,
+                            report.datasets_checked,
+                            report.tx_rows,
+                            report.cdc_rows
+                        ),
+                        color
+                    )
+                );
+                for warning in &report.warnings {
+                    println!("{}", format_status_line(StatusTone::Warn, warning, color));
+                }
             }
-        }
-        for warning in &report.warnings {
-            println!("WARN: {}", warning);
+        } else {
+            let summary = format_status_line(
+                StatusTone::Error,
+                &format!(
+                    "Doctor found issues for {} (db_version {}, datasets checked {}, tx rows {}, cdc rows {})",
+                    db_path.display(),
+                    report.manifest_db_version,
+                    report.datasets_checked,
+                    report.tx_rows,
+                    report.cdc_rows
+                ),
+                color,
+            );
+            if use_stderr {
+                eprintln!("{}", summary);
+                for issue in &report.issues {
+                    eprintln!("{}", format_status_line(StatusTone::Error, issue, color));
+                }
+                for warning in &report.warnings {
+                    eprintln!("{}", format_status_line(StatusTone::Warn, warning, color));
+                }
+            } else {
+                println!("{}", summary);
+                for issue in &report.issues {
+                    println!("{}", format_status_line(StatusTone::Error, issue, color));
+                }
+                for warning in &report.warnings {
+                    println!("{}", format_status_line(StatusTone::Warn, warning, color));
+                }
+            }
         }
     }
 
@@ -1201,7 +1394,7 @@ async fn cmd_doctor(db_path: &Path, json: bool) -> Result<()> {
 }
 
 #[instrument(skip(query_path), fields(db_path = %db_path.display(), query_path = %query_path.display()))]
-async fn cmd_check(db_path: PathBuf, query_path: &PathBuf, json: bool) -> Result<()> {
+async fn cmd_check(db_path: PathBuf, query_path: &PathBuf, json: bool, quiet: bool) -> Result<()> {
     let query_src = std::fs::read_to_string(query_path)
         .wrap_err_with(|| format!("failed to read query: {}", query_path.display()))?;
     let db = Database::open(&db_path).await?;
@@ -1214,8 +1407,15 @@ async fn cmd_check(db_path: PathBuf, query_path: &PathBuf, json: bool) -> Result
     for q in &queries.queries {
         match typecheck_query_decl(&catalog, q) {
             Ok(CheckedQuery::Read(_)) => {
-                if !json {
-                    println!("OK: query `{}` (read)", q.name);
+                if !json && !quiet {
+                    println!(
+                        "{}",
+                        format_status_line(
+                            StatusTone::Ok,
+                            &format!("query `{}` (read)", q.name),
+                            stdout_supports_color()
+                        )
+                    );
                 }
                 checks.push(serde_json::json!({
                     "name": q.name,
@@ -1224,8 +1424,15 @@ async fn cmd_check(db_path: PathBuf, query_path: &PathBuf, json: bool) -> Result
                 }));
             }
             Ok(CheckedQuery::Mutation(_)) => {
-                if !json {
-                    println!("OK: query `{}` (mutation)", q.name);
+                if !json && !quiet {
+                    println!(
+                        "{}",
+                        format_status_line(
+                            StatusTone::Ok,
+                            &format!("query `{}` (mutation)", q.name),
+                            stdout_supports_color()
+                        )
+                    );
                 }
                 checks.push(serde_json::json!({
                     "name": q.name,
@@ -1235,7 +1442,20 @@ async fn cmd_check(db_path: PathBuf, query_path: &PathBuf, json: bool) -> Result
             }
             Err(e) => {
                 if !json {
-                    println!("ERROR: query `{}`: {}", q.name, e);
+                    let message = format_status_line(
+                        StatusTone::Error,
+                        &format!("query `{}`: {}", q.name, e),
+                        if quiet {
+                            stderr_supports_color()
+                        } else {
+                            stdout_supports_color()
+                        },
+                    );
+                    if quiet {
+                        eprintln!("{}", message);
+                    } else {
+                        println!("{}", message);
+                    }
                 }
                 checks.push(serde_json::json!({
                     "name": q.name,
@@ -1259,53 +1479,89 @@ async fn cmd_check(db_path: PathBuf, query_path: &PathBuf, json: bool) -> Result
                 "results": checks,
             })
         );
-    } else {
+    } else if !quiet {
         println!(
-            "Check complete: {} queries processed",
-            queries.queries.len()
+            "{}",
+            format_status_line(
+                StatusTone::Info,
+                &format!(
+                    "Check complete: {} queries processed",
+                    queries.queries.len()
+                ),
+                stdout_supports_color()
+            )
         );
     }
     if error_count > 0 {
+        if json {
+            return Err(RenderedJsonError(format!("{} query(s) failed typecheck", error_count)).into());
+        }
         return Err(eyre!("{} query(s) failed typecheck", error_count));
     }
     Ok(())
 }
 
 #[instrument(
-    skip(query_path, format, raw_params),
-    fields(db_path = %db_path.display(), query_name = query_name, query_path = %query_path.display(), format = format)
+    skip(run, raw_params),
+    fields(
+        db_path = %db_path.display(),
+        query_name = %run.query_name,
+        query_path = %run.query_path.display(),
+        format = %run.format
+    )
 )]
 async fn cmd_run(
     db_path: PathBuf,
-    query_path: &PathBuf,
-    query_name: &str,
-    format: &str,
+    run: &ResolvedRunConfig,
+    table_max_column_width: usize,
+    table_cell_layout: TableCellLayout,
     raw_params: Vec<(String, String)>,
     json: bool,
+    quiet: bool,
 ) -> Result<()> {
-    let query_src = std::fs::read_to_string(query_path)
-        .wrap_err_with(|| format!("failed to read query: {}", query_path.display()))?;
+    let query_src = std::fs::read_to_string(&run.query_path)
+        .wrap_err_with(|| format!("failed to read query: {}", run.query_path.display()))?;
 
     // Parse queries and find the named one
-    let queries = parse_query_or_report(query_path, &query_src)?;
+    let queries = parse_query_or_report(&run.query_path, &query_src)?;
     let query = queries
         .queries
         .iter()
-        .find(|q| q.name == query_name)
-        .ok_or_else(|| eyre!("query `{}` not found", query_name))?;
+        .find(|q| q.name == run.query_name)
+        .ok_or_else(|| eyre!("query `{}` not found", run.query_name))?;
     info!("executing query");
 
     // Build param map from CLI args, using query param type info for inference
     let param_map = build_param_map(&query.params, &raw_params)?;
 
-    let effective_format = if json { "json" } else { format };
-    if let Some(preamble) = query_execution_preamble(query, effective_format, json) {
+    let effective_format = if json { "json" } else { run.format.as_str() };
+    let human_output = !quiet || !is_human_run_format(effective_format);
+    if human_output && let Some(preamble) = query_execution_preamble(query, effective_format, json)
+    {
         print!("{}", preamble);
     }
     let db = Database::open(&db_path).await?;
+    let started = Instant::now();
     let run_result = db.run_query(query, &param_map).await?;
     let results = run_result.into_record_batches()?;
-    render_results(effective_format, &results)
+    let elapsed = started.elapsed();
+    if human_output {
+        render_results(
+            query,
+            effective_format,
+            &results,
+            table_max_column_width,
+            table_cell_layout,
+        )?;
+    }
+    if human_output && effective_format == "table" {
+        print_table_footer(&results, elapsed);
+    }
+    Ok(())
+}
+
+fn is_human_run_format(format: &str) -> bool {
+    matches!(format, "table" | "kv")
 }
 
 fn query_execution_preamble(
@@ -1313,7 +1569,7 @@ fn query_execution_preamble(
     format: &str,
     json: bool,
 ) -> Option<String> {
-    if json || format != "table" {
+    if json || !matches!(format, "table" | "kv") {
         return None;
     }
     let has_metadata = query.description.is_some() || query.instruction.is_some();
@@ -1321,79 +1577,462 @@ fn query_execution_preamble(
         return None;
     }
 
-    let mut lines = vec![format!("Query: {}", query.name)];
+    let color = stdout_supports_color();
+    let mut lines = vec![format!("{} {}", style_label("Query:", color), query.name)];
     if let Some(description) = &query.description {
-        lines.push(format!("Description: {}", description));
+        lines.push(format!(
+            "{} {}",
+            style_label("Description:", color),
+            description
+        ));
     }
     if let Some(instruction) = &query.instruction {
-        lines.push(format!("Instruction: {}", instruction));
+        lines.push(format!(
+            "{} {}",
+            style_label("Instruction:", color),
+            instruction
+        ));
     }
     Some(format!("{}\n\n", lines.join("\n")))
 }
 
-fn render_results(format: &str, results: &[RecordBatch]) -> Result<()> {
+fn render_results(
+    query: &nanograph::query::ast::QueryDecl,
+    format: &str,
+    results: &[RecordBatch],
+    table_max_column_width: usize,
+    table_cell_layout: TableCellLayout,
+) -> Result<()> {
     match format {
         "table" => {
-            if results.is_empty() {
-                println!("(empty result)");
-            } else {
-                let formatted = arrow_cast::pretty::pretty_format_batches(results)
-                    .wrap_err("failed to render table output")?;
-                println!("{}", formatted);
-            }
+            print!(
+                "{}",
+                format_table(results, table_max_column_width, table_cell_layout)
+            );
+        }
+        "kv" => {
+            print_kv(results);
         }
         "csv" => {
-            for batch in results {
-                print_csv(batch);
-            }
+            print!("{}", format_csv(results));
         }
         "jsonl" => {
-            for batch in results {
-                print_jsonl(batch);
-            }
+            print!("{}", format_jsonl_with_query(query, results)?);
         }
         "json" => {
-            print_json(results)?;
+            print_json_with_query(query, results)?;
         }
         _ => return Err(eyre!("unknown format: {}", format)),
     }
     Ok(())
 }
 
-fn print_csv(batch: &RecordBatch) {
-    let schema = batch.schema();
-    let header: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-    println!("{}", header.join(","));
-
-    for row in 0..batch.num_rows() {
-        let mut values = Vec::new();
-        for col in 0..batch.num_columns() {
-            let col_arr = batch.column(col);
-            values
-                .push(arrow_cast::display::array_value_to_string(col_arr, row).unwrap_or_default());
-        }
-        println!("{}", values.join(","));
-    }
+fn print_table_footer(results: &[RecordBatch], elapsed: Duration) {
+    let rows: usize = results.iter().map(RecordBatch::num_rows).sum();
+    println!("({} rows, {})", rows, format_elapsed(elapsed));
 }
 
-fn print_jsonl(batch: &RecordBatch) {
-    let schema = batch.schema();
-    for row in 0..batch.num_rows() {
-        let mut map = serde_json::Map::new();
-        for (col_idx, field) in schema.fields().iter().enumerate() {
-            let col_arr = batch.column(col_idx);
-            let val = arrow_cast::display::array_value_to_string(col_arr, row).unwrap_or_default();
-            map.insert(field.name().clone(), serde_json::Value::String(val));
-        }
-        println!("{}", serde_json::Value::Object(map));
-    }
-}
-
-fn print_json(results: &[RecordBatch]) -> Result<()> {
+fn print_kv(results: &[RecordBatch]) {
     let rows = nanograph::json_output::record_batches_to_json_rows(results);
-    let out = serde_json::to_string_pretty(&rows).wrap_err("failed to serialize JSON output")?;
+    print!("{}", format_kv_rows(&rows, stdout_supports_color()));
+}
+
+fn format_table(
+    results: &[RecordBatch],
+    table_max_column_width: usize,
+    table_cell_layout: TableCellLayout,
+) -> String {
+    if results.is_empty() {
+        return "(empty result)\n".to_string();
+    }
+
+    let mut table = Table::new();
+    table
+        .load_preset(if io::stdout().is_terminal() {
+            UTF8_FULL_CONDENSED
+        } else {
+            ASCII_BORDERS_ONLY_CONDENSED
+        })
+        .apply_modifier(UTF8_ROUND_CORNERS)
+        .set_content_arrangement(ContentArrangement::Dynamic);
+    if matches!(table_cell_layout, TableCellLayout::Wrap) {
+        let column_count = results[0].num_columns() as u16;
+        if column_count > 0 {
+            let content_width = table_max_column_width.max(1) as u16;
+            table.set_constraints(std::iter::repeat_n(
+                ColumnConstraint::UpperBoundary(Width::Fixed(content_width)),
+                column_count.into(),
+            ));
+            let estimated_total_width = column_count
+                .saturating_mul(content_width.saturating_add(3))
+                .saturating_add(1);
+            table.set_width(estimated_total_width);
+        }
+    }
+
+    let schema = results[0].schema();
+    let header = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let mut cell = Cell::new(field.name().as_str()).add_attribute(Attribute::Bold);
+            if stdout_supports_color() {
+                cell = cell.fg(TableColor::Cyan);
+            }
+            if is_numeric_type(field.data_type()) {
+                cell = cell.set_alignment(CellAlignment::Right);
+            }
+            cell
+        })
+        .collect::<Vec<_>>();
+    table.set_header(header);
+
+    for batch in results {
+        for row_idx in 0..batch.num_rows() {
+            let row = batch
+                .schema()
+                .fields()
+                .iter()
+                .enumerate()
+                .map(|(col_idx, field)| {
+                    let value =
+                        arrow_cast::display::array_value_to_string(batch.column(col_idx), row_idx)
+                            .unwrap_or_default();
+                    let rendered = match table_cell_layout {
+                        TableCellLayout::Truncate => {
+                            format_table_cell_value(&value, table_max_column_width)
+                        }
+                        TableCellLayout::Wrap => compact_whitespace(&value),
+                    };
+                    let mut cell = Cell::new(rendered);
+                    if is_numeric_type(field.data_type()) {
+                        cell = cell.set_alignment(CellAlignment::Right);
+                    }
+                    cell
+                })
+                .collect::<Vec<_>>();
+            table.add_row(row);
+        }
+    }
+
+    format!("{}\n", table)
+}
+
+fn format_table_cell_value(value: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return compact_whitespace(value);
+    }
+
+    let compacted = compact_whitespace(value);
+    let char_count = compacted.chars().count();
+    if char_count <= max_width {
+        return compacted;
+    }
+
+    if max_width <= 3 {
+        return ".".repeat(max_width);
+    }
+
+    let truncated: String = compacted.chars().take(max_width - 3).collect();
+    format!("{truncated}...")
+}
+
+fn compact_whitespace(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn is_numeric_type(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _)
+    )
+}
+
+fn format_elapsed(elapsed: Duration) -> String {
+    if elapsed.as_millis() < 1_000 {
+        format!("{}ms", elapsed.as_millis())
+    } else {
+        format!("{:.2}s", elapsed.as_secs_f64())
+    }
+}
+
+fn format_csv(results: &[RecordBatch]) -> String {
+    let Some(first_batch) = results.first() else {
+        return String::new();
+    };
+
+    let schema = first_batch.schema();
+    let header = schema
+        .fields()
+        .iter()
+        .map(|field| escape_csv_field(field.name()))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let mut out = String::new();
+    out.push_str(&header);
+    out.push('\n');
+
+    for batch in results {
+        for row in 0..batch.num_rows() {
+            let mut values = Vec::with_capacity(batch.num_columns());
+            for col in 0..batch.num_columns() {
+                let col_arr = batch.column(col);
+                let value =
+                    arrow_cast::display::array_value_to_string(col_arr, row).unwrap_or_default();
+                values.push(escape_csv_field(&value));
+            }
+            out.push_str(&values.join(","));
+            out.push('\n');
+        }
+    }
+
+    out
+}
+
+fn escape_csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+#[cfg(test)]
+fn format_jsonl(results: &[RecordBatch]) -> Result<String> {
+    let rows = nanograph::json_output::record_batches_to_json_rows(results);
+    let mut out = String::new();
+    for row in rows {
+        let line = serde_json::to_string(&row).wrap_err("failed to serialize JSONL output")?;
+        out.push_str(&line);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+fn format_jsonl_with_query(
+    query: &nanograph::query::ast::QueryDecl,
+    results: &[RecordBatch],
+) -> Result<String> {
+    let rows = nanograph::json_output::record_batches_to_json_rows(results);
+    let mut out = String::new();
+    let metadata = serde_json::json!({
+        "$nanograph": {
+            "query": query_metadata_json(query),
+        }
+    });
+    let metadata_line =
+        serde_json::to_string(&metadata).wrap_err("failed to serialize JSONL metadata")?;
+    out.push_str(&metadata_line);
+    out.push('\n');
+    for row in rows {
+        let line = serde_json::to_string(&row).wrap_err("failed to serialize JSONL output")?;
+        out.push_str(&line);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+fn print_json_with_query(
+    query: &nanograph::query::ast::QueryDecl,
+    results: &[RecordBatch],
+) -> Result<()> {
+    let rows = nanograph::json_output::record_batches_to_json_rows(results);
+    let out = serde_json::to_string_pretty(&serde_json::json!({
+        "$nanograph": {
+            "query": query_metadata_json(query),
+        },
+        "rows": rows,
+    }))
+    .wrap_err("failed to serialize JSON output")?;
     println!("{}", out);
     Ok(())
+}
+
+fn query_metadata_json(query: &nanograph::query::ast::QueryDecl) -> serde_json::Value {
+    let mut query_json = serde_json::Map::new();
+    query_json.insert(
+        "name".to_string(),
+        serde_json::Value::String(query.name.clone()),
+    );
+    if let Some(description) = &query.description {
+        query_json.insert(
+            "description".to_string(),
+            serde_json::Value::String(description.clone()),
+        );
+    }
+    if let Some(instruction) = &query.instruction {
+        query_json.insert(
+            "instruction".to_string(),
+            serde_json::Value::String(instruction.clone()),
+        );
+    }
+    serde_json::Value::Object(query_json)
+}
+
+fn format_kv_rows(rows: &[serde_json::Value], color: bool) -> String {
+    if rows.is_empty() {
+        return "(empty result)\n".to_string();
+    }
+
+    let mut out = String::new();
+    for (idx, row) in rows.iter().enumerate() {
+        if idx > 0 {
+            out.push('\n');
+            out.push_str(&render_kv_row_separator(color));
+            out.push('\n');
+            out.push('\n');
+        }
+        match row {
+            serde_json::Value::Object(map) => {
+                out.push_str(&render_kv_row_header(idx + 1, map, color));
+                out.push('\n');
+                format_kv_object(&mut out, map, 0, color);
+            }
+            other => {
+                out.push_str(&render_kv_row_header(
+                    idx + 1,
+                    &serde_json::Map::new(),
+                    color,
+                ));
+                out.push('\n');
+                out.push_str(&render_kv_scalar(other, color));
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
+fn render_kv_row_header(
+    row_number: usize,
+    map: &serde_json::Map<String, serde_json::Value>,
+    color: bool,
+) -> String {
+    let type_name = map.get("type").and_then(kv_header_scalar);
+    let identity = ["slug", "id", "name"]
+        .into_iter()
+        .find_map(|key| map.get(key).and_then(kv_header_scalar));
+
+    let header = match (type_name, identity) {
+        (Some(type_name), Some(identity)) => format!("{type_name}: {identity}"),
+        (Some(type_name), None) => format!("Row {row_number}: {type_name}"),
+        (None, Some(identity)) => format!("Row {row_number}: {identity}"),
+        (None, None) => format!("Row {row_number}"),
+    };
+
+    if color {
+        format!("\x1b[1;36m{header}\x1b[0m")
+    } else {
+        header
+    }
+}
+
+fn kv_header_scalar(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(text) if !text.is_empty() => Some(text.clone()),
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        serde_json::Value::Bool(boolean) => Some(boolean.to_string()),
+        _ => None,
+    }
+}
+
+fn render_kv_row_separator(color: bool) -> String {
+    let separator = "────────────────────────";
+    if color {
+        format!("\x1b[2m{separator}\x1b[0m")
+    } else {
+        separator.to_string()
+    }
+}
+
+fn format_kv_object(
+    out: &mut String,
+    map: &serde_json::Map<String, serde_json::Value>,
+    indent: usize,
+    color: bool,
+) {
+    let key_width = map.keys().map(|key| key.chars().count()).max().unwrap_or(0);
+    for (key, value) in map {
+        format_kv_entry(out, key, value, indent, key_width, color);
+    }
+}
+
+fn format_kv_entry(
+    out: &mut String,
+    key: &str,
+    value: &serde_json::Value,
+    indent: usize,
+    key_width: usize,
+    color: bool,
+) {
+    out.push_str(&" ".repeat(indent));
+    let padded_key = format!("{key:width$}", width = key_width);
+    out.push_str(&style_key(&padded_key, color));
+    out.push(':');
+
+    match value {
+        serde_json::Value::Array(items) if !items.is_empty() => {
+            out.push('\n');
+            format_kv_array(out, items, indent + 2, color);
+        }
+        serde_json::Value::Object(map) if !map.is_empty() => {
+            out.push('\n');
+            format_kv_object(out, map, indent + 2, color);
+        }
+        _ => {
+            out.push(' ');
+            out.push_str(&render_kv_scalar(value, color));
+            out.push('\n');
+        }
+    }
+}
+
+fn format_kv_array(out: &mut String, items: &[serde_json::Value], indent: usize, color: bool) {
+    for item in items {
+        out.push_str(&" ".repeat(indent));
+        out.push_str("- ");
+        match item {
+            serde_json::Value::Array(values) if !values.is_empty() => {
+                out.push('\n');
+                format_kv_array(out, values, indent + 2, color);
+            }
+            serde_json::Value::Object(map) if !map.is_empty() => {
+                out.push('\n');
+                format_kv_object(out, map, indent + 2, color);
+            }
+            _ => {
+                out.push_str(&render_kv_scalar(item, color));
+                out.push('\n');
+            }
+        }
+    }
+}
+
+fn render_kv_scalar(value: &serde_json::Value, color: bool) -> String {
+    match value {
+        serde_json::Value::Null => style_scalar("null", "2", color),
+        serde_json::Value::Bool(true) => style_scalar("true", "32", color),
+        serde_json::Value::Bool(false) => style_scalar("false", "31", color),
+        serde_json::Value::Number(number) => style_scalar(&number.to_string(), "33", color),
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(items) if items.is_empty() => "[]".to_string(),
+        serde_json::Value::Object(map) if map.is_empty() => "{}".to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// Parse a `key=value` CLI parameter.

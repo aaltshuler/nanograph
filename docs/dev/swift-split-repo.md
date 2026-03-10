@@ -35,7 +35,7 @@ It contains:
 
 Consumers add the package with a standard SPM dependency:
 ```swift
-.package(url: "https://github.com/nanograph/nanograph-swift", from: "0.9.1")
+.package(url: "https://github.com/nanograph/nanograph-swift", from: "0.10.0")
 ```
 
 No Rust toolchain. No monorepo clone. Just `swift build`.
@@ -97,7 +97,7 @@ let package = Package(
     targets: [
         .binaryTarget(
             name: "NanoGraphFFI",
-            url: "https://github.com/nanograph/nanograph/releases/download/v0.9.1/NanoGraphFFI.xcframework.zip",
+            url: "https://github.com/nanograph/nanograph/releases/download/v0.10.0/NanoGraphFFI.xcframework.zip",
             checksum: "<sha256>"
         ),
         .target(

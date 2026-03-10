@@ -49,7 +49,7 @@ query semantic_search($q: String)
 }
 ```
 
-`nanograph run` prints this metadata before results in the default table output. It is advisory only and does not change planning or execution semantics.
+`nanograph run` prints this metadata before results in the human-readable `table` and `kv` outputs. It is advisory only and does not change planning or execution semantics.
 
 Aliases from [Project Config](config.md) compose cleanly with query metadata. For example:
 
@@ -57,7 +57,7 @@ Aliases from [Project Config](config.md) compose cleanly with query metadata. Fo
 nanograph run search "father and son conflict"
 ```
 
-In table mode this prints the query name plus any `@description(...)` / `@instruction(...)` text before the result rows. Machine-oriented formats like `json`, `jsonl`, and `csv` keep their payloads unchanged.
+In `table` or `kv` mode this prints the query name plus any `@description(...)` / `@instruction(...)` text before the result rows. `kv` groups rows into clearly separated blocks with an auto header based on `type`, `slug`, `id`, or `name` when available. In `json` mode, `nanograph run` emits a top-level object with query metadata plus `rows`. In `jsonl` mode, it emits a metadata header record first and then the row records. `csv` stays row-only. `--quiet` suppresses the human-readable preamble together with the rest of the human view.
 
 ## Parameters
 
