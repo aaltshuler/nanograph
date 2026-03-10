@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use color_eyre::eyre::{Result, WrapErr, eyre};
 use tracing::instrument;
 
+use crate::ui::{StatusTone, format_status_line, stdout_supports_color, style_label};
 use nanograph::store::migration::{
     MigrationExecution, MigrationPlan, MigrationStatus, MigrationStep, SchemaCompatibility,
     SchemaDiffReport, analyze_schema_diff, execute_schema_migration,
@@ -15,6 +16,7 @@ pub(crate) async fn cmd_migrate(
     format: &str,
     auto_approve: bool,
     json: bool,
+    quiet: bool,
 ) -> Result<()> {
     let schema_path = db_path.join("schema.pg");
     let schema_src = std::fs::read_to_string(&schema_path)
@@ -23,7 +25,9 @@ pub(crate) async fn cmd_migrate(
 
     let execution = execute_schema_migration(db_path, dry_run, auto_approve).await?;
     let effective_format = if json { "json" } else { format };
-    render_migration_execution(&execution, effective_format)?;
+    if !(quiet && effective_format == "table") {
+        render_migration_execution(&execution, effective_format)?;
+    }
 
     match execution.status {
         MigrationStatus::Applied => Ok(()),
@@ -63,10 +67,19 @@ fn migration_status_label(status: MigrationStatus) -> &'static str {
 }
 
 fn print_migration_plan_table(plan: &MigrationPlan) {
-    println!("Migration Plan");
-    println!("  DB: {}", plan.db_path);
-    println!("  Old schema hash: {}", plan.old_schema_hash);
-    println!("  New schema hash: {}", plan.new_schema_hash);
+    let color = stdout_supports_color();
+    println!("{}", style_label("Migration Plan", color));
+    println!("  {} {}", style_label("DB:", color), plan.db_path);
+    println!(
+        "  {} {}",
+        style_label("Old schema hash:", color),
+        plan.old_schema_hash
+    );
+    println!(
+        "  {} {}",
+        style_label("New schema hash:", color),
+        plan.new_schema_hash
+    );
     println!();
 
     if !plan.steps.is_empty() {
@@ -86,14 +99,20 @@ fn print_migration_plan_table(plan: &MigrationPlan) {
 
     if !plan.warnings.is_empty() {
         println!();
-        println!("Warnings:");
+        println!(
+            "{}",
+            format_status_line(StatusTone::Warn, "Warnings:", color)
+        );
         for w in &plan.warnings {
             println!("- {}", w);
         }
     }
     if !plan.blocked.is_empty() {
         println!();
-        println!("Blocked:");
+        println!(
+            "{}",
+            format_status_line(StatusTone::Error, "Blocked:", color)
+        );
         for b in &plan.blocked {
             println!("- {}", b);
         }
@@ -127,6 +146,7 @@ pub(crate) async fn cmd_schema_diff(
     to_schema: &PathBuf,
     format: &str,
     json: bool,
+    quiet: bool,
 ) -> Result<()> {
     let old_source = std::fs::read_to_string(from_schema)
         .wrap_err_with(|| format!("failed to read schema: {}", from_schema.display()))?;
@@ -136,7 +156,10 @@ pub(crate) async fn cmd_schema_diff(
     let new_schema = crate::parse_schema_or_report(to_schema, &new_source)?;
     let report = analyze_schema_diff(&old_schema, &new_schema)?;
     let effective_format = if json { "json" } else { format };
-    render_schema_diff_report(&report, effective_format)
+    if !(quiet && effective_format == "table") {
+        render_schema_diff_report(&report, effective_format)?;
+    }
+    Ok(())
 }
 
 fn render_schema_diff_report(report: &SchemaDiffReport, format: &str) -> Result<()> {
@@ -147,14 +170,28 @@ fn render_schema_diff_report(report: &SchemaDiffReport, format: &str) -> Result<
             println!("{}", out);
         }
         "table" => {
-            println!("Schema Diff");
-            println!("  Old schema hash: {}", report.old_schema_hash);
-            println!("  New schema hash: {}", report.new_schema_hash);
+            let color = stdout_supports_color();
+            println!("{}", style_label("Schema Diff", color));
             println!(
-                "  Compatibility: {}",
+                "  {} {}",
+                style_label("Old schema hash:", color),
+                report.old_schema_hash
+            );
+            println!(
+                "  {} {}",
+                style_label("New schema hash:", color),
+                report.new_schema_hash
+            );
+            println!(
+                "  {} {}",
+                style_label("Compatibility:", color),
                 schema_compatibility_label(report.compatibility)
             );
-            println!("  Has breaking: {}", report.has_breaking);
+            println!(
+                "  {} {}",
+                style_label("Has breaking:", color),
+                report.has_breaking
+            );
             println!();
 
             if report.steps.is_empty() {
@@ -176,14 +213,20 @@ fn render_schema_diff_report(report: &SchemaDiffReport, format: &str) -> Result<
 
             if !report.warnings.is_empty() {
                 println!();
-                println!("Warnings:");
+                println!(
+                    "{}",
+                    format_status_line(StatusTone::Warn, "Warnings:", color)
+                );
                 for warning in &report.warnings {
                     println!("- {}", warning);
                 }
             }
             if !report.blocked.is_empty() {
                 println!();
-                println!("Blocked:");
+                println!(
+                    "{}",
+                    format_status_line(StatusTone::Error, "Blocked:", color)
+                );
                 for item in &report.blocked {
                     println!("- {}", item);
                 }

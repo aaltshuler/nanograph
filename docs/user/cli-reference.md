@@ -14,6 +14,7 @@ nanograph <command> [options]
 | Option | Description |
 |--------|-------------|
 | `--json` | Emit machine-readable JSON output for supported commands |
+| `--quiet`, `-q` | Suppress human-readable stdout while leaving machine formats and stderr errors intact |
 | `--config <nanograph.toml>` | Load CLI defaults from a project config file. If omitted, `./nanograph.toml` is used when present. Local secrets are loaded from `./.env.nano` and then `./.env` when present. |
 | `--help` | Show help |
 | `--version` | Show CLI version |
@@ -37,12 +38,12 @@ With `--db` or `db.default_path`, includes current manifest `db_version` and per
 Describe schema + manifest summary for a database.
 
 ```bash
-nanograph describe [--db <db_path>] [--format table|json] [--type <TypeName>]
+nanograph describe [--db <db_path>] [--format table|json] [--type <TypeName>] [--verbose]
 ```
 
 If `db.default_path` is set in `nanograph.toml`, `--db` can be omitted.
 
-`--type` filters the output down to a single node or edge type. JSON output includes agent-facing schema metadata such as `description`, `instruction`, derived key properties, unique properties, relationship summaries, and edge endpoint keys.
+`--type` filters the output down to a single node or edge type. `--verbose` expands the human table view with manifest, schema hash, type IDs, dataset versions, and dataset paths. JSON output includes agent-facing schema metadata such as `description`, `instruction`, derived key properties, unique properties, relationship summaries, and edge endpoint keys.
 
 ### `schema-diff`
 
@@ -119,7 +120,7 @@ nanograph run [alias] [--db <db_path>] [--query <queries.gq>] [--name <query_nam
 
 | Option | Description |
 |--------|-------------|
-| `--format table\|csv\|jsonl\|json` | Output format (default: `table`) |
+| `--format table\|kv\|csv\|jsonl\|json` | Output format (default: `table`) |
 | `--param key=value` | Query parameter (repeatable) |
 
 Supports both read queries and mutation queries (`insert`, `update`, `delete`) in DB mode.
@@ -127,7 +128,11 @@ Supports both read queries and mutation queries (`insert`, `update`, `delete`) i
 If the provided query path is relative and not found directly, `nanograph` also searches the configured `query.roots` from `nanograph.toml`.
 If `db.default_path` is set in `nanograph.toml`, `--db` can be omitted.
 
-When the selected query includes `@description("...")` and/or `@instruction("...")`, the default table output prints that context before the result rows. Machine-oriented formats like `json`, `jsonl`, and `csv` remain unchanged.
+When the selected query includes `@description("...")` and/or `@instruction("...")`, `nanograph run` includes that context in every output mode. Human-readable `table` and `kv` views print it as a preamble. `json` wraps rows in an object with query metadata, and `jsonl` emits a metadata header record before the row records. `csv` remains row-only.
+
+Use `--quiet` to suppress human-readable `table` / `kv` output while still executing the query. Machine-oriented formats continue to print normally.
+
+`table` defaults to a compact preview layout. Adjust the preview width with `cli.table_max_column_width` in `nanograph.toml`, or switch the layout with `cli.table_cell_layout = "wrap"` if you prefer multi-line wrapped cells. `kv` renders full values with one row per block, using an auto header plus dividers between rows. Use `json`, `jsonl`, or `csv` for machine-oriented output.
 
 ### Query aliases
 

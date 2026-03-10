@@ -288,7 +288,33 @@ pub fn reconcile_migration_sidecars(db_path: &Path) -> Result<()> {
             std::fs::remove_file(&paths.journal_path)?;
             Ok(())
         }
-        // TODO: implement deterministic roll-forward / rollback for PREPARED/APPLYING/ABORTED states.
+        JournalState::Prepared | JournalState::Aborted => {
+            if !db_path.exists() {
+                return Err(NanoError::Manifest(format!(
+                    "found incomplete migration journal at {} (state {}) but database path {} is missing; manual recovery required",
+                    paths.journal_path.display(),
+                    journal_state_name(journal.state),
+                    db_path.display()
+                )));
+            }
+            if backup_path.exists() {
+                return Err(NanoError::Manifest(format!(
+                    "found incomplete migration journal at {} (state {}) with backup path {} still present; manual recovery required",
+                    paths.journal_path.display(),
+                    journal_state_name(journal.state),
+                    backup_path.display()
+                )));
+            }
+            if staging_path.exists() {
+                std::fs::remove_dir_all(&staging_path)?;
+            }
+            if paths.lock_path.exists() {
+                let _ = std::fs::remove_file(&paths.lock_path);
+            }
+            std::fs::remove_file(&paths.journal_path)?;
+            Ok(())
+        }
+        // TODO: implement deterministic roll-forward / rollback for APPLYING state.
         state => Err(NanoError::Manifest(format!(
             "incomplete migration journal at {} (state {}); manual recovery required",
             paths.journal_path.display(),

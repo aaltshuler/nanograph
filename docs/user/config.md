@@ -51,6 +51,8 @@ api_key_env = "OPENAI_API_KEY"
 [cli]
 output_format = "table"
 json = false
+table_max_column_width = 80
+table_cell_layout = "truncate"
 
 [query_aliases.search]
 query = "starwars.gq"
@@ -202,6 +204,16 @@ json = false
 ```
 
 `output_format` is used when a command supports multiple formats and no explicit `--format` is passed.
+For `nanograph run`, supported formats are `table`, `kv`, `csv`, `jsonl`, and `json`.
+`--quiet` is always a runtime flag; it is not stored in project config.
+
+`table_max_column_width` controls the width budget for `nanograph run --format table`.
+
+`table_cell_layout` controls how wide text cells are rendered:
+- `truncate` — default compact preview; long or multiline values are collapsed to one line and truncated
+- `wrap` — keep a compact normalized string, but wrap it across multiple table lines instead of truncating
+
+Use `kv`, `json`, `jsonl`, or `csv` when you need the full value payload without table formatting. For `nanograph run`, `json` and `jsonl` also carry query metadata (`name`, `@description`, `@instruction`) for agent consumers.
 
 ### `[query_aliases.<alias>]`
 

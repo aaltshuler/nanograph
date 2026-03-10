@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
-use arrow_array::{Array, StringArray};
+use arrow_array::{Array, Date32Array, StringArray};
 use lance::Dataset;
 use lance_index::DatasetIndexExt;
 use tempfile::TempDir;
@@ -217,6 +217,71 @@ fn sample_data() -> &'static str {
 "#
 }
 
+fn edge_order_bug_base_schema() -> &'static str {
+    r#"
+node Person {
+    slug: String @key
+    name: String
+    email: String @unique
+    age: I32?
+    role: enum(admin, member, guest)
+    tags: [String]?
+    joinedAt: Date
+}
+
+node Project {
+    slug: String @key
+    name: String
+    description: String?
+    isActive: Bool
+    budget: F64?
+    createdAt: DateTime
+}
+
+edge WorksOn: Person -> Project {
+    role: enum(lead, contributor, reviewer)
+    startedAt: Date
+}
+"#
+}
+
+fn edge_order_bug_target_schema() -> &'static str {
+    r#"
+node Person {
+    slug: String @key
+    name: String
+    displayName: String?
+    email: String @unique
+    age: I32?
+    role: enum(admin, member, guest)
+    tags: [String]?
+    joinedAt: Date
+}
+
+node Project {
+    slug: String @key
+    name: String
+    description: String?
+    isActive: Bool
+    budget: F64?
+    createdAt: DateTime
+}
+
+edge WorksOn: Person -> Project {
+    role: enum(lead, contributor, reviewer)
+    startedAt: Date
+}
+"#
+}
+
+fn edge_order_bug_data() -> &'static str {
+    r#"
+{"type":"Person","data":{"slug":"alice","name":"Alice","email":"alice@example.com","age":30,"role":"admin","tags":["rust"],"joinedAt":"2024-01-10"}}
+{"type":"Project","data":{"slug":"apollo","name":"Apollo","description":"Ship it","isActive":true,"budget":12.5,"createdAt":"2024-01-10T12:00:00Z"}}
+{"edge":"worksOn","from":"alice","to":"apollo","data":{"role":"lead","startedAt":"2024-02-01"}}
+"#
+}
+
 async fn init_db_with_data(schema: &str) -> (TempDir, std::path::PathBuf) {
     let dir = TempDir::new().expect("tempdir");
     let db_path = dir.path().join("db");
@@ -351,6 +416,41 @@ async fn migration_apply_rename_preserves_data() {
         .expect("read edges")
         .expect("connected edge rows");
     assert_eq!(edge_batch.num_rows(), 1);
+}
+
+#[tokio::test]
+async fn migration_apply_add_property_preserves_edge_property_order() {
+    let (_dir, db_path) =
+        init_db_with_custom_data(edge_order_bug_base_schema(), edge_order_bug_data()).await;
+    write_schema(&db_path, edge_order_bug_target_schema());
+
+    let exec = execute_schema_migration(&db_path, false, true)
+        .await
+        .expect("apply migration");
+    assert_eq!(exec.status, MigrationStatus::Applied);
+
+    let db = Database::open(&db_path).await.expect("re-open migrated db");
+    let storage = db.snapshot();
+    let edge_batch = storage
+        .edge_batch_for_save("WorksOn")
+        .expect("read edges")
+        .expect("worksOn rows");
+
+    let role = edge_batch
+        .column_by_name("role")
+        .expect("role column")
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("role as StringArray");
+    assert_eq!(role.value(0), "lead");
+
+    let started_at = edge_batch
+        .column_by_name("startedAt")
+        .expect("startedAt column")
+        .as_any()
+        .downcast_ref::<Date32Array>()
+        .expect("startedAt as Date32Array");
+    assert_eq!(started_at.value(0), 19754);
 }
 
 #[tokio::test]
@@ -737,6 +837,64 @@ async fn open_cleans_committed_journal_and_backup_sidecars() {
     let _db = Database::open(&db_path).await.expect("open db");
     assert!(!journal_path.exists(), "journal should be removed");
     assert!(!backup_path.exists(), "backup should be removed");
+    assert!(!staging_path.exists(), "staging should be removed");
+}
+
+#[tokio::test]
+async fn open_cleans_prepared_journal_when_db_is_intact() {
+    let (_dir, db_path) = init_db_with_data(base_schema()).await;
+    let (journal_path, backup_path, staging_path) = sidecar_paths(&db_path);
+
+    fs::create_dir_all(&staging_path).expect("create staging dir");
+    fs::write(staging_path.join("marker.txt"), "staged").expect("write staging marker");
+
+    let journal = serde_json::json!({
+        "version": 1,
+        "state": "PREPARED",
+        "db_path": db_path.display().to_string(),
+        "backup_path": backup_path.display().to_string(),
+        "staging_path": staging_path.display().to_string(),
+        "old_schema_hash": "old",
+        "new_schema_hash": "new",
+        "created_at_unix": 0
+    });
+    fs::write(
+        &journal_path,
+        serde_json::to_string_pretty(&journal).expect("serialize journal"),
+    )
+    .expect("write journal");
+
+    let _db = Database::open(&db_path).await.expect("open db");
+    assert!(!journal_path.exists(), "journal should be removed");
+    assert!(!staging_path.exists(), "staging should be removed");
+}
+
+#[tokio::test]
+async fn open_cleans_aborted_journal_when_backup_is_already_restored() {
+    let (_dir, db_path) = init_db_with_data(base_schema()).await;
+    let (journal_path, backup_path, staging_path) = sidecar_paths(&db_path);
+
+    fs::create_dir_all(&staging_path).expect("create staging dir");
+    fs::write(staging_path.join("marker.txt"), "staged").expect("write staging marker");
+
+    let journal = serde_json::json!({
+        "version": 1,
+        "state": "ABORTED",
+        "db_path": db_path.display().to_string(),
+        "backup_path": backup_path.display().to_string(),
+        "staging_path": staging_path.display().to_string(),
+        "old_schema_hash": "old",
+        "new_schema_hash": "new",
+        "created_at_unix": 0
+    });
+    fs::write(
+        &journal_path,
+        serde_json::to_string_pretty(&journal).expect("serialize journal"),
+    )
+    .expect("write journal");
+
+    let _db = Database::open(&db_path).await.expect("open db");
+    assert!(!journal_path.exists(), "journal should be removed");
     assert!(!staging_path.exists(), "staging should be removed");
 }
 

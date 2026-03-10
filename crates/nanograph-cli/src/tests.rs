@@ -1,6 +1,9 @@
 use super::*;
 use crate::metadata::{build_describe_payload, build_export_rows, build_version_payload};
-use arrow_array::{ArrayRef, Date32Array, Date64Array, Int32Array, StringArray};
+use arrow_array::{
+    ArrayRef, BooleanArray, Date32Array, Date64Array, Int32Array, RecordBatch, StringArray,
+};
+use arrow_schema::{DataType, Field, Schema};
 use nanograph::store::manifest::GraphManifest;
 use nanograph::store::txlog::read_visible_cdc_entries;
 use std::cell::RefCell;
@@ -111,6 +114,9 @@ fn scaffold_project_files_creates_shared_config_and_env_template() {
     assert!(config.contains("default_path = \"schema.pg\""));
     assert!(config.contains("[embedding]"));
     assert!(config.contains("provider = \"openai\""));
+    assert!(config.contains("[cli]"));
+    assert!(config.contains("table_max_column_width = 80"));
+    assert!(config.contains("table_cell_layout = \"truncate\""));
 
     let dotenv = std::fs::read_to_string(dir.path().join(".env.nano")).unwrap();
     assert!(dotenv.contains("OPENAI_API_KEY=sk-..."));
@@ -153,6 +159,12 @@ fn query_execution_preamble_renders_description_and_instruction() {
             "Query: semantic_search\nDescription: Find semantically similar documents.\nInstruction: Use for conceptual search. Prefer keyword_search for exact terms.\n\n"
         )
     );
+    assert_eq!(
+        query_execution_preamble(&query, "kv", false).as_deref(),
+        Some(
+            "Query: semantic_search\nDescription: Find semantically similar documents.\nInstruction: Use for conceptual search. Prefer keyword_search for exact terms.\n\n"
+        )
+    );
 }
 
 #[test]
@@ -171,6 +183,79 @@ fn query_execution_preamble_skips_machine_formats() {
 
     assert!(query_execution_preamble(&query, "json", false).is_none());
     assert!(query_execution_preamble(&query, "table", true).is_none());
+}
+
+#[test]
+fn query_metadata_json_includes_description_and_instruction() {
+    let query = nanograph::query::ast::QueryDecl {
+        name: "semantic_search".to_string(),
+        description: Some("Find semantically similar documents.".to_string()),
+        instruction: Some(
+            "Use for conceptual search. Prefer keyword_search for exact terms.".to_string(),
+        ),
+        params: Vec::new(),
+        match_clause: Vec::new(),
+        return_clause: Vec::new(),
+        order_clause: Vec::new(),
+        limit: None,
+        mutation: None,
+    };
+
+    assert_eq!(
+        query_metadata_json(&query),
+        serde_json::json!({
+            "name": "semantic_search",
+            "description": "Find semantically similar documents.",
+            "instruction": "Use for conceptual search. Prefer keyword_search for exact terms."
+        })
+    );
+}
+
+#[test]
+fn format_kv_rows_renders_typed_scalars_and_nested_values() {
+    let rows = vec![serde_json::json!({
+        "type": "Character",
+        "slug": "luke-skywalker",
+        "name": "Luke Skywalker",
+        "age": 23,
+        "active": true,
+        "homeworld": serde_json::Value::Null,
+        "tags": ["jedi", "pilot"],
+        "meta": {
+            "rank": "commander"
+        }
+    })];
+
+    let formatted = format_kv_rows(&rows, false);
+    assert!(formatted.starts_with("Character: luke-skywalker\n"));
+    assert!(formatted.contains("type     : Character\n"));
+    assert!(formatted.contains("slug     : luke-skywalker\n"));
+    assert!(formatted.contains("name     : Luke Skywalker\n"));
+    assert!(formatted.contains("age      : 23\n"));
+    assert!(formatted.contains("active   : true\n"));
+    assert!(formatted.contains("homeworld: null\n"));
+    assert!(formatted.contains("tags     :\n  - jedi\n  - pilot\n"));
+    assert!(formatted.contains("meta     :\n  rank: commander\n"));
+}
+
+#[test]
+fn format_kv_rows_separates_rows_with_headers_and_divider() {
+    let rows = vec![
+        serde_json::json!({
+            "slug": "luke-skywalker",
+            "name": "Luke Skywalker",
+        }),
+        serde_json::json!({
+            "name": "Leia Organa",
+            "role": "General",
+        }),
+    ];
+
+    let formatted = format_kv_rows(&rows, false);
+    assert!(formatted.contains("Row 1: luke-skywalker\n"));
+    assert!(formatted.contains("slug: luke-skywalker\n"));
+    assert!(formatted.contains("\n────────────────────────\n\nRow 2: Leia Organa\n"));
+    assert!(formatted.contains("role: General\n"));
 }
 
 #[test]
@@ -290,7 +375,8 @@ fn parse_maintenance_commands_from_cli() {
 
 #[test]
 fn parse_metadata_commands_from_cli() {
-    let version = Cli::parse_from(["nanograph", "version", "--db", "/tmp/db"]);
+    let version = Cli::parse_from(["nanograph", "--quiet", "version", "--db", "/tmp/db"]);
+    assert!(version.quiet);
     match version.command {
         Commands::Version { db } => assert_eq!(db, Some(PathBuf::from("/tmp/db"))),
         _ => panic!("expected version command"),
@@ -303,16 +389,19 @@ fn parse_metadata_commands_from_cli() {
         "/tmp/db",
         "--format",
         "json",
+        "--verbose",
     ]);
     match describe.command {
         Commands::Describe {
             db,
             format,
             type_name,
+            verbose,
         } => {
             assert_eq!(db, Some(PathBuf::from("/tmp/db")));
             assert_eq!(format.as_deref(), Some("json"));
             assert!(type_name.is_none());
+            assert!(verbose);
         }
         _ => panic!("expected describe command"),
     }
@@ -401,8 +490,10 @@ async fn load_mode_merge_requires_keyed_schema() {
     );
     write_file(&data_path, r#"{"type":"Person","data":{"name":"Alice"}}"#);
 
-    cmd_init(&db_path, &schema_path, false).await.unwrap();
-    let err = cmd_load(&db_path, &data_path, LoadModeArg::Merge, false)
+    cmd_init(&db_path, &schema_path, false, false)
+        .await
+        .unwrap();
+    let err = cmd_load(&db_path, &data_path, LoadModeArg::Merge, false, false)
         .await
         .unwrap_err();
     assert!(err.to_string().contains("requires at least one node @key"));
@@ -437,14 +528,22 @@ async fn load_mode_append_and_merge_behave_as_expected() {
         r#"{"type":"Person","data":{"name":"Alice","age":31}}"#,
     );
 
-    cmd_init(&db_path, &schema_path, false).await.unwrap();
-    cmd_load(&db_path, &data_initial, LoadModeArg::Overwrite, false)
+    cmd_init(&db_path, &schema_path, false, false)
         .await
         .unwrap();
-    cmd_load(&db_path, &data_append, LoadModeArg::Append, false)
+    cmd_load(
+        &db_path,
+        &data_initial,
+        LoadModeArg::Overwrite,
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+    cmd_load(&db_path, &data_append, LoadModeArg::Append, false, false)
         .await
         .unwrap();
-    cmd_load(&db_path, &data_merge, LoadModeArg::Merge, false)
+    cmd_load(&db_path, &data_merge, LoadModeArg::Merge, false, false)
         .await
         .unwrap();
 
@@ -689,6 +788,229 @@ fn array_value_to_json_formats_temporal_types_as_iso_strings() {
     );
 }
 
+#[test]
+fn format_jsonl_preserves_typed_values() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("name", DataType::Utf8, false),
+        Field::new("age", DataType::Int32, false),
+        Field::new("active", DataType::Boolean, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec![Some("Luke")])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![Some(23)])) as ArrayRef,
+            Arc::new(BooleanArray::from(vec![Some(true)])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+
+    let output = format_jsonl(&[batch]).unwrap();
+    let line = output.trim_end();
+    let parsed: serde_json::Value = serde_json::from_str(line).unwrap();
+    assert_eq!(
+        parsed,
+        serde_json::json!({
+            "name": "Luke",
+            "age": 23,
+            "active": true
+        })
+    );
+}
+
+#[test]
+fn format_jsonl_with_query_emits_metadata_header_then_rows() {
+    let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(StringArray::from(vec![Some("Luke")])) as ArrayRef],
+    )
+    .unwrap();
+    let query = nanograph::query::ast::QueryDecl {
+        name: "semantic_search".to_string(),
+        description: Some("Find semantically similar documents.".to_string()),
+        instruction: Some(
+            "Use for conceptual search. Prefer keyword_search for exact terms.".to_string(),
+        ),
+        params: Vec::new(),
+        match_clause: Vec::new(),
+        return_clause: Vec::new(),
+        order_clause: Vec::new(),
+        limit: None,
+        mutation: None,
+    };
+
+    let output = format_jsonl_with_query(&query, &[batch]).unwrap();
+    let mut lines = output.lines();
+    let header: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+    let row: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+    assert_eq!(
+        header,
+        serde_json::json!({
+            "$nanograph": {
+                "query": {
+                    "name": "semantic_search",
+                    "description": "Find semantically similar documents.",
+                    "instruction": "Use for conceptual search. Prefer keyword_search for exact terms."
+                }
+            }
+        })
+    );
+    assert_eq!(row, serde_json::json!({ "name": "Luke" }));
+    assert!(lines.next().is_none());
+}
+
+#[test]
+fn print_json_with_query_wraps_rows_with_query_metadata() {
+    let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(StringArray::from(vec![Some("Luke")])) as ArrayRef],
+    )
+    .unwrap();
+    let query = nanograph::query::ast::QueryDecl {
+        name: "semantic_search".to_string(),
+        description: Some("Find semantically similar documents.".to_string()),
+        instruction: Some(
+            "Use for conceptual search. Prefer keyword_search for exact terms.".to_string(),
+        ),
+        params: Vec::new(),
+        match_clause: Vec::new(),
+        return_clause: Vec::new(),
+        order_clause: Vec::new(),
+        limit: None,
+        mutation: None,
+    };
+
+    let rows = nanograph::json_output::record_batches_to_json_rows(&[batch]);
+    let payload = serde_json::json!({
+        "$nanograph": {
+            "query": query_metadata_json(&query),
+        },
+        "rows": rows,
+    });
+    assert_eq!(
+        payload,
+        serde_json::json!({
+            "$nanograph": {
+                "query": {
+                    "name": "semantic_search",
+                    "description": "Find semantically similar documents.",
+                    "instruction": "Use for conceptual search. Prefer keyword_search for exact terms."
+                }
+            },
+            "rows": [
+                { "name": "Luke" }
+            ]
+        })
+    );
+}
+
+#[test]
+fn format_csv_escapes_values_and_prints_header_once() {
+    let schema = Arc::new(Schema::new(vec![Field::new("note", DataType::Utf8, false)]));
+    let batch_a = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StringArray::from(vec![Some("alpha,beta")])) as ArrayRef],
+    )
+    .unwrap();
+    let batch_b = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(StringArray::from(vec![
+            Some("line 1\nline 2"),
+            Some("quote \"here\""),
+        ])) as ArrayRef],
+    )
+    .unwrap();
+
+    assert_eq!(
+        format_csv(&[batch_a, batch_b]),
+        concat!(
+            "note\n",
+            "\"alpha,beta\"\n",
+            "\"line 1\nline 2\"\n",
+            "\"quote \"\"here\"\"\"\n",
+        )
+    );
+}
+
+#[test]
+fn format_table_renders_headers_rows_and_empty_state() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("name", DataType::Utf8, false),
+        Field::new("age", DataType::Int32, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec![Some("Luke"), Some("Leia")])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![Some(23), Some(23)])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+
+    let formatted = format_table(&[batch], 80, TableCellLayout::Truncate);
+    assert!(formatted.contains("name"));
+    assert!(formatted.contains("age"));
+    assert!(formatted.contains("Luke"));
+    assert!(formatted.contains("Leia"));
+
+    assert_eq!(
+        format_table(&[], 80, TableCellLayout::Truncate),
+        "(empty result)\n"
+    );
+}
+
+#[test]
+fn format_table_truncates_and_flattens_long_text_cells() {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "content",
+        DataType::Utf8,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(StringArray::from(vec![Some(
+            "line 1\n\nline 2 with much more text than should fit in a compact table cell",
+        )])) as ArrayRef],
+    )
+    .unwrap();
+
+    let formatted = format_table(&[batch], 24, TableCellLayout::Truncate);
+    assert!(formatted.contains("line 1 line 2 with mu..."));
+    assert!(!formatted.contains("line 1\n\nline 2"));
+}
+
+#[test]
+fn format_table_wrap_layout_preserves_wrapped_preview() {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "content",
+        DataType::Utf8,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(StringArray::from(vec![Some(
+            "line 1 line 2 with much more text than should wrap across rows",
+        )])) as ArrayRef],
+    )
+    .unwrap();
+
+    let formatted = format_table(&[batch], 18, TableCellLayout::Wrap);
+    assert!(formatted.contains("line 1 line 2"));
+    assert!(formatted.contains("much more text"));
+    assert!(!formatted.contains("..."));
+}
+
+#[test]
+fn format_elapsed_uses_ms_then_seconds() {
+    assert_eq!(format_elapsed(std::time::Duration::from_millis(2)), "2ms");
+    assert_eq!(
+        format_elapsed(std::time::Duration::from_millis(1250)),
+        "1.25s"
+    );
+}
+
 #[tokio::test]
 async fn run_mutation_insert_in_db_mode() {
     let dir = TempDir::new().unwrap();
@@ -715,16 +1037,24 @@ query add_person($name: String, $age: I32) {
 "#,
     );
 
-    cmd_init(&db_path, &schema_path, false).await.unwrap();
+    cmd_init(&db_path, &schema_path, false, false)
+        .await
+        .unwrap();
     cmd_run(
         db_path.clone(),
-        &query_path,
-        "add_person",
-        "table",
+        &ResolvedRunConfig {
+            query_path: query_path.clone(),
+            query_name: "add_person".to_string(),
+            format: "table".to_string(),
+            positional_param_names: Vec::new(),
+        },
+        80,
+        TableCellLayout::Truncate,
         vec![
             ("name".to_string(), "Eve".to_string()),
             ("age".to_string(), "29".to_string()),
         ],
+        false,
         false,
     )
     .await
@@ -766,17 +1096,21 @@ async fn maintenance_commands_work_on_real_db() {
 {"type":"Person","data":{"name":"Bob"}}"#,
     );
 
-    cmd_init(&db_path, &schema_path, false).await.unwrap();
-    cmd_load(&db_path, &data_path, LoadModeArg::Overwrite, false)
+    cmd_init(&db_path, &schema_path, false, false)
+        .await
+        .unwrap();
+    cmd_load(&db_path, &data_path, LoadModeArg::Overwrite, false, false)
         .await
         .unwrap();
 
-    cmd_compact(&db_path, 1_024, true, 0.1, false)
+    cmd_compact(&db_path, 1_024, true, 0.1, false, false)
         .await
         .unwrap();
-    cmd_cleanup(&db_path, 1, 1, false).await.unwrap();
-    cmd_cdc_materialize(&db_path, 0, true, false).await.unwrap();
-    cmd_doctor(&db_path, false).await.unwrap();
+    cmd_cleanup(&db_path, 1, 1, false, false).await.unwrap();
+    cmd_cdc_materialize(&db_path, 0, true, false, false)
+        .await
+        .unwrap();
+    cmd_doctor(&db_path, false, false).await.unwrap();
 
     assert!(db_path.join("__cdc_analytics").exists());
 
@@ -812,8 +1146,10 @@ edge Knows: Person -> Person"#,
 {"edge":"Knows","from":"Alice","to":"Bob"}"#,
     );
 
-    cmd_init(&db_path, &schema_path, false).await.unwrap();
-    cmd_load(&db_path, &data_path, LoadModeArg::Overwrite, false)
+    cmd_init(&db_path, &schema_path, false, false)
+        .await
+        .unwrap();
+    cmd_load(&db_path, &data_path, LoadModeArg::Overwrite, false, false)
         .await
         .unwrap();
 
@@ -882,7 +1218,9 @@ edge DependsOn: Task -> Task @description("Hard dependency") @instruction("Use o
 "#,
     );
 
-    cmd_init(&db_path, &schema_path, false).await.unwrap();
+    cmd_init(&db_path, &schema_path, false, false)
+        .await
+        .unwrap();
 
     let db = Database::open(&db_path).await.unwrap();
     let manifest = GraphManifest::read(&db_path).unwrap();
@@ -943,8 +1281,10 @@ edge MadeBy: ActionItem -> Person"#,
 {"edge":"MadeBy","from":"dec-build-mcp","to":"act-andrew"}"#,
     );
 
-    cmd_init(&db_path, &schema_path, false).await.unwrap();
-    cmd_load(&db_path, &data_path, LoadModeArg::Overwrite, false)
+    cmd_init(&db_path, &schema_path, false, false)
+        .await
+        .unwrap();
+    cmd_load(&db_path, &data_path, LoadModeArg::Overwrite, false, false)
         .await
         .unwrap();
 
@@ -967,13 +1307,14 @@ edge MadeBy: ActionItem -> Person"#,
         .join("\n");
     write_file(&export_path, &(export_jsonl + "\n"));
 
-    cmd_init(&roundtrip_db_path, &schema_path, false)
+    cmd_init(&roundtrip_db_path, &schema_path, false, false)
         .await
         .unwrap();
     cmd_load(
         &roundtrip_db_path,
         &export_path,
         LoadModeArg::Overwrite,
+        false,
         false,
     )
     .await
@@ -1016,8 +1357,10 @@ edge Follows: User -> User"#,
 {"edge":"Follows","from":"usr_01","to":"usr_02"}"#,
     );
 
-    cmd_init(&db_path, &schema_path, false).await.unwrap();
-    cmd_load(&db_path, &data_path, LoadModeArg::Overwrite, false)
+    cmd_init(&db_path, &schema_path, false, false)
+        .await
+        .unwrap();
+    cmd_load(&db_path, &data_path, LoadModeArg::Overwrite, false, false)
         .await
         .unwrap();
 
@@ -1042,13 +1385,14 @@ edge Follows: User -> User"#,
         .join("\n");
     write_file(&export_path, &(export_jsonl + "\n"));
 
-    cmd_init(&roundtrip_db_path, &schema_path, false)
+    cmd_init(&roundtrip_db_path, &schema_path, false, false)
         .await
         .unwrap();
     cmd_load(
         &roundtrip_db_path,
         &export_path,
         LoadModeArg::Overwrite,
+        false,
         false,
     )
     .await

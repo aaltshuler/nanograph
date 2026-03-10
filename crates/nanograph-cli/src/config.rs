@@ -73,6 +73,16 @@ pub struct EmbeddingConfig {
 pub struct CliDefaults {
     pub output_format: Option<String>,
     pub json: Option<bool>,
+    pub table_max_column_width: Option<usize>,
+    pub table_cell_layout: Option<TableCellLayout>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TableCellLayout {
+    #[default]
+    Truncate,
+    Wrap,
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +101,14 @@ pub struct ResolvedRunConfig {
 }
 
 impl LoadedConfig {
+    pub fn effective_table_max_column_width(&self) -> usize {
+        self.settings.cli.table_max_column_width.unwrap_or(80)
+    }
+
+    pub fn effective_table_cell_layout(&self) -> TableCellLayout {
+        self.settings.cli.table_cell_layout.unwrap_or_default()
+    }
+
     pub fn load(explicit_path: Option<&Path>) -> Result<Self> {
         let current_dir =
             std::env::current_dir().wrap_err("failed to resolve current directory")?;
@@ -205,7 +223,7 @@ impl LoadedConfig {
             .or_else(|| alias_config.and_then(|alias| alias.format.clone()))
             .or_else(|| self.settings.cli.output_format.clone())
             .unwrap_or_else(|| "table".to_string());
-        let format = self.validate_format(format, &["table", "csv", "jsonl", "json"])?;
+        let format = self.validate_format(format, &["table", "kv", "csv", "jsonl", "json"])?;
         let positional_param_names = alias_config
             .map(|alias| alias.args.clone())
             .unwrap_or_default();
@@ -441,6 +459,12 @@ impl CliDefaults {
         if other.json.is_some() {
             self.json = other.json;
         }
+        if other.table_max_column_width.is_some() {
+            self.table_max_column_width = other.table_max_column_width;
+        }
+        if other.table_cell_layout.is_some() {
+            self.table_cell_layout = other.table_cell_layout;
+        }
     }
 }
 
@@ -508,6 +532,8 @@ mod tests {
                 cli: CliDefaults {
                     output_format: Some("json".to_string()),
                     json: Some(true),
+                    table_max_column_width: None,
+                    table_cell_layout: None,
                 },
                 ..NanographConfig::default()
             },
@@ -586,6 +612,8 @@ args = ["q"]
 [cli]
 output_format = "json"
 json = true
+table_max_column_width = 72
+table_cell_layout = "wrap"
 "#,
         );
         write_file(&query_path, "query all_people { Person { name } }");
@@ -607,6 +635,8 @@ json = true
         assert_eq!(run.query_name, "all_people");
         assert_eq!(run.format, "json");
         assert_eq!(run.positional_param_names, vec!["q".to_string()]);
+        assert_eq!(cfg.effective_table_max_column_width(), 72);
+        assert_eq!(cfg.effective_table_cell_layout(), TableCellLayout::Wrap);
         assert_eq!(
             cfg.resolve_format(None, "table", &["table", "json"])
                 .unwrap(),
@@ -662,6 +692,72 @@ json = true
         assert_eq!(run.query_name, "custom");
         assert_eq!(run.format, "csv");
         assert_eq!(run.positional_param_names, vec!["q".to_string()]);
+    }
+
+    #[test]
+    fn resolve_run_config_accepts_kv_format() {
+        let dir = TempDir::new().unwrap();
+        let query_root = dir.path().join("queries");
+        let aliased_query = query_root.join("people.gq");
+        write_file(
+            &aliased_query,
+            "query all_people() { match { $p: Person } return { $p.name } }",
+        );
+
+        let cfg = LoadedConfig {
+            path: Some(dir.path().join("nanograph.toml")),
+            base_dir: dir.path().to_path_buf(),
+            settings: NanographConfig {
+                query_aliases: HashMap::from([(
+                    "detail".to_string(),
+                    QueryAliasConfig {
+                        query: Some(PathBuf::from("queries/people.gq")),
+                        name: Some("all_people".to_string()),
+                        format: Some("kv".to_string()),
+                        args: Vec::new(),
+                    },
+                )]),
+                ..NanographConfig::default()
+            },
+        };
+
+        let run = cfg
+            .resolve_run_config(Some("detail"), None, None, None)
+            .unwrap();
+        assert_eq!(run.query_path, aliased_query);
+        assert_eq!(run.format, "kv");
+    }
+
+    #[test]
+    fn effective_table_max_column_width_uses_config_or_default() {
+        let configured = LoadedConfig {
+            path: None,
+            base_dir: PathBuf::from("/tmp"),
+            settings: NanographConfig {
+                cli: CliDefaults {
+                    table_max_column_width: Some(42),
+                    table_cell_layout: Some(TableCellLayout::Wrap),
+                    ..CliDefaults::default()
+                },
+                ..NanographConfig::default()
+            },
+        };
+        assert_eq!(configured.effective_table_max_column_width(), 42);
+        assert_eq!(
+            configured.effective_table_cell_layout(),
+            TableCellLayout::Wrap
+        );
+
+        let defaulted = LoadedConfig {
+            path: None,
+            base_dir: PathBuf::from("/tmp"),
+            settings: NanographConfig::default(),
+        };
+        assert_eq!(defaulted.effective_table_max_column_width(), 80);
+        assert_eq!(
+            defaulted.effective_table_cell_layout(),
+            TableCellLayout::Truncate
+        );
     }
 
     #[test]

@@ -33,6 +33,7 @@ pub struct EdgeType {
     pub from_type: String,
     pub to_type: String,
     pub properties: HashMap<String, PropType>,
+    pub arrow_schema: SchemaRef,
 }
 
 impl Catalog {
@@ -121,8 +122,8 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
     }
 
     // Second pass: collect edge types, validate endpoints
-    for decl in &schema.declarations {
-        if let SchemaDecl::Edge(edge) = decl {
+        for decl in &schema.declarations {
+            if let SchemaDecl::Edge(edge) = decl {
             if edge_types.contains_key(&edge.name) {
                 return Err(NanoError::Catalog(format!(
                     "duplicate edge type: {}",
@@ -143,8 +144,18 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
             }
 
             let mut properties = HashMap::new();
+            let mut fields = vec![
+                Field::new("id", DataType::UInt64, false),
+                Field::new("src", DataType::UInt64, false),
+                Field::new("dst", DataType::UInt64, false),
+            ];
             for prop in &edge.properties {
                 properties.insert(prop.name.clone(), prop.prop_type.clone());
+                fields.push(Field::new(
+                    &prop.name,
+                    prop.prop_type.to_arrow(),
+                    prop.prop_type.nullable,
+                ));
             }
 
             let lowercase_name = lowercase_first_char(&edge.name);
@@ -157,6 +168,7 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
                     from_type: edge.from_type.clone(),
                     to_type: edge.to_type.clone(),
                     properties,
+                    arrow_schema: Arc::new(Schema::new(fields)),
                 },
             );
         }

@@ -294,23 +294,27 @@ pub fn build_catalog_from_ir(ir: &SchemaIR) -> Result<Catalog> {
             }
             TypeDef::Edge(e) => {
                 let mut properties = HashMap::new();
+                let mut fields = vec![
+                    Field::new("id", arrow_schema::DataType::UInt64, false),
+                    Field::new("src", arrow_schema::DataType::UInt64, false),
+                    Field::new("dst", arrow_schema::DataType::UInt64, false),
+                ];
                 for prop in &e.properties {
                     let scalar = ScalarType::from_str_name(&prop.scalar_type).ok_or_else(|| {
                         NanoError::Catalog(format!("unknown scalar type: {}", prop.scalar_type))
                     })?;
-                    properties.insert(
-                        prop.name.clone(),
-                        PropType {
-                            scalar,
-                            nullable: prop.nullable,
-                            list: prop.list,
-                            enum_values: if prop.enum_values.is_empty() {
-                                None
-                            } else {
-                                Some(prop.enum_values.clone())
-                            },
+                    let prop_type = PropType {
+                        scalar,
+                        nullable: prop.nullable,
+                        list: prop.list,
+                        enum_values: if prop.enum_values.is_empty() {
+                            None
+                        } else {
+                            Some(prop.enum_values.clone())
                         },
-                    );
+                    };
+                    properties.insert(prop.name.clone(), prop_type.clone());
+                    fields.push(Field::new(&prop.name, prop_type.to_arrow(), prop.nullable));
                 }
 
                 let lowercase_name = lowercase_first_char(&e.name);
@@ -323,6 +327,7 @@ pub fn build_catalog_from_ir(ir: &SchemaIR) -> Result<Catalog> {
                         from_type: e.src_type_name.clone(),
                         to_type: e.dst_type_name.clone(),
                         properties,
+                        arrow_schema: Arc::new(Schema::new(fields)),
                     },
                 );
             }

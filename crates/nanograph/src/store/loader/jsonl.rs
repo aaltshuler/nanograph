@@ -279,6 +279,9 @@ fn flush_node_rows(
                     row.row_idx
                 )));
             }
+            if let Some(prop_type) = node_type.properties.get(field.name()) {
+                validate_json_value(type_name, field.name(), prop_type, &value)?;
+            }
             builders[idx].push(value);
         }
     }
@@ -381,6 +384,11 @@ fn insert_resolved_edge_chunk(
         .edge_segments
         .get(edge_name)
         .ok_or_else(|| NanoError::Storage(format!("no edge segment: {}", edge_name)))?;
+    let edge_type = storage
+        .catalog
+        .edge_types
+        .get(edge_name)
+        .ok_or_else(|| NanoError::Storage(format!("unknown edge type in data: {}", edge_name)))?;
     let prop_fields: Vec<Field> = edge_seg
         .schema
         .fields()
@@ -404,6 +412,11 @@ fn insert_resolved_edge_chunk(
                         .unwrap_or(serde_json::Value::Null)
                 })
                 .collect();
+            if let Some(prop_type) = edge_type.properties.get(field.name()) {
+                for value in &values {
+                    validate_json_value(edge_name, field.name(), prop_type, value)?;
+                }
+            }
             columns.push(json_values_to_array(
                 &values,
                 field.data_type(),
@@ -607,6 +620,139 @@ fn parse_env_usize(name: &str, default: usize) -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(default)
+}
+
+fn validate_json_value(
+    type_name: &str,
+    field_name: &str,
+    prop_type: &crate::types::PropType,
+    value: &serde_json::Value,
+) -> Result<()> {
+    if value.is_null() {
+        return Ok(());
+    }
+    if prop_type.list {
+        let Some(items) = value.as_array() else {
+            return Err(type_mismatch_error(
+                type_name,
+                field_name,
+                &expected_type_name(prop_type),
+                value,
+            ));
+        };
+        let item_type = crate::types::PropType {
+            scalar: prop_type.scalar,
+            nullable: true,
+            list: false,
+            enum_values: prop_type.enum_values.clone(),
+        };
+        for item in items {
+            validate_json_value(type_name, field_name, &item_type, item)?;
+        }
+        return Ok(());
+    }
+    if let Some(enum_values) = &prop_type.enum_values {
+        let Some(raw) = value.as_str() else {
+            return Err(type_mismatch_error(
+                type_name,
+                field_name,
+                &expected_type_name(prop_type),
+                value,
+            ));
+        };
+        if enum_values.iter().any(|allowed| allowed == raw) {
+            return Ok(());
+        }
+        return Err(NanoError::Storage(format!(
+            "invalid enum value '{}' for {}.{} (expected: {})",
+            raw,
+            type_name,
+            field_name,
+            enum_values.join(", ")
+        )));
+    }
+
+    let valid = match prop_type.scalar {
+        crate::types::ScalarType::String => value.is_string(),
+        crate::types::ScalarType::Bool => value.is_boolean(),
+        crate::types::ScalarType::I32 => value
+            .as_i64()
+            .and_then(|n| i32::try_from(n).ok())
+            .is_some(),
+        crate::types::ScalarType::I64 => value.as_i64().is_some(),
+        crate::types::ScalarType::U32 => value
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .is_some(),
+        crate::types::ScalarType::U64 => value.as_u64().is_some(),
+        crate::types::ScalarType::F32 => value.as_f64().is_some(),
+        crate::types::ScalarType::F64 => value.as_f64().is_some(),
+        crate::types::ScalarType::Date => parse_date32_json_value(value).is_ok(),
+        crate::types::ScalarType::DateTime => parse_date64_json_value(value).is_ok(),
+        crate::types::ScalarType::Vector(dim) => match value.as_array() {
+            Some(items) if items.len() == dim as usize => {
+                items.iter().all(|item| item.as_f64().is_some())
+            }
+            _ => false,
+        },
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(type_mismatch_error(
+            type_name,
+            field_name,
+            &expected_type_name(prop_type),
+            value,
+        ))
+    }
+}
+
+fn expected_type_name(prop_type: &crate::types::PropType) -> String {
+    let base = if let Some(enum_values) = &prop_type.enum_values {
+        format!("enum({})", enum_values.join(", "))
+    } else {
+        prop_type.scalar.to_string()
+    };
+    if prop_type.list {
+        format!("[{}]", base)
+    } else {
+        base
+    }
+}
+
+fn type_mismatch_error(
+    type_name: &str,
+    field_name: &str,
+    expected: &str,
+    value: &serde_json::Value,
+) -> NanoError {
+    NanoError::Storage(format!(
+        "type mismatch for {}.{}: expected {}, got {}",
+        type_name,
+        field_name,
+        expected,
+        describe_json_value(value)
+    ))
+}
+
+fn describe_json_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "Null".to_string(),
+        serde_json::Value::Bool(v) => format!("Bool {}", v),
+        serde_json::Value::Number(v) => {
+            if v.is_i64() || v.is_u64() {
+                format!("Integer {}", v)
+            } else {
+                format!("Float {}", v)
+            }
+        }
+        serde_json::Value::String(v) => format!("String {:?}", v),
+        serde_json::Value::Array(v) => format!("Array {}", serde_json::Value::Array(v.clone())),
+        serde_json::Value::Object(v) => {
+            format!("Object {}", serde_json::Value::Object(v.clone()))
+        }
+    }
 }
 
 /// Convert JSON values to an Arrow array based on the target DataType.
@@ -1323,5 +1469,67 @@ edge Follows: User -> User
         load_jsonl_data(&mut storage, data, &key_props).unwrap();
         let follows = &storage.edge_segments["Follows"];
         assert_eq!(follows.edge_ids.len(), 1);
+    }
+
+    #[test]
+    fn load_jsonl_rejects_invalid_node_enum_values() {
+        let schema = r#"node Person {
+    name: String @key
+    role: enum(admin, member, guest)
+}"#;
+        let mut storage = build_storage(schema);
+        let err = load_jsonl_data(
+            &mut storage,
+            r#"{"type":"Person","data":{"name":"Bad","role":"superadmin"}}"#,
+            &HashMap::from([("Person".to_string(), "name".to_string())]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "storage error: invalid enum value 'superadmin' for Person.role (expected: admin, guest, member)"
+        );
+    }
+
+    #[test]
+    fn load_jsonl_rejects_invalid_edge_enum_values() {
+        let schema = r#"node Person {
+    name: String @key
+}
+edge WorksWith: Person -> Person {
+    role: enum(lead, contributor)
+}"#;
+        let mut storage = build_storage(schema);
+        let data = r#"{"type":"Person","data":{"name":"Alice"}}
+{"type":"Person","data":{"name":"Bob"}}
+{"edge":"WorksWith","from":"Alice","to":"Bob","data":{"role":"manager"}}"#;
+        let err = load_jsonl_data(
+            &mut storage,
+            data,
+            &HashMap::from([("Person".to_string(), "name".to_string())]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "storage error: invalid enum value 'manager' for WorksWith.role (expected: contributor, lead)"
+        );
+    }
+
+    #[test]
+    fn load_jsonl_rejects_wrong_type_for_nullable_node_field() {
+        let schema = r#"node Person {
+    name: String @key
+    age: I32?
+}"#;
+        let mut storage = build_storage(schema);
+        let err = load_jsonl_data(
+            &mut storage,
+            r#"{"type":"Person","data":{"name":"Bad","age":"not-a-number"}}"#,
+            &HashMap::from([("Person".to_string(), "name".to_string())]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            r#"storage error: type mismatch for Person.age: expected I32, got String "not-a-number""#
+        );
     }
 }

@@ -135,7 +135,7 @@ Description: Rank characters by semantic similarity against their embedded notes
 Instruction: Use for broad conceptual search, not exact spelling.
 ```
 
-Machine-oriented formats like `json`, `jsonl`, and `csv` keep their existing payload shape.
+For agents, `json` and `jsonl` now carry this query metadata too. `json` wraps the output with query metadata plus `rows`, `jsonl` emits a metadata header record first, and `csv` stays row-only.
 
 ## Next steps
 
