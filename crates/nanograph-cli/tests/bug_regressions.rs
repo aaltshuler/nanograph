@@ -69,6 +69,31 @@ fn bug_append_data() -> &'static str {
 "#
 }
 
+fn embed_merge_schema() -> &'static str {
+    r#"
+node Chunk {
+    slug: String @key
+    chunk_type: String @index
+    content: String
+    context: String?
+    embedding: Vector(1536) @embed(content)
+}
+"#
+}
+
+fn embed_merge_initial_data() -> &'static str {
+    r#"
+{"type":"Chunk","data":{"slug":"abc123","chunk_type":"teaching_point","content":"Some text content here...","context":"Context info"}}
+"#
+}
+
+fn embed_merge_delta_data() -> &'static str {
+    r#"
+{"type":"Chunk","data":{"slug":"abc123","chunk_type":"teaching_point","content":"Some text content here...","context":"Context info"}}
+{"type":"Chunk","data":{"slug":"def456","chunk_type":"teaching_point","content":"More text content here...","context":"More context info"}}
+"#
+}
+
 fn write_bug_fixture(workspace: &ExampleWorkspace) {
     workspace.write_file("bug.pg", bug_schema());
     workspace.write_file("bug.jsonl", bug_seed_data());
@@ -79,6 +104,23 @@ fn init_bug_db(workspace: &ExampleWorkspace) {
     write_bug_fixture(workspace);
     let init = workspace.json_value(&["--json", "init", "bug.nano", "--schema", "bug.pg"]);
     assert_eq!(init["status"], "ok");
+}
+
+fn write_embed_merge_fixture(workspace: &ExampleWorkspace) {
+    workspace.write_file(".env.nano", "NANOGRAPH_EMBEDDINGS_MOCK=1\n");
+    workspace.write_file("embed.pg", embed_merge_schema());
+    workspace.write_file("embed-initial.jsonl", embed_merge_initial_data());
+    workspace.write_file("embed-merge.jsonl", embed_merge_delta_data());
+    workspace.write_file(
+        "embed.gq",
+        r#"
+query all_chunks() {
+    match { $c: Chunk }
+    return { $c.slug, $c.embedding }
+    order { $c.slug asc }
+}
+"#,
+    );
 }
 
 #[test]
@@ -256,4 +298,51 @@ fn prepared_journal_is_cleaned_when_database_is_intact() {
     assert!(doctor.contains("Doctor OK"));
     assert!(!journal_path.exists());
     assert!(!staging_path.exists());
+}
+
+#[test]
+fn merge_mode_materializes_missing_embeddings_end_to_end() {
+    let workspace = ExampleWorkspace::copy(ExampleProject::Revops);
+    write_embed_merge_fixture(&workspace);
+
+    let init = workspace.json_value(&["--json", "init", "embed.nano", "--schema", "embed.pg"]);
+    assert_eq!(init["status"], "ok");
+
+    let overwrite = workspace.json_value(&[
+        "--json",
+        "load",
+        "embed.nano",
+        "--data",
+        "embed-initial.jsonl",
+        "--mode",
+        "overwrite",
+    ]);
+    assert_eq!(overwrite["status"], "ok");
+
+    let merge = workspace.json_value(&[
+        "--json",
+        "load",
+        "embed.nano",
+        "--data",
+        "embed-merge.jsonl",
+        "--mode",
+        "merge",
+    ]);
+    assert_eq!(merge["status"], "ok");
+
+    let rows = workspace.json_rows(&[
+        "--json",
+        "run",
+        "--db",
+        "embed.nano",
+        "--query",
+        "embed.gq",
+        "--name",
+        "all_chunks",
+    ]);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["slug"], "abc123");
+    assert_eq!(rows[1]["slug"], "def456");
+    assert_eq!(rows[0]["embedding"].as_array().map(Vec::len), Some(1536));
+    assert_eq!(rows[1]["embedding"].as_array().map(Vec::len), Some(1536));
 }

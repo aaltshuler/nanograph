@@ -4,8 +4,9 @@ use std::sync::Arc;
 
 use arrow_array::builder::UInt64Builder;
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array,
-    Int32Array, Int64Array, ListArray, RecordBatch, StringArray, UInt32Array, UInt64Array,
+    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, FixedSizeListArray, Float32Array,
+    Float64Array, Int32Array, Int64Array, ListArray, RecordBatch, StringArray, UInt32Array,
+    UInt64Array,
 };
 use arrow_schema::DataType;
 
@@ -694,8 +695,47 @@ fn array_value_to_json(array: &ArrayRef, row: usize) -> serde_json::Value {
                 )
             })
             .unwrap_or(serde_json::Value::Null),
+        DataType::FixedSizeList(_, _) => array
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .map(|a| fixed_size_list_value_to_json(a, row))
+            .unwrap_or(serde_json::Value::Null),
         _ => serde_json::Value::Null,
     }
+}
+
+fn fixed_size_list_value_to_json(array: &FixedSizeListArray, row: usize) -> serde_json::Value {
+    let value_len = array.value_length() as usize;
+    let values = array.values();
+    if let Some(float_values) = values.as_any().downcast_ref::<Float32Array>() {
+        let start = row.saturating_mul(value_len);
+        return float32_json_array(float_values, start, value_len);
+    }
+
+    let values = array.value(row);
+    serde_json::Value::Array(
+        (0..values.len())
+            .map(|idx| array_value_to_json(&values, idx))
+            .collect(),
+    )
+}
+
+fn float32_json_array(values: &Float32Array, start: usize, len: usize) -> serde_json::Value {
+    let mut out = Vec::with_capacity(len);
+    let end = start.saturating_add(len).min(values.len());
+    for idx in start..end {
+        if values.is_null(idx) {
+            out.push(serde_json::Value::Null);
+            continue;
+        }
+        let value = values.value(idx) as f64;
+        out.push(
+            serde_json::Number::from_f64(value)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null),
+        );
+    }
+    serde_json::Value::Array(out)
 }
 
 #[cfg(test)]
@@ -705,6 +745,7 @@ mod tests {
 
     use crate::catalog::schema_ir::{build_catalog_from_ir, build_schema_ir};
     use crate::schema::parser::parse_schema;
+    use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
     use arrow_schema::{Field, Schema};
 
     use super::*;
@@ -811,6 +852,42 @@ mod tests {
                 Arc::new(UInt64Array::from(internal_ids)) as ArrayRef,
                 Arc::new(StringArray::from(user_ids)) as ArrayRef,
                 Arc::new(StringArray::from(names)) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    }
+
+    fn node_batch_with_embedding(
+        ids: Vec<u64>,
+        slugs: Vec<&str>,
+        embeddings: Vec<[f32; 3]>,
+    ) -> RecordBatch {
+        let mut builder =
+            FixedSizeListBuilder::with_capacity(Float32Builder::new(), 3, embeddings.len());
+        for embedding in embeddings {
+            for value in embedding {
+                builder.values().append_value(value);
+            }
+            builder.append(true);
+        }
+
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::UInt64, false),
+                Field::new("slug", DataType::Utf8, false),
+                Field::new(
+                    "embedding",
+                    DataType::FixedSizeList(
+                        Arc::new(Field::new("item", DataType::Float32, true)),
+                        3,
+                    ),
+                    false,
+                ),
+            ])),
+            vec![
+                Arc::new(UInt64Array::from(ids)) as ArrayRef,
+                Arc::new(StringArray::from(slugs)) as ArrayRef,
+                Arc::new(builder.finish()) as ArrayRef,
             ],
         )
         .unwrap()
@@ -938,6 +1015,55 @@ mod tests {
         assert_eq!(by_name.get("Alice"), Some(&(10, 31)));
         assert_eq!(by_name.get("Bob"), Some(&(11, 40)));
         assert_eq!(by_name.get("Cara"), Some(&(50, 22)));
+    }
+
+    #[test]
+    fn run_keyed_merge_insert_in_memory_preserves_fixed_size_list_values() {
+        let existing = node_batch_with_embedding(
+            vec![10],
+            vec!["a"],
+            vec![[1.0, 0.0, 0.0]],
+        );
+        let incoming = node_batch_with_embedding(
+            vec![1, 2],
+            vec!["a", "b"],
+            vec![[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        );
+        let mut next_id = 50;
+        let (source_batch, remap) =
+            rewrite_incoming_keyed_ids(&existing, &incoming, "slug", &mut next_id).unwrap();
+        assert_eq!(remap.get(&1), Some(&10));
+        assert_eq!(remap.get(&2), Some(&50));
+
+        let merged = run_keyed_merge_insert_in_memory(&existing, source_batch, "slug").unwrap();
+        let slugs = merged
+            .column_by_name("slug")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let embeddings = merged
+            .column_by_name("embedding")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        let values = embeddings.values();
+        let values = values.as_any().downcast_ref::<Float32Array>().unwrap();
+
+        let mut by_slug = HashMap::new();
+        for row in 0..merged.num_rows() {
+            let start = row * 3;
+            let vector = vec![
+                values.value(start),
+                values.value(start + 1),
+                values.value(start + 2),
+            ];
+            by_slug.insert(slugs.value(row).to_string(), vector);
+        }
+
+        assert_eq!(by_slug.get("a"), Some(&vec![0.0, 1.0, 0.0]));
+        assert_eq!(by_slug.get("b"), Some(&vec![0.0, 0.0, 1.0]));
     }
 
     #[test]
