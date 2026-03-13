@@ -100,6 +100,12 @@ pub fn infer_query_result_schema(
 fn parse_declared_param_types(params: &[Param]) -> Result<HashMap<String, PropType>> {
     let mut out = HashMap::with_capacity(params.len());
     for p in params {
+        if p.name == NOW_PARAM_NAME {
+            return Err(NanoError::Type(format!(
+                "parameter name `${}` is reserved for runtime timestamp injection",
+                NOW_PARAM_NAME
+            )));
+        }
         let scalar = ScalarType::from_str_name(&p.type_name).ok_or_else(|| {
             NanoError::Type(format!(
                 "unknown parameter type `{}` for `${}`",
@@ -482,7 +488,19 @@ fn check_match_value_type(
             }
             Ok(())
         }
+        MatchValue::Now => check_now_match_value_type(expected, property),
     }
+}
+
+fn check_now_match_value_type(expected: &PropType, property: &str) -> Result<()> {
+    if expected.list || expected.scalar != ScalarType::DateTime {
+        return Err(NanoError::Type(format!(
+            "T7: cannot assign/compare DateTime with {} for property `{}`",
+            expected.display_name(),
+            property
+        )));
+    }
+    Ok(())
 }
 
 fn typecheck_clauses(
@@ -569,6 +587,7 @@ fn typecheck_binding(catalog: &Catalog, binding: &Binding, ctx: &mut TypeContext
             MatchValue::Variable(_) => {
                 // Variable match — will be unified, no static check needed here
             }
+            MatchValue::Now => check_now_match_value_type(prop, &pm.prop_name)?,
         }
     }
 
@@ -748,6 +767,10 @@ fn resolve_expr_type(
     params: &HashMap<String, PropType>,
 ) -> Result<ResolvedType> {
     match expr {
+        Expr::Now => Ok(ResolvedType::Scalar(PropType::scalar(
+            ScalarType::DateTime,
+            false,
+        ))),
         Expr::PropAccess { variable, property } => {
             // T6: variable must be bound and property must exist
             let bv = ctx.bindings.get(variable).ok_or_else(|| {
@@ -1197,6 +1220,7 @@ fn projection_name(expr: &Expr, alias: Option<&str>) -> String {
     }
 
     match expr {
+        Expr::Now => "now".to_string(),
         Expr::PropAccess { property, .. } => property.clone(),
         Expr::Variable(variable) => variable.clone(),
         Expr::Literal(_) => "literal".to_string(),
@@ -2373,5 +2397,60 @@ query upd_knows($from: String) {
         .unwrap();
         let err = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap_err();
         assert!(err.to_string().contains("T16"));
+    }
+
+    #[test]
+    fn test_now_expression_typechecks_as_datetime() {
+        let schema = parse_schema(
+            r#"
+node Event {
+    slug: String @key
+    at: DateTime
+}
+"#,
+        )
+        .unwrap();
+        let catalog = build_catalog(&schema).unwrap();
+        let qf = parse_query(
+            r#"
+query due() {
+    match {
+        $e: Event
+        $e.at <= now()
+    }
+    return { now() as ts }
+}
+"#,
+        )
+        .unwrap();
+
+        let checked = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap();
+        assert!(matches!(checked, CheckedQuery::Read(_)));
+    }
+
+    #[test]
+    fn test_now_is_rejected_for_non_datetime_mutation_property() {
+        let schema = parse_schema(
+            r#"
+node Event {
+    slug: String @key
+    on: Date
+}
+"#,
+        )
+        .unwrap();
+        let catalog = build_catalog(&schema).unwrap();
+        let qf = parse_query(
+            r#"
+query stamp() {
+    update Event set { on: now() } where slug = "launch"
+}
+"#,
+        )
+        .unwrap();
+
+        let err = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap_err();
+        assert!(err.to_string().contains("DateTime"));
+        assert!(err.to_string().contains("property `on`"));
     }
 }

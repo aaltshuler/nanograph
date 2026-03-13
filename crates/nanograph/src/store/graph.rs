@@ -269,6 +269,18 @@ impl GraphStorage {
         Ok(())
     }
 
+    /// Replace all node batches for a type with the provided batch.
+    pub fn replace_node_batch(&mut self, type_name: &str, batch: RecordBatch) -> Result<()> {
+        let segment = self
+            .node_segments
+            .get_mut(type_name)
+            .ok_or_else(|| NanoError::Storage(format!("unknown node type: {}", type_name)))?;
+        segment.batches.clear();
+        segment.id_to_row.clear();
+        segment.next_local_id = 0;
+        self.load_node_batch(type_name, batch)
+    }
+
     /// Load edge data from a combined batch (edge_id, src, dst, ...props).
     /// Extracts vectors and optional property columns.
     pub fn load_edge_batch(&mut self, type_name: &str, batch: RecordBatch) -> Result<()> {

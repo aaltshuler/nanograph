@@ -1,3 +1,6 @@
+// Legacy manual performance harness.
+// Prefer the Criterion benchmark in `crates/nanograph/benches/query_lookup.rs`.
+
 use std::time::{Duration, Instant};
 
 use nanograph::query::parser::parse_query;

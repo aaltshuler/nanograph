@@ -1,3 +1,5 @@
+pub(crate) const NOW_PARAM_NAME: &str = "__nanograph_now";
+
 #[derive(Debug, Clone)]
 pub struct QueryFile {
     pub queries: Vec<QueryDecl>,
@@ -48,6 +50,7 @@ pub struct PropMatch {
 pub enum MatchValue {
     Literal(Literal),
     Variable(String),
+    Now,
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +94,7 @@ impl std::fmt::Display for CompOp {
 
 #[derive(Debug, Clone)]
 pub enum Expr {
+    Now,
     PropAccess {
         variable: String,
         property: String,

@@ -14,7 +14,7 @@ use crate::catalog::schema_ir::{SchemaIR, build_catalog_from_ir, build_schema_ir
 use crate::error::{NanoError, Result};
 use crate::ir::{ParamMap, QueryIR};
 use crate::plan::physical::execute_mutation;
-use crate::query::ast::QueryDecl;
+use crate::query::ast::{Literal, NOW_PARAM_NAME, QueryDecl};
 use crate::query::parser::parse_query;
 use crate::query::typecheck::{
     CheckedQuery, infer_query_result_schema, typecheck_query, typecheck_query_decl,
@@ -139,6 +139,26 @@ pub struct CdcAnalyticsMaterializeResult {
     pub dataset_written: bool,
     pub skipped_by_threshold: bool,
     pub dataset_version: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct EmbedOptions {
+    pub type_name: Option<String>,
+    pub property: Option<String>,
+    pub only_null: bool,
+    pub limit: Option<usize>,
+    pub reindex: bool,
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EmbedResult {
+    pub node_types_considered: usize,
+    pub properties_selected: usize,
+    pub rows_selected: usize,
+    pub embeddings_generated: usize,
+    pub reindexed_types: usize,
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -267,7 +287,8 @@ impl PreparedReadQuery {
     }
 
     pub async fn execute(&self, params: &ParamMap) -> Result<QueryResult> {
-        let batches = execute_query(&self.ir, self.storage.clone(), params).await?;
+        let runtime_params = params_with_runtime_now(params)?;
+        let batches = execute_query(&self.ir, self.storage.clone(), &runtime_params).await?;
         Ok(QueryResult::new(self.output_schema.clone(), batches))
     }
 
@@ -528,7 +549,8 @@ impl Database {
 
             let mutation_ir = lower_mutation_query(query)?;
             let mut writer = self.lock_writer().await;
-            let result = execute_mutation(&mutation_ir, self, params, &mut writer).await?;
+            let runtime_params = params_with_runtime_now(params)?;
+            let result = execute_mutation(&mutation_ir, self, &runtime_params, &mut writer).await?;
             return Ok(RunResult::Mutation(MutationResult::from(result)));
         }
 
@@ -582,6 +604,26 @@ fn now_unix_seconds_string() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs().to_string())
         .unwrap_or_else(|_| "0".to_string())
+}
+
+fn runtime_now_literal() -> Result<Literal> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| NanoError::Execution(format!("failed to read system time: {}", e)))?;
+    let millis = i64::try_from(now.as_millis())
+        .map_err(|_| NanoError::Execution("system time exceeds supported range".to_string()))?;
+    let dt = arrow_array::temporal_conversions::date64_to_datetime(millis).ok_or_else(|| {
+        NanoError::Execution("failed to convert system time to DateTime literal".to_string())
+    })?;
+    Ok(Literal::DateTime(
+        dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
+    ))
+}
+
+fn params_with_runtime_now(params: &ParamMap) -> Result<ParamMap> {
+    let mut runtime_params = params.clone();
+    runtime_params.insert(NOW_PARAM_NAME.to_string(), runtime_now_literal()?);
+    Ok(runtime_params)
 }
 
 fn load_mode_op_summary(mode: LoadMode) -> &'static str {

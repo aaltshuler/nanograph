@@ -122,8 +122,8 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
     }
 
     // Second pass: collect edge types, validate endpoints
-        for decl in &schema.declarations {
-            if let SchemaDecl::Edge(edge) = decl {
+    for decl in &schema.declarations {
+        if let SchemaDecl::Edge(edge) = decl {
             if edge_types.contains_key(&edge.name) {
                 return Err(NanoError::Catalog(format!(
                     "duplicate edge type: {}",

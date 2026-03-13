@@ -136,6 +136,7 @@ Boolean expressions over bound variables:
 $f.age > 25
 $p.name != "Bob"
 $p.createdAt >= datetime("2026-01-01T00:00:00Z")
+$p.updatedAt <= now()
 $o.amount >= 10000.0
 ```
 
@@ -242,6 +243,24 @@ Required when using `nearest()` or `rrf()` in the order clause.
 | DateTime | `datetime("2026-01-15T10:00:00Z")` |
 | List | `[1, 2, 3]`, `["a", "b"]` |
 
+### Built-in runtime values
+
+| Expression | Type | Description |
+|------------|------|-------------|
+| `now()` | `DateTime` | Current UTC timestamp, resolved once per query execution |
+
+`now()` can be used in filters, projections, bindings, and mutation assignments/predicates:
+
+```graphql
+query recently_updated() {
+    match {
+        $p: Person
+        $p.updatedAt <= now()
+    }
+    return { $p.name, now() as queried_at }
+}
+```
+
 ## Mutations
 
 Mutation queries modify graph data. They use the same `query` wrapper but contain `insert`, `update`, or `delete` instead of `match`/`return`.
@@ -253,6 +272,14 @@ Append a new node:
 ```graphql
 query add_person($name: String, $age: I32) {
     insert Person { name: $name, age: $age }
+}
+```
+
+Set a server-side timestamp during mutation:
+
+```graphql
+query touch_person($name: String) {
+    update Person set { updatedAt: now() } where name = $name
 }
 ```
 

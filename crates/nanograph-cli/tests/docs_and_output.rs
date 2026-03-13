@@ -88,6 +88,22 @@ fn revops_example_doc_commands_stay_green() {
         "json",
     ]);
     assert!(!signals.is_empty());
+
+    let embed = workspace.json_value(&[
+        "--json",
+        "embed",
+        "--type",
+        "Signal",
+        "--property",
+        "summaryEmbedding",
+        "--limit",
+        "1",
+        "--dry-run",
+    ]);
+    assert_eq!(embed["status"], "ok");
+    assert_eq!(embed["dry_run"], true);
+    assert_eq!(embed["rows_selected"], 1);
+    assert_eq!(embed["embeddings_generated"], 1);
 }
 
 #[test]

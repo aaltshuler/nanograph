@@ -37,10 +37,11 @@ use nanograph::query::typecheck::{CheckedQuery, typecheck_query_decl};
 use nanograph::schema::parser::parse_schema_diagnostic;
 use nanograph::store::database::{
     CdcAnalyticsMaterializeOptions, CleanupOptions, CompactOptions, Database, DeleteOp,
-    DeletePredicate, LoadMode,
+    DeletePredicate, EmbedOptions, LoadMode,
 };
+use nanograph::store::migration::{SchemaDiffReport, analyze_schema_diff};
 use nanograph::store::txlog::{CdcLogEntry, read_visible_cdc_entries};
-use schema_ops::{cmd_migrate, cmd_schema_diff};
+use schema_ops::{cmd_migrate, cmd_schema_diff, schema_compatibility_label};
 use ui::{
     StatusTone, format_status_line, stderr_supports_color, stdout_supports_color, style_key,
     style_label, style_scalar,
@@ -127,6 +128,30 @@ enum Commands {
         #[arg(long, value_enum)]
         mode: LoadModeArg,
     },
+    /// Backfill or recompute @embed(...) vector properties on existing rows
+    Embed {
+        /// Database directory
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Restrict to one node type
+        #[arg(long = "type")]
+        type_name: Option<String>,
+        /// Restrict to one @embed target property (requires --type)
+        #[arg(long)]
+        property: Option<String>,
+        /// Only embed rows where the target property is currently null
+        #[arg(long, default_value_t = false)]
+        only_null: bool,
+        /// Maximum number of rows to process
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Rebuild vector indexes even if no rows are updated
+        #[arg(long, default_value_t = false)]
+        reindex: bool,
+        /// Report what would be embedded without writing
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
     /// Delete nodes by predicate, cascading incident edges
     Delete {
         /// Path to the database directory
@@ -184,6 +209,9 @@ enum Commands {
     Doctor {
         /// Path to the database directory
         db_path: Option<PathBuf>,
+        /// Desired schema file to compare against the current DB schema
+        #[arg(long)]
+        schema: Option<PathBuf>,
     },
     /// Materialize visible CDC into a derived Lance analytics dataset
     CdcMaterialize {
@@ -217,6 +245,9 @@ enum Commands {
         db: Option<PathBuf>,
         #[arg(long)]
         query: PathBuf,
+        /// Desired schema file for stale-schema diagnostics
+        #[arg(long)]
+        schema: Option<PathBuf>,
     },
     /// Run a named query against data
     Run {
@@ -329,6 +360,31 @@ async fn dispatch_cli(
             let db_path = config.resolve_db_path(db_path)?;
             cmd_load(&db_path, &data, mode, json, quiet).await
         }
+        Commands::Embed {
+            db,
+            type_name,
+            property,
+            only_null,
+            limit,
+            reindex,
+            dry_run,
+        } => {
+            let db_path = config.resolve_db_path(db)?;
+            cmd_embed(
+                &db_path,
+                EmbedOptions {
+                    type_name,
+                    property,
+                    only_null,
+                    limit,
+                    reindex,
+                    dry_run,
+                },
+                json,
+                quiet,
+            )
+            .await
+        }
         Commands::Delete {
             db_path,
             type_name,
@@ -380,9 +436,12 @@ async fn dispatch_cli(
             )
             .await
         }
-        Commands::Doctor { db_path } => {
+        Commands::Doctor { db_path, schema } => {
             let db_path = config.resolve_db_path(db_path)?;
-            cmd_doctor(&db_path, json, quiet).await
+            let schema = schema
+                .map(|path| config.resolve_schema_path(Some(path)))
+                .transpose()?;
+            cmd_doctor(&db_path, schema.as_deref(), json, quiet).await
         }
         Commands::CdcMaterialize {
             db_path,
@@ -402,10 +461,11 @@ async fn dispatch_cli(
             let format = config.resolve_format(format.as_deref(), "table", &["table", "json"])?;
             cmd_migrate(&db_path, dry_run, &format, auto_approve, json, quiet).await
         }
-        Commands::Check { db, query } => {
+        Commands::Check { db, query, schema } => {
             let db = config.resolve_db_path(db)?;
             let query = config.resolve_query_path(&query)?;
-            cmd_check(db, &query, json, quiet).await
+            let schema = config.resolve_optional_schema_path(schema);
+            cmd_check(db, &query, schema.as_deref(), json, quiet).await
         }
         Commands::Run {
             alias,
@@ -952,6 +1012,81 @@ async fn cmd_load(
     Ok(())
 }
 
+#[instrument(
+    fields(
+        db_path = %db_path.display(),
+        type_name = options.type_name.as_deref(),
+        property = options.property.as_deref(),
+        only_null = options.only_null,
+        limit = options.limit,
+        reindex = options.reindex,
+        dry_run = options.dry_run
+    )
+)]
+async fn cmd_embed(
+    db_path: &Path,
+    options: EmbedOptions,
+    json: bool,
+    quiet: bool,
+) -> Result<()> {
+    let db = Database::open(db_path).await?;
+    let result = db.embed(options.clone()).await?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "status": "ok",
+                "db_path": db_path.display().to_string(),
+                "type_name": options.type_name,
+                "property": options.property,
+                "only_null": options.only_null,
+                "limit": options.limit,
+                "reindex": options.reindex,
+                "dry_run": options.dry_run,
+                "node_types_considered": result.node_types_considered,
+                "properties_selected": result.properties_selected,
+                "rows_selected": result.rows_selected,
+                "embeddings_generated": result.embeddings_generated,
+                "reindexed_types": result.reindexed_types,
+            })
+        );
+    } else if !quiet {
+        let mut message = if result.dry_run {
+            format!(
+                "Would embed {} value(s) across {} row(s) in {}",
+                result.embeddings_generated,
+                result.rows_selected,
+                db_path.display()
+            )
+        } else {
+            format!(
+                "Embedded {} value(s) across {} row(s) in {}",
+                result.embeddings_generated,
+                result.rows_selected,
+                db_path.display()
+            )
+        };
+        if result.reindexed_types > 0 {
+            message.push_str(&format!(
+                " (reindexed {} type(s))",
+                result.reindexed_types
+            ));
+        }
+        let tone = if result.dry_run {
+            StatusTone::Skip
+        } else {
+            StatusTone::Ok
+        };
+        println!(
+            "{}",
+            format_status_line(tone, &message, stdout_supports_color())
+        );
+    }
+
+    Ok(())
+}
+
 fn render_load_error(db_path: &Path, err: &NanoError, json: bool) {
     if let NanoError::UniqueConstraint {
         type_name,
@@ -1305,12 +1440,139 @@ async fn cmd_cdc_materialize(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct SchemaDriftSummary {
+    current_schema_path: PathBuf,
+    desired_schema_path: PathBuf,
+    report: SchemaDiffReport,
+}
+
+impl SchemaDriftSummary {
+    fn matches(&self) -> bool {
+        self.report.steps.is_empty()
+    }
+}
+
+fn load_schema_drift_summary(
+    db_path: &Path,
+    desired_schema_path: &Path,
+) -> Result<SchemaDriftSummary> {
+    let current_schema_path = db_path.join("schema.pg");
+    let current_schema_src = std::fs::read_to_string(&current_schema_path).wrap_err_with(|| {
+        format!(
+            "failed to read current DB schema: {}",
+            current_schema_path.display()
+        )
+    })?;
+    let desired_schema_src = std::fs::read_to_string(desired_schema_path)
+        .wrap_err_with(|| format!("failed to read schema: {}", desired_schema_path.display()))?;
+    let current_schema = parse_schema_or_report(&current_schema_path, &current_schema_src)?;
+    let desired_schema = parse_schema_or_report(desired_schema_path, &desired_schema_src)?;
+    let report = analyze_schema_diff(&current_schema, &desired_schema)?;
+    Ok(SchemaDriftSummary {
+        current_schema_path,
+        desired_schema_path: desired_schema_path.to_path_buf(),
+        report,
+    })
+}
+
+fn schema_drift_hint_message(db_path: &Path, drift: Option<&SchemaDriftSummary>) -> String {
+    match drift {
+        Some(drift) if !drift.matches() => format!(
+            "query is checked against the current DB schema at {}; desired schema {} differs ({}, {} step(s)); run `nanograph migrate {}` to bring the DB schema up to date",
+            drift.current_schema_path.display(),
+            drift.desired_schema_path.display(),
+            schema_compatibility_label(drift.report.compatibility),
+            drift.report.steps.len(),
+            db_path.display()
+        ),
+        _ => format!(
+            "queries are checked against the current DB schema at {}; if your source schema changed, migrate the DB or pass --schema <path> for drift diagnostics",
+            db_path.join("schema.pg").display()
+        ),
+    }
+}
+
+fn typecheck_error_looks_like_schema_drift(error_message: &str) -> bool {
+    error_message.contains(" has no property `")
+        || error_message.contains("unknown node type `")
+        || error_message.contains("unknown node/edge type `")
+        || error_message.contains(" not found in catalog")
+}
+
+fn render_check_error(
+    error: &dyn StdError,
+    db_path: &Path,
+    drift: Option<&SchemaDriftSummary>,
+) -> String {
+    let rendered = error.to_string();
+    if typecheck_error_looks_like_schema_drift(&rendered) {
+        format!(
+            "{}\n  hint: {}",
+            rendered,
+            schema_drift_hint_message(db_path, drift)
+        )
+    } else {
+        rendered
+    }
+}
+
 #[instrument(fields(db_path = %db_path.display()))]
-async fn cmd_doctor(db_path: &Path, json: bool, quiet: bool) -> Result<()> {
+async fn cmd_doctor(
+    db_path: &Path,
+    desired_schema_path: Option<&Path>,
+    json: bool,
+    quiet: bool,
+) -> Result<()> {
     let db = Database::open(db_path).await?;
-    let report = db.doctor().await?;
+    let mut report = db.doctor().await?;
+    let schema_drift = desired_schema_path
+        .map(|path| load_schema_drift_summary(db_path, path))
+        .transpose()?;
+
+    if let Some(drift) = &schema_drift
+        && !drift.matches()
+    {
+        report.issues.push(format!(
+            "database schema differs from desired schema {} ({}, {} step(s)); run `nanograph migrate {}`",
+            drift.desired_schema_path.display(),
+            schema_compatibility_label(drift.report.compatibility),
+            drift.report.steps.len(),
+            db_path.display()
+        ));
+        report.warnings.extend(
+            drift
+                .report
+                .warnings
+                .iter()
+                .map(|warning| format!("schema diff: {}", warning)),
+        );
+        report.issues.extend(
+            drift
+                .report
+                .blocked
+                .iter()
+                .map(|item| format!("schema diff blocked: {}", item)),
+        );
+        report.healthy = false;
+    }
 
     if json {
+        let schema_status = schema_drift.as_ref().map(|drift| {
+            serde_json::json!({
+                "current_schema_path": drift.current_schema_path.display().to_string(),
+                "desired_schema_path": drift.desired_schema_path.display().to_string(),
+                "matches": drift.matches(),
+                "old_schema_hash": drift.report.old_schema_hash,
+                "new_schema_hash": drift.report.new_schema_hash,
+                "compatibility": schema_compatibility_label(drift.report.compatibility),
+                "has_breaking": drift.report.has_breaking,
+                "step_count": drift.report.steps.len(),
+                "steps": drift.report.steps.clone(),
+                "warnings": drift.report.warnings.clone(),
+                "blocked": drift.report.blocked.clone(),
+            })
+        });
         println!(
             "{}",
             serde_json::json!({
@@ -1323,6 +1585,7 @@ async fn cmd_doctor(db_path: &Path, json: bool, quiet: bool) -> Result<()> {
                 "cdc_rows": report.cdc_rows,
                 "issues": report.issues,
                 "warnings": report.warnings,
+                "schema_status": schema_status,
             })
         );
     } else {
@@ -1389,16 +1652,32 @@ async fn cmd_doctor(db_path: &Path, json: bool, quiet: bool) -> Result<()> {
     if report.healthy {
         Ok(())
     } else {
+        if json {
+            return Err(RenderedJsonError(format!(
+                "doctor detected {} issue(s)",
+                report.issues.len()
+            ))
+            .into());
+        }
         Err(eyre!("doctor detected {} issue(s)", report.issues.len()))
     }
 }
 
 #[instrument(skip(query_path), fields(db_path = %db_path.display(), query_path = %query_path.display()))]
-async fn cmd_check(db_path: PathBuf, query_path: &PathBuf, json: bool, quiet: bool) -> Result<()> {
+async fn cmd_check(
+    db_path: PathBuf,
+    query_path: &PathBuf,
+    desired_schema_path: Option<&Path>,
+    json: bool,
+    quiet: bool,
+) -> Result<()> {
     let query_src = std::fs::read_to_string(query_path)
         .wrap_err_with(|| format!("failed to read query: {}", query_path.display()))?;
     let db = Database::open(&db_path).await?;
     let catalog = db.catalog().clone();
+    let schema_drift = desired_schema_path
+        .map(|path| load_schema_drift_summary(&db_path, path))
+        .transpose()?;
 
     let queries = parse_query_or_report(query_path, &query_src)?;
 
@@ -1441,10 +1720,11 @@ async fn cmd_check(db_path: PathBuf, query_path: &PathBuf, json: bool, quiet: bo
                 }));
             }
             Err(e) => {
+                let rendered_error = render_check_error(&e, &db_path, schema_drift.as_ref());
                 if !json {
                     let message = format_status_line(
                         StatusTone::Error,
-                        &format!("query `{}`: {}", q.name, e),
+                        &format!("query `{}`: {}", q.name, rendered_error),
                         if quiet {
                             stderr_supports_color()
                         } else {
@@ -1461,7 +1741,7 @@ async fn cmd_check(db_path: PathBuf, query_path: &PathBuf, json: bool, quiet: bo
                     "name": q.name,
                     "kind": if q.mutation.is_some() { "mutation" } else { "read" },
                     "status": "error",
-                    "error": e.to_string(),
+                    "error": rendered_error,
                 }));
                 error_count += 1;
             }
@@ -1494,7 +1774,9 @@ async fn cmd_check(db_path: PathBuf, query_path: &PathBuf, json: bool, quiet: bo
     }
     if error_count > 0 {
         if json {
-            return Err(RenderedJsonError(format!("{} query(s) failed typecheck", error_count)).into());
+            return Err(
+                RenderedJsonError(format!("{} query(s) failed typecheck", error_count)).into(),
+            );
         }
         return Err(eyre!("{} query(s) failed typecheck", error_count));
     }

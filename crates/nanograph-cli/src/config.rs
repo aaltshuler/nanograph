@@ -257,6 +257,12 @@ impl LoadedConfig {
         }
     }
 
+    pub fn resolve_optional_schema_path(&self, cli_path: Option<PathBuf>) -> Option<PathBuf> {
+        cli_path
+            .or_else(|| self.settings.schema.default_path.clone())
+            .map(|path| self.resolve_relative(path))
+    }
+
     pub fn resolve_query_path(&self, query_path: &Path) -> Result<PathBuf> {
         if query_path.is_absolute() || query_path.exists() {
             return Ok(query_path.to_path_buf());

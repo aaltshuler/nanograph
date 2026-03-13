@@ -19,7 +19,7 @@ use lance_index::DatasetIndexExt;
 use crate::embedding::EmbeddingClient;
 use crate::error::{NanoError, Result};
 use crate::ir::*;
-use crate::query::ast::{AggFunc, CompOp, Literal};
+use crate::query::ast::{AggFunc, CompOp, Literal, NOW_PARAM_NAME};
 use crate::store::graph::GraphStorage;
 use crate::store::lance_io::logical_node_field_to_lance;
 use crate::types::ScalarType;
@@ -2480,8 +2480,12 @@ fn infer_projection_field(
             Ok((name, DataType::Utf8, true))
         }
         IRExpr::Param(p) => {
-            let name = alias.unwrap_or(p).to_string();
-            Ok((name, DataType::Utf8, true))
+            let (name, data_type, nullable) = if p == NOW_PARAM_NAME {
+                (alias.unwrap_or("now").to_string(), DataType::Date64, false)
+            } else {
+                (alias.unwrap_or(p).to_string(), DataType::Utf8, true)
+            };
+            Ok((name, data_type, nullable))
         }
         IRExpr::AliasRef(a) => {
             let name = alias.unwrap_or(a).to_string();

@@ -12,12 +12,15 @@
 | [search.md](user/search.md) | Text search, vector search, hybrid fusion |
 | [starwars-example.md](user/starwars-example.md) | Star Wars worked example with search |
 | [context-graph-example.md](user/context-graph-example.md) | CRM context graph case study |
+| [best-practices.md](user/best-practices.md) | Agent best practices — common mistakes and how to avoid them |
 
 ## Developer Docs
 
 | Document | Description |
 |----------|-------------|
 | [embeddable-api.md](dev/embeddable-api.md) | Current embeddable API, streaming ingest, and SDK status |
+| [benchmarking.md](dev/benchmarking.md) | Criterion benchmark suite and how to run it |
+| [benchmark-host.md](dev/benchmark-host.md) | Recommended AWS benchmark host spec and provisioning checklist |
 | [backlog.md](dev/backlog.md) | High-level shipped milestones and deferred follow-up |
 | [typescript-sdk.md](dev/typescript-sdk.md) | TypeScript SDK notes and current surface |
 | [swift-sdk.md](dev/swift-sdk.md) | Swift SDK notes and current surface |

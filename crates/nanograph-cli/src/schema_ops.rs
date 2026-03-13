@@ -237,7 +237,7 @@ fn render_schema_diff_report(report: &SchemaDiffReport, format: &str) -> Result<
     Ok(())
 }
 
-fn schema_compatibility_label(value: SchemaCompatibility) -> &'static str {
+pub(crate) fn schema_compatibility_label(value: SchemaCompatibility) -> &'static str {
     match value {
         SchemaCompatibility::Additive => "additive",
         SchemaCompatibility::CompatibleWithConfirmation => "compatible_with_confirmation",

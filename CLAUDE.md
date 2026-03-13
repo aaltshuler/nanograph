@@ -23,6 +23,9 @@ cargo test -p nanograph-cli --test starwars_workflows  # single CLI test file
 cargo clippy                             # lint
 cargo fmt                                # format
 RUST_LOG=debug cargo run -p nanograph-cli -- run ...  # enable tracing
+cargo bench -p nanograph                 # all criterion benchmarks
+cargo bench -p nanograph --bench traversal  # single benchmark domain
+NANOGRAPH_BENCH_SMOKE=1 cargo bench -p nanograph  # quick smoke mode
 cargo build -p nanograph-ffi             # FFI crate (not in default-members)
 cargo build -p nanograph-ts              # TS SDK crate (not in default-members)
 ```
@@ -218,18 +221,25 @@ Arrow 57, DataFusion 52, Lance 2.0 + lance-index 2.0 — these must stay compati
 - `docs/dev/typescript-sdk.md` — TypeScript SDK implementation details (lock semantics, type conversion, build)
 - `docs/dev/swift-sdk.md` — Swift SDK implementation details (C ABI, Swift Package wrapper)
 - `docs/dev/release-checklist.md` — release process steps
+- `docs/dev/embeddable-api.md` — embeddable API, streaming ingest, SDK status
+- `docs/dev/benchmarking.md` — criterion benchmark suite and how to run it
+- `docs/dev/benchmark-host.md` — recommended AWS benchmark host spec and provisioning
+
+User-facing docs live in `docs/user/` — schema, queries, search, config, CLI reference, worked examples, and `best-practices.md` (agent anti-patterns and operational guidelines).
 
 Source of truth for behavior is code. Update docs in the same PR when behavior changes.
 
 ## Test Fixtures
 
-Test schemas, queries, and data live in `crates/nanograph/tests/fixtures/` (test.pg, test.gq, test.jsonl). Star Wars example in `examples/starwars/`. Library integration tests: `engine_integration.rs` (core query engine), `schema_migration.rs` (schema evolution). Performance harnesses (run with `--ignored`): `index_perf.rs`, `write_amp_perf.rs`, `json_output_perf.rs`.
+Test schemas, queries, and data live in `crates/nanograph/tests/fixtures/` (test.pg, test.gq, test.jsonl). Runnable examples in `examples/starwars/` and `examples/revops/`. Library integration tests: `engine_integration.rs` (core query engine), `schema_migration.rs` (schema evolution). Performance harnesses (run with `--ignored`): `index_perf.rs`, `write_amp_perf.rs`, `json_output_perf.rs`.
 
 CLI integration tests (Rust) in `crates/nanograph-cli/tests/` with shared helpers in `common/mod.rs`. Test files: `bootstrap_and_env`, `bug_regressions`, `config_and_aliases`, `config_failures`, `display_formats`, `docs_and_output`, `load_modes_and_export`, `revops_admin_and_cdc`, `revops_workflows`, `schema_analysis`, `starwars_export_roundtrip`, `starwars_workflows`.
 
+Criterion benchmarks in `crates/nanograph/benches/`: `query_lookup`, `traversal`, `load`, `search`, `result_transport`, `migration`. Shared setup in `benches/common/mod.rs`. Uses synthetic data and checked-in examples (starwars, revops). Legacy perf tests (`tests/*_perf.rs`, run with `--ignored`) are frozen — new benchmark work goes in `benches/`.
+
 ## Not Yet Implemented
 
-These are on the backlog but **do not exist yet** — do not assume they work or generate code that depends on them: `@locked` annotation, encryption at rest, multimedia content storage, Python SDK, Go SDK, criterion benchmark suite, graph analytics (community detection, centrality, flow tracing, blast radius), ASCII graph visualization, progress bars on `nanograph load`.
+These are on the backlog but **do not exist yet** — do not assume they work or generate code that depends on them: `@locked` annotation, encryption at rest, multimedia content storage, Python SDK, Go SDK, graph analytics (community detection, centrality, flow tracing, blast radius), ASCII graph visualization, progress bars on `nanograph load`.
 
 ## Known Pitfalls
 

@@ -99,16 +99,46 @@ nanograph load [<db_path>] --data <data.jsonl> --mode <overwrite|append|merge>
 `merge` requires at least one node type in the schema to have a `@key` property.
 If `db.default_path` is set in `nanograph.toml`, `db_path` can be omitted.
 
+### `embed`
+
+Backfill or recompute `@embed(...)` vector properties on existing rows.
+
+```bash
+nanograph embed --db <db_path> [--type <NodeType>] [--property <vector_prop>] [--only-null] [--limit <n>] [--reindex] [--dry-run]
+```
+
+If `db.default_path` is set in `nanograph.toml`, `--db` can be omitted.
+
+Useful modes:
+
+- `nanograph embed --db omni.nano`
+  - recompute every `@embed(...)` property on every matching row
+- `nanograph embed --db omni.nano --type Signal`
+  - restrict to one node type
+- `nanograph embed --db omni.nano --type Signal --property embedding`
+  - restrict to one `@embed(...)` target property
+- `nanograph embed --db omni.nano --only-null`
+  - only fill rows where the target vector is currently null
+- `nanograph embed --db omni.nano --limit 500`
+  - process at most 500 rows
+- `nanograph embed --db omni.nano --reindex`
+  - rebuild vector indexes for touched indexed embed properties; if no rows need updates, reindex matching indexed types anyway
+- `nanograph embed --db omni.nano --dry-run`
+  - report what would be embedded without writing changes
+
+`--property` requires `--type`.
+
 ### `check`
 
 Parse and typecheck a query file without executing.
 
 ```bash
-nanograph check [--db <db_path>] --query <queries.gq>
+nanograph check [--db <db_path>] --query <queries.gq> [--schema <schema.pg>]
 ```
 
 If the provided query path is relative and not found directly, `nanograph` also searches the configured `query.roots` from `nanograph.toml`.
 If `db.default_path` is set in `nanograph.toml`, `--db` can be omitted.
+If `schema.default_path` is set in `nanograph.toml`, `check` also uses it for stale-schema diagnostics. When a query references a type or property that is missing from the current DB schema, `--schema` helps `check` tell you whether the desired schema differs and whether you likely need `nanograph migrate`.
 
 ### `run`
 
@@ -238,11 +268,12 @@ If `db.default_path` is set in `nanograph.toml`, `db_path` can be omitted.
 Validate manifest/dataset/log consistency and graph integrity.
 
 ```bash
-nanograph doctor [<db_path>]
+nanograph doctor [<db_path>] [--schema <schema.pg>]
 ```
 
 Returns non-zero when issues are detected.
 If `db.default_path` is set in `nanograph.toml`, `db_path` can be omitted.
+With `--schema`, `doctor` also compares the current DB schema against the desired schema file and reports drift as part of the health check. This is useful when queries have been updated ahead of the database schema.
 
 ### `cdc-materialize`
 

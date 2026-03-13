@@ -80,6 +80,20 @@ fn keyed_data_append_duplicate() -> &'static str {
 "#
 }
 
+fn timestamp_schema_src() -> &'static str {
+    r#"node Person {
+    name: String @key
+    created_at: DateTime?
+    updated_at: DateTime?
+}
+"#
+}
+
+fn timestamp_data_src() -> &'static str {
+    r#"{"type": "Person", "data": {"name": "Alice"}}
+"#
+}
+
 fn id_named_key_schema_src() -> &'static str {
     r#"node Person {
     id: String @key
@@ -1791,6 +1805,100 @@ query people() {
             { "name": "Charlie", "age": 40 }
         ])
     );
+}
+
+#[tokio::test]
+async fn test_prepared_reads_resolve_now_per_execute() {
+    let db = Database::open_in_memory(timestamp_schema_src())
+        .await
+        .unwrap();
+    db.load_with_mode(timestamp_data_src(), LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    let query = parse_query(
+        r#"
+query stamp() {
+    match { $p: Person }
+    return { now() as ts }
+}
+"#,
+    )
+    .unwrap()
+    .queries
+    .into_iter()
+    .next()
+    .unwrap();
+    let prepared = db.prepare_read_query(&query).unwrap();
+
+    let first = prepared
+        .execute(&ParamMap::new())
+        .await
+        .unwrap()
+        .to_rust_json();
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let second = prepared
+        .execute(&ParamMap::new())
+        .await
+        .unwrap()
+        .to_rust_json();
+
+    let first_ts = first[0]["ts"].as_str().unwrap().to_string();
+    let second_ts = second[0]["ts"].as_str().unwrap().to_string();
+
+    assert!(second_ts >= first_ts);
+    assert_ne!(first_ts, second_ts);
+}
+
+#[tokio::test]
+async fn test_mutation_queries_can_assign_now_to_datetime() {
+    let db = Database::open_in_memory(timestamp_schema_src())
+        .await
+        .unwrap();
+    db.load_with_mode(timestamp_data_src(), LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    let mutation = parse_query(
+        r#"
+query touch() {
+    update Person set { updated_at: now() } where name = "Alice"
+}
+"#,
+    )
+    .unwrap()
+    .queries
+    .into_iter()
+    .next()
+    .unwrap();
+    let result = db.run_query(&mutation, &ParamMap::new()).await.unwrap();
+    let RunResult::Mutation(result) = result else {
+        panic!("expected mutation result");
+    };
+    assert_eq!(result.affected_nodes, 1);
+
+    let query = parse_query(
+        r#"
+query person() {
+    match { $p: Person { name: "Alice" } }
+    return { $p.updated_at }
+}
+"#,
+    )
+    .unwrap()
+    .queries
+    .into_iter()
+    .next()
+    .unwrap();
+    let rows = db.run_query(&query, &ParamMap::new()).await.unwrap();
+    let RunResult::Query(rows) = rows else {
+        panic!("expected query result");
+    };
+    let json = rows.to_rust_json();
+    let updated_at = json[0]["updated_at"].as_str().unwrap();
+
+    assert!(!updated_at.is_empty());
+    assert!(updated_at.ends_with('Z'));
 }
 
 #[tokio::test]

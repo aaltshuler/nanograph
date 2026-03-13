@@ -21,10 +21,16 @@ const EMBEDDING_CACHE_LOCK_RETRIES: usize = 200;
 const EMBEDDING_CACHE_LOCK_RETRY_DELAY_MS: u64 = 10;
 
 #[derive(Debug, Clone)]
-struct EmbedSpec {
-    target_prop: String,
-    source_prop: String,
-    dim: usize,
+pub(crate) struct EmbedSpec {
+    pub target_prop: String,
+    pub source_prop: String,
+    pub dim: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct EmbedValueRequest {
+    pub source_text: String,
+    pub dim: usize,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -165,6 +171,14 @@ pub(crate) async fn materialize_embeddings_for_load_to_tempfile<R: BufRead>(
     materialize_embeddings_for_load_to_tempfile_inner(db_path, schema_ir, reader, None).await
 }
 
+pub(crate) async fn resolve_embedding_requests(
+    db_path: &Path,
+    requests: &[EmbedValueRequest],
+) -> Result<Vec<Vec<f32>>> {
+    resolve_embedding_requests_with_chunking(db_path, requests, EmbedChunkingConfig::from_env())
+        .await
+}
+
 async fn materialize_embeddings_for_load_to_tempfile_inner<R: BufRead>(
     db_path: &Path,
     schema_ir: &SchemaIR,
@@ -179,6 +193,144 @@ async fn materialize_embeddings_for_load_to_tempfile_inner<R: BufRead>(
         EmbedChunkingConfig::from_env(),
     )
     .await
+}
+
+async fn resolve_embedding_requests_with_chunking(
+    db_path: &Path,
+    requests: &[EmbedValueRequest],
+    chunking: EmbedChunkingConfig,
+) -> Result<Vec<Vec<f32>>> {
+    if requests.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let cache_path = db_path.join(EMBEDDING_CACHE_FILENAME);
+    let mut cache = load_embedding_cache(&cache_path)?;
+    let client = EmbeddingClient::from_env()
+        .map_err(|err| NanoError::Storage(format!("embedding initialization failed: {}", err)))?;
+    let model = client.model().to_string();
+    let batch_size = parse_env_usize("NANOGRAPH_EMBED_BATCH_SIZE", DEFAULT_EMBED_BATCH_SIZE);
+
+    let mut results: Vec<Option<Vec<f32>>> = vec![None; requests.len()];
+    let mut missing_by_dim: BTreeMap<usize, Vec<(CacheKey, String)>> = BTreeMap::new();
+    let mut missing_indices: HashMap<CacheKey, Vec<usize>> = HashMap::new();
+
+    for (idx, request) in requests.iter().enumerate() {
+        if request.dim == 0 {
+            return Err(NanoError::Storage(
+                "embedding dimension must be greater than zero".to_string(),
+            ));
+        }
+
+        let key = CacheKey {
+            model: model.clone(),
+            dim: request.dim,
+            content_hash: hash_string(&request.source_text),
+            chunk_chars: chunking.chunk_chars,
+            chunk_overlap_chars: chunking.chunk_overlap_chars,
+        };
+
+        if let Some(vector) = cache.get(&key) {
+            results[idx] = Some(vector.clone());
+            continue;
+        }
+
+        missing_indices.entry(key.clone()).or_default().push(idx);
+        let entries = missing_by_dim.entry(request.dim).or_default();
+        if !entries.iter().any(|(existing, _)| existing == &key) {
+            entries.push((key, request.source_text.clone()));
+        }
+    }
+
+    let mut new_cache_records = Vec::new();
+    for (dim, entries) in missing_by_dim {
+        if chunking.is_enabled() {
+            for (key, text) in entries {
+                let vector =
+                    embed_text_with_chunking(&client, &text, dim, batch_size, chunking).await?;
+                if vector.len() != dim {
+                    return Err(NanoError::Storage(format!(
+                        "embedding dimension mismatch for {}: expected {}, got {}",
+                        key.content_hash,
+                        dim,
+                        vector.len()
+                    )));
+                }
+                cache.insert(key.clone(), vector.clone());
+                new_cache_records.push(CacheRecord {
+                    model: key.model.clone(),
+                    dim: key.dim,
+                    content_hash: key.content_hash.clone(),
+                    vector,
+                    chunk_chars: key.chunk_chars,
+                    chunk_overlap_chars: key.chunk_overlap_chars,
+                });
+            }
+            continue;
+        }
+
+        for chunk in entries.chunks(batch_size.max(1)) {
+            let texts: Vec<String> = chunk.iter().map(|(_, text)| text.clone()).collect();
+            let vectors = client
+                .embed_texts(&texts, dim)
+                .await
+                .map_err(|err| NanoError::Storage(format!("embedding request failed: {}", err)))?;
+            if vectors.len() != chunk.len() {
+                return Err(NanoError::Storage(format!(
+                    "embedding response size mismatch: expected {}, got {}",
+                    chunk.len(),
+                    vectors.len()
+                )));
+            }
+
+            for ((key, _), vector) in chunk.iter().zip(vectors.into_iter()) {
+                if vector.len() != dim {
+                    return Err(NanoError::Storage(format!(
+                        "embedding dimension mismatch for {}: expected {}, got {}",
+                        key.content_hash,
+                        dim,
+                        vector.len()
+                    )));
+                }
+                cache.insert(key.clone(), vector.clone());
+                new_cache_records.push(CacheRecord {
+                    model: key.model.clone(),
+                    dim: key.dim,
+                    content_hash: key.content_hash.clone(),
+                    vector,
+                    chunk_chars: key.chunk_chars,
+                    chunk_overlap_chars: key.chunk_overlap_chars,
+                });
+            }
+        }
+    }
+
+    append_embedding_cache(&cache_path, &new_cache_records)?;
+
+    for (key, indices) in missing_indices {
+        let vector = cache.get(&key).ok_or_else(|| {
+            NanoError::Storage(format!(
+                "embedding cache miss for content hash {}",
+                key.content_hash
+            ))
+        })?;
+        for idx in indices {
+            results[idx] = Some(vector.clone());
+        }
+    }
+
+    results
+        .into_iter()
+        .enumerate()
+        .map(|(idx, vector)| {
+            vector.ok_or_else(|| {
+                NanoError::Storage(format!(
+                    "missing embedding result for request index {}",
+                    idx
+                ))
+            })
+        })
+        .collect()
 }
 
 async fn materialize_embeddings_for_load_to_tempfile_inner_with_chunking<R: BufRead>(
@@ -1005,7 +1157,7 @@ fn average_pool_embeddings(vectors: &[Vec<f32>], dim: usize) -> Result<Vec<f32>>
     Ok(pooled)
 }
 
-fn collect_embed_specs(schema_ir: &SchemaIR) -> Result<HashMap<String, Vec<EmbedSpec>>> {
+pub(crate) fn collect_embed_specs(schema_ir: &SchemaIR) -> Result<HashMap<String, Vec<EmbedSpec>>> {
     let mut specs_by_type: HashMap<String, Vec<EmbedSpec>> = HashMap::new();
     for node in schema_ir.node_types() {
         let mut prop_by_name: HashMap<&str, &PropDef> = HashMap::new();

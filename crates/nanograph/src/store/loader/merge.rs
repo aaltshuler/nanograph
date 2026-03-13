@@ -1019,11 +1019,7 @@ mod tests {
 
     #[test]
     fn run_keyed_merge_insert_in_memory_preserves_fixed_size_list_values() {
-        let existing = node_batch_with_embedding(
-            vec![10],
-            vec!["a"],
-            vec![[1.0, 0.0, 0.0]],
-        );
+        let existing = node_batch_with_embedding(vec![10], vec!["a"], vec![[1.0, 0.0, 0.0]]);
         let incoming = node_batch_with_embedding(
             vec![1, 2],
             vec!["a", "b"],

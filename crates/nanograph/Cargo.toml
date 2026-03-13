@@ -38,3 +38,28 @@ tempfile = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "query_lookup"
+harness = false
+
+[[bench]]
+name = "traversal"
+harness = false
+
+[[bench]]
+name = "load"
+harness = false
+
+[[bench]]
+name = "search"
+harness = false
+
+[[bench]]
+name = "result_transport"
+harness = false
+
+[[bench]]
+name = "migration"
+harness = false

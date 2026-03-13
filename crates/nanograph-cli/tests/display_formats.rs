@@ -1,6 +1,6 @@
 mod common;
 
-use common::{parse_json_value, ExampleProject, ExampleWorkspace};
+use common::{ExampleProject, ExampleWorkspace, parse_json_value};
 use serde_json::Value;
 
 fn override_cli_layout(workspace: &ExampleWorkspace, width: usize, layout: &str) {
@@ -53,7 +53,10 @@ fn override_cli_layout(workspace: &ExampleWorkspace, width: usize, layout: &str)
 }
 
 fn first_nonempty_lines(output: &str) -> Vec<&str> {
-    output.lines().filter(|line| !line.trim().is_empty()).collect()
+    output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect()
 }
 
 #[test]
@@ -101,9 +104,9 @@ fn table_output_respects_truncate_and_wrap_layout_config() {
     assert!(truncated.contains("Luke Skywalker"));
     assert!(truncated.contains("..."));
     assert!(truncated.contains("(1 rows, "));
-    assert!(!truncated.contains(
-        "Son of Anakin, destroyed the Death Star and redeemed his father."
-    ));
+    assert!(
+        !truncated.contains("Son of Anakin, destroyed the Death Star and redeemed his father.")
+    );
 
     override_cli_layout(&workspace, 20, "wrap");
     let wrapped = workspace
@@ -131,13 +134,7 @@ fn json_run_output_wraps_rows_with_query_metadata() {
     workspace.init();
     workspace.load();
 
-    let value = workspace.json_value(&[
-        "run",
-        "why",
-        "opp-stripe-migration",
-        "--format",
-        "json",
-    ]);
+    let value = workspace.json_value(&["run", "why", "opp-stripe-migration", "--format", "json"]);
 
     assert_eq!(value["$nanograph"]["query"]["name"], "decision_trace");
     assert_eq!(
@@ -197,9 +194,9 @@ fn csv_run_output_escapes_fields_and_stays_row_only() {
 
     assert!(output.starts_with("slug,name,note,alignment,tags\n"));
     assert_eq!(output.matches("slug,name,note,alignment,tags").count(), 1);
-    assert!(output.contains(
-        "\"Son of Anakin, destroyed the Death Star and redeemed his father.\""
-    ));
+    assert!(
+        output.contains("\"Son of Anakin, destroyed the Death Star and redeemed his father.\"")
+    );
     assert!(!output.contains("Query:"));
     assert!(!output.contains("Description:"));
     assert!(!output.contains("Instruction:"));
@@ -282,6 +279,11 @@ fn check_json_failure_emits_summary_without_stderr_leak() {
     let value = parse_json_value(&result.stdout);
     assert_eq!(value["status"], "error");
     assert_eq!(value["errors"], 1);
-    assert!(value["results"][0]["error"].as_str().unwrap().contains("expects one of"));
+    assert!(
+        value["results"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("expects one of")
+    );
     assert!(result.stderr.trim().is_empty());
 }

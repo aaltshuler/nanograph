@@ -150,6 +150,16 @@ fn lower_clauses(
                         right: IRExpr::Literal(lit.clone()),
                     });
                 }
+                MatchValue::Now => {
+                    scan_filters.push(IRFilter {
+                        left: IRExpr::PropAccess {
+                            variable: binding.variable.clone(),
+                            property: pm.prop_name.clone(),
+                        },
+                        op: CompOp::Eq,
+                        right: IRExpr::Param(NOW_PARAM_NAME.to_string()),
+                    });
+                }
                 MatchValue::Variable(v) => {
                     let right = if param_names.contains(v) {
                         IRExpr::Param(v.clone())
@@ -328,6 +338,7 @@ fn find_outer_var(clauses: &[Clause], outer_bound: &HashSet<String>) -> Option<S
 
 fn expr_var(expr: &Expr) -> Option<String> {
     match expr {
+        Expr::Now => None,
         Expr::PropAccess { variable, .. } => Some(variable.clone()),
         Expr::Variable(v) => Some(v.clone()),
         Expr::Nearest { variable, .. } => Some(variable.clone()),
@@ -355,6 +366,7 @@ fn expr_var(expr: &Expr) -> Option<String> {
 
 fn lower_expr(expr: &Expr, param_names: &HashSet<String>) -> IRExpr {
     match expr {
+        Expr::Now => IRExpr::Param(NOW_PARAM_NAME.to_string()),
         Expr::PropAccess { variable, property } => IRExpr::PropAccess {
             variable: variable.clone(),
             property: property.clone(),
@@ -419,6 +431,7 @@ fn lower_expr(expr: &Expr, param_names: &HashSet<String>) -> IRExpr {
 
 fn lower_match_value(value: &MatchValue, param_names: &HashSet<String>) -> IRExpr {
     match value {
+        MatchValue::Now => IRExpr::Param(NOW_PARAM_NAME.to_string()),
         MatchValue::Literal(l) => IRExpr::Literal(l.clone()),
         MatchValue::Variable(v) => {
             if param_names.contains(v) {
@@ -554,5 +567,71 @@ query q() {
             .expect("expected expand op");
         assert_eq!(expand.0, 1);
         assert_eq!(expand.1, Some(3));
+    }
+
+    #[test]
+    fn test_lower_now_uses_reserved_runtime_param() {
+        let catalog = setup();
+        let qf = parse_query(
+            r#"
+query stamp() {
+    match { $p: Person }
+    return { now() as ts }
+}
+"#,
+        )
+        .unwrap();
+        let tc = typecheck_query(&catalog, &qf.queries[0]).unwrap();
+        let ir = lower_query(&catalog, &qf.queries[0], &tc).unwrap();
+
+        assert!(matches!(
+            ir.return_exprs[0].expr,
+            IRExpr::Param(ref name) if name == NOW_PARAM_NAME
+        ));
+    }
+
+    #[test]
+    fn test_lower_mutation_now_uses_reserved_runtime_param() {
+        let catalog = build_catalog(
+            &parse_schema(
+                r#"
+node Event {
+    slug: String @key
+    updated_at: DateTime?
+}
+"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let qf = parse_query(
+            r#"
+query stamp() {
+    update Event set { updated_at: now() } where updated_at = now()
+}
+"#,
+        )
+        .unwrap();
+        let checked = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap();
+        assert!(matches!(checked, CheckedQuery::Mutation(_)));
+
+        let ir = lower_mutation_query(&qf.queries[0]).unwrap();
+        match ir.op {
+            MutationOpIR::Update {
+                assignments,
+                predicate,
+                ..
+            } => {
+                assert!(matches!(
+                    assignments[0].value,
+                    IRExpr::Param(ref name) if name == NOW_PARAM_NAME
+                ));
+                assert!(matches!(
+                    predicate.value,
+                    IRExpr::Param(ref name) if name == NOW_PARAM_NAME
+                ));
+            }
+            _ => panic!("expected update mutation op"),
+        }
     }
 }

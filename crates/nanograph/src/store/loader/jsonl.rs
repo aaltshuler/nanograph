@@ -384,11 +384,10 @@ fn insert_resolved_edge_chunk(
         .edge_segments
         .get(edge_name)
         .ok_or_else(|| NanoError::Storage(format!("no edge segment: {}", edge_name)))?;
-    let edge_type = storage
-        .catalog
-        .edge_types
-        .get(edge_name)
-        .ok_or_else(|| NanoError::Storage(format!("unknown edge type in data: {}", edge_name)))?;
+    let edge_type =
+        storage.catalog.edge_types.get(edge_name).ok_or_else(|| {
+            NanoError::Storage(format!("unknown edge type in data: {}", edge_name))
+        })?;
     let prop_fields: Vec<Field> = edge_seg
         .schema
         .fields()
@@ -675,15 +674,13 @@ fn validate_json_value(
     let valid = match prop_type.scalar {
         crate::types::ScalarType::String => value.is_string(),
         crate::types::ScalarType::Bool => value.is_boolean(),
-        crate::types::ScalarType::I32 => value
-            .as_i64()
-            .and_then(|n| i32::try_from(n).ok())
-            .is_some(),
+        crate::types::ScalarType::I32 => {
+            value.as_i64().and_then(|n| i32::try_from(n).ok()).is_some()
+        }
         crate::types::ScalarType::I64 => value.as_i64().is_some(),
-        crate::types::ScalarType::U32 => value
-            .as_u64()
-            .and_then(|n| u32::try_from(n).ok())
-            .is_some(),
+        crate::types::ScalarType::U32 => {
+            value.as_u64().and_then(|n| u32::try_from(n).ok()).is_some()
+        }
         crate::types::ScalarType::U64 => value.as_u64().is_some(),
         crate::types::ScalarType::F32 => value.as_f64().is_some(),
         crate::types::ScalarType::F64 => value.as_f64().is_some(),

@@ -31,6 +31,18 @@ OPENAI_API_KEY=...
 
 See [Project Config](config.md) for config and env precedence.
 
+If you add new `@embed(...)` properties to an existing database, or want to recompute vectors after changing embedding settings, use:
+
+```bash
+nanograph embed --db starwars.nano --only-null
+```
+
+or, to recompute all matching rows:
+
+```bash
+nanograph embed --db starwars.nano
+```
+
 ## Lexical search
 
 Token search:

@@ -147,7 +147,7 @@ nanograph run search "vector databases"
 
 ### `[schema]`
 
-Default schema path, mainly used by `init`.
+Default schema path, used by `init` and as the default desired schema for `check` drift diagnostics.
 
 ```toml
 [schema]
@@ -192,6 +192,11 @@ Supported fields:
 - `api_key_env`
 
 Do not put raw API keys in `nanograph.toml`.
+
+These settings are used by both:
+
+- automatic `@embed(...)` materialization during `load`
+- explicit backfills via `nanograph embed`
 
 ### `[cli]`
 

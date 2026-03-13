@@ -1,3 +1,7 @@
+// Legacy manual performance harness.
+// Prefer the Criterion benchmarks in `crates/nanograph/benches/load.rs` and
+// `crates/nanograph/benches/migration.rs`.
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;

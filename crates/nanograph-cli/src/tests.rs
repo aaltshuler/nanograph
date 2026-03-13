@@ -581,7 +581,7 @@ async fn load_mode_append_and_merge_behave_as_expected() {
 fn check_and_run_allow_db_to_be_resolved_later() {
     let check = Cli::try_parse_from(["nanograph", "check", "--query", "/tmp/q.gq"]).unwrap();
     match check.command {
-        Commands::Check { db, query } => {
+        Commands::Check { db, query, .. } => {
             assert!(db.is_none());
             assert_eq!(query, PathBuf::from("/tmp/q.gq"));
         }
@@ -1110,7 +1110,7 @@ async fn maintenance_commands_work_on_real_db() {
     cmd_cdc_materialize(&db_path, 0, true, false, false)
         .await
         .unwrap();
-    cmd_doctor(&db_path, false, false).await.unwrap();
+    cmd_doctor(&db_path, None, false, false).await.unwrap();
 
     assert!(db_path.join("__cdc_analytics").exists());
 

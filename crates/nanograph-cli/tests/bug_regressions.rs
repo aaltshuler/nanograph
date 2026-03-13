@@ -2,7 +2,7 @@ mod common;
 
 use std::fs;
 
-use common::{parse_jsonl_rows, ExampleProject, ExampleWorkspace};
+use common::{ExampleProject, ExampleWorkspace, parse_jsonl_rows};
 
 fn bug_schema() -> &'static str {
     r#"
@@ -94,6 +94,42 @@ fn embed_merge_delta_data() -> &'static str {
 "#
 }
 
+fn stale_vector_schema_current() -> &'static str {
+    r#"
+node Opportunity {
+    slug: String @key
+    summary: String
+}
+"#
+}
+
+fn stale_vector_schema_desired() -> &'static str {
+    r#"
+node Opportunity {
+    slug: String @key
+    summary: String
+    embedding: Vector(8)? @embed(summary)
+}
+"#
+}
+
+fn stale_vector_data() -> &'static str {
+    r#"
+{"type":"Opportunity","data":{"slug":"opp-alpha","summary":"Modernize billing workflows"}}
+"#
+}
+
+fn stale_vector_query() -> &'static str {
+    r#"
+query search_opportunities($q: String) {
+    match { $o: Opportunity }
+    return { $o.slug, nearest($o.embedding, $q) as score }
+    order { nearest($o.embedding, $q) }
+    limit 5
+}
+"#
+}
+
 fn write_bug_fixture(workspace: &ExampleWorkspace) {
     workspace.write_file("bug.pg", bug_schema());
     workspace.write_file("bug.jsonl", bug_seed_data());
@@ -104,6 +140,18 @@ fn init_bug_db(workspace: &ExampleWorkspace) {
     write_bug_fixture(workspace);
     let init = workspace.json_value(&["--json", "init", "bug.nano", "--schema", "bug.pg"]);
     assert_eq!(init["status"], "ok");
+}
+
+fn write_schema_drift_query(workspace: &ExampleWorkspace) {
+    workspace.write_file(
+        "display-name.gq",
+        r#"
+query display_names() {
+    match { $p: Person }
+    return { $p.slug, $p.displayName }
+}
+"#,
+    );
 }
 
 fn write_embed_merge_fixture(workspace: &ExampleWorkspace) {
@@ -121,6 +169,26 @@ query all_chunks() {
 }
 "#,
     );
+}
+
+fn init_stale_vector_db(workspace: &ExampleWorkspace) {
+    workspace.write_file("current.pg", stale_vector_schema_current());
+    workspace.write_file("desired.pg", stale_vector_schema_desired());
+    workspace.write_file("stale.jsonl", stale_vector_data());
+    workspace.write_file("stale.gq", stale_vector_query());
+
+    let init = workspace.json_value(&["--json", "init", "stale.nano", "--schema", "current.pg"]);
+    assert_eq!(init["status"], "ok");
+    let load = workspace.json_value(&[
+        "--json",
+        "load",
+        "stale.nano",
+        "--data",
+        "stale.jsonl",
+        "--mode",
+        "overwrite",
+    ]);
+    assert_eq!(load["status"], "ok");
 }
 
 #[test]
@@ -236,10 +304,14 @@ fn additive_migration_with_edge_date_properties_succeeds_end_to_end() {
 
     workspace.write_file("bug.nano/schema.pg", bug_schema_with_display_name());
 
-    let plan = workspace.run_ok(&["migrate", "bug.nano", "--dry-run"]).stdout;
+    let plan = workspace
+        .run_ok(&["migrate", "bug.nano", "--dry-run"])
+        .stdout;
     assert!(plan.contains("AddProperty"));
 
-    let apply = workspace.run_ok(&["migrate", "bug.nano", "--auto-approve"]).stdout;
+    let apply = workspace
+        .run_ok(&["migrate", "bug.nano", "--auto-approve"])
+        .stdout;
     assert!(apply.contains("AddProperty") || apply.contains("Applied"));
 
     let doctor = workspace.run_ok(&["doctor", "bug.nano"]).stdout;
@@ -255,6 +327,121 @@ fn additive_migration_with_edge_date_properties_succeeds_end_to_end() {
             && row["to"] == "apollo"
             && row["data"]["role"] == "lead"
             && row["data"]["startedAt"] == "2024-02-01"
+    }));
+}
+
+#[test]
+fn doctor_reports_schema_drift_against_desired_schema() {
+    let workspace = ExampleWorkspace::copy(ExampleProject::Revops);
+    init_bug_db(&workspace);
+    workspace.write_file("desired.pg", bug_schema_with_display_name());
+
+    let result = workspace.run_fail(&["--json", "doctor", "bug.nano", "--schema", "desired.pg"]);
+    assert!(result.stderr.trim().is_empty());
+
+    let value = serde_json::from_str::<serde_json::Value>(&result.stdout).expect("doctor json");
+    assert_eq!(value["status"], "error");
+    assert_eq!(value["healthy"], false);
+    assert_eq!(value["schema_status"]["matches"], false);
+    assert_eq!(value["schema_status"]["compatibility"], "additive");
+    assert_eq!(value["schema_status"]["step_count"], 1);
+    assert!(value["issues"].as_array().unwrap().iter().any(|issue| {
+        issue
+            .as_str()
+            .unwrap_or_default()
+            .contains("database schema differs from desired schema")
+    }));
+}
+
+#[test]
+fn check_hints_to_migrate_when_desired_schema_diff_explains_missing_property() {
+    let workspace = ExampleWorkspace::copy(ExampleProject::Revops);
+    init_bug_db(&workspace);
+    workspace.write_file("desired.pg", bug_schema_with_display_name());
+    write_schema_drift_query(&workspace);
+
+    let result = workspace.run_fail(&[
+        "--json",
+        "check",
+        "--db",
+        "bug.nano",
+        "--query",
+        "display-name.gq",
+        "--schema",
+        "desired.pg",
+    ]);
+    assert!(result.stderr.trim().is_empty());
+
+    let value = serde_json::from_str::<serde_json::Value>(&result.stdout).expect("check json");
+    assert_eq!(value["status"], "error");
+    let error = value["results"][0]["error"].as_str().expect("error string");
+    assert!(error.contains("has no property `displayName`"));
+    assert!(error.contains("desired schema"));
+    assert!(error.contains("run `nanograph migrate"));
+}
+
+#[test]
+fn check_and_run_surface_vector_schema_drift_end_to_end() {
+    let workspace = ExampleWorkspace::copy(ExampleProject::Revops);
+    init_stale_vector_db(&workspace);
+
+    let check = workspace.run_fail(&[
+        "--json",
+        "check",
+        "--db",
+        "stale.nano",
+        "--query",
+        "stale.gq",
+        "--schema",
+        "desired.pg",
+    ]);
+    assert!(check.stderr.trim().is_empty());
+    let check_value = serde_json::from_str::<serde_json::Value>(&check.stdout).expect("check json");
+    assert_eq!(check_value["status"], "error");
+    let check_error = check_value["results"][0]["error"].as_str().expect("check error");
+    assert!(check_error.contains("has no property `embedding`"));
+    assert!(check_error.contains("desired schema"));
+    assert!(check_error.contains("run `nanograph migrate"));
+
+    let run = workspace.run_fail(&[
+        "--json",
+        "run",
+        "--db",
+        "stale.nano",
+        "--query",
+        "stale.gq",
+        "--name",
+        "search_opportunities",
+        "--param",
+        "q=billing workflow",
+    ]);
+    assert!(run.stderr.trim().is_empty());
+    let run_value = serde_json::from_str::<serde_json::Value>(&run.stdout).expect("run json");
+    assert_eq!(run_value["status"], "error");
+    assert!(run_value["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("has no property `embedding`"));
+
+    let doctor = workspace.run_fail(&[
+        "--json",
+        "doctor",
+        "stale.nano",
+        "--schema",
+        "desired.pg",
+    ]);
+    assert!(doctor.stderr.trim().is_empty());
+    let doctor_value =
+        serde_json::from_str::<serde_json::Value>(&doctor.stdout).expect("doctor json");
+    assert_eq!(doctor_value["status"], "error");
+    assert_eq!(doctor_value["healthy"], false);
+    assert_eq!(doctor_value["schema_status"]["matches"], false);
+    assert_eq!(doctor_value["schema_status"]["compatibility"], "additive");
+    assert!(doctor_value["issues"].as_array().unwrap().iter().any(|issue| {
+        issue
+            .as_str()
+            .unwrap_or_default()
+            .contains("database schema differs from desired schema")
     }));
 }
 

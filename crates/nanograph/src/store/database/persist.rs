@@ -4,11 +4,16 @@ use std::path::Path;
 
 use arrow_array::RecordBatch;
 use lance::dataset::WriteMode;
+use serde_json::{Map as JsonMap, Value as JsonValue};
 use tracing::{debug, info};
 
-use super::{Database, DatabaseWriteGuard, LoadMode, MutationPlan, MutationSource};
+use super::{
+    Database, DatabaseWriteGuard, EmbedOptions, EmbedResult, LoadMode, MutationPlan,
+    MutationSource,
+};
 use crate::catalog::schema_ir::SchemaIR;
 use crate::error::{NanoError, Result};
+use crate::json_output::array_value_to_json;
 use crate::store::graph::GraphStorage;
 use crate::store::indexing::{rebuild_node_scalar_indexes, rebuild_node_vector_indexes};
 use crate::store::lance_io::{
@@ -16,12 +21,22 @@ use crate::store::lance_io::{
     write_lance_batch_with_mode,
 };
 use crate::store::loader::{
-    build_next_storage_for_load, build_next_storage_for_load_reader, json_values_to_array,
+    EmbedValueRequest, build_next_storage_for_load, build_next_storage_for_load_reader,
+    collect_embed_specs, json_values_to_array, resolve_embedding_requests,
 };
 use crate::store::manifest::{DatasetEntry, GraphManifest, hash_string};
 use crate::store::txlog::{CdcLogEntry, commit_manifest_and_logs};
+use crate::types::ScalarType;
 
 use super::cdc::{build_cdc_events_for_storage_transition, deleted_ids_from_cdc_events};
+
+#[derive(Debug, Clone)]
+struct SelectedEmbedProp {
+    target_prop: String,
+    source_prop: String,
+    dim: usize,
+    indexed: bool,
+}
 
 impl Database {
     /// Load JSONL data using compatibility defaults:
@@ -120,6 +135,155 @@ impl Database {
         let mut writer = self.lock_writer().await;
         self.apply_merge_mutation_locked(data_source, op_summary, &mut writer)
             .await
+    }
+
+    pub async fn embed(&self, options: EmbedOptions) -> Result<EmbedResult> {
+        if options.property.is_some() && options.type_name.is_none() {
+            return Err(NanoError::Execution(
+                "--property requires --type for `nanograph embed`".to_string(),
+            ));
+        }
+
+        let embed_specs = collect_embed_specs(&self.schema_ir)?;
+        let selected_types = select_embed_types(
+            &self.schema_ir,
+            &embed_specs,
+            options.type_name.as_deref(),
+            options.property.as_deref(),
+        )?;
+
+        let reindexable_types: HashSet<String> = selected_types
+            .iter()
+            .filter(|(_, props)| props.iter().any(|prop| prop.indexed))
+            .map(|(node_def, _)| node_def.name.clone())
+            .collect();
+
+        let current = self.snapshot();
+        let mut next_storage = current.as_ref().clone();
+        let mut rows_selected = 0usize;
+        let mut embeddings_generated = 0usize;
+        let mut remaining_limit = options.limit.unwrap_or(usize::MAX);
+        let mut touched_types = HashSet::new();
+
+        for (node_def, props) in &selected_types {
+            if remaining_limit == 0 {
+                break;
+            }
+
+            let Some(batch) = current.get_all_nodes(&node_def.name)? else {
+                continue;
+            };
+
+            let mut rows = record_batch_to_json_rows(&batch);
+            let mut requests = Vec::new();
+            let mut assignments = Vec::new();
+
+            for (row_idx, row) in rows.iter().enumerate() {
+                if remaining_limit == 0 {
+                    break;
+                }
+
+                let mut row_assignments = Vec::new();
+                for prop in props {
+                    let current_value = row.get(&prop.target_prop).unwrap_or(&JsonValue::Null);
+                    let should_generate = if options.only_null {
+                        current_value.is_null()
+                    } else {
+                        true
+                    };
+                    if !should_generate {
+                        continue;
+                    }
+
+                    let source_text = row
+                        .get(&prop.source_prop)
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| {
+                            NanoError::Execution(format!(
+                                "cannot embed {}.{}: source property {} must be a String",
+                                node_def.name, prop.target_prop, prop.source_prop
+                            ))
+                        })?;
+
+                    row_assignments.push((prop.target_prop.clone(), source_text.to_string(), prop.dim));
+                }
+
+                if row_assignments.is_empty() {
+                    continue;
+                }
+
+                rows_selected += 1;
+                remaining_limit = remaining_limit.saturating_sub(1);
+                for (target_prop, source_text, dim) in row_assignments {
+                    requests.push(EmbedValueRequest { source_text, dim });
+                    assignments.push((row_idx, target_prop));
+                    embeddings_generated += 1;
+                }
+            }
+
+            if requests.is_empty() {
+                continue;
+            }
+
+            touched_types.insert(node_def.name.clone());
+            if options.dry_run {
+                continue;
+            }
+
+            let vectors = resolve_embedding_requests(self.path(), &requests).await?;
+            for ((row_idx, target_prop), vector) in assignments.into_iter().zip(vectors.into_iter()) {
+                rows[row_idx].insert(
+                    target_prop,
+                    serde_json::to_value(vector).map_err(|e| {
+                        NanoError::Storage(format!("serialize embedding vector failed: {}", e))
+                    })?,
+                );
+            }
+
+            let rebuilt = json_rows_to_record_batch(batch.schema().as_ref(), &rows)?;
+            next_storage.replace_node_batch(&node_def.name, rebuilt)?;
+        }
+
+        let properties_selected = selected_types.iter().map(|(_, props)| props.len()).sum();
+        let reindexed_types = if options.dry_run {
+            if options.reindex {
+                reindexable_types.len()
+            } else {
+                reindexable_types
+                    .iter()
+                    .filter(|type_name| touched_types.contains(*type_name))
+                    .count()
+            }
+        } else if !touched_types.is_empty() {
+            let mut writer = self.lock_writer().await;
+            self.apply_mutation_plan_locked(
+                MutationPlan {
+                    source: MutationSource::PreparedStorage(Box::new(next_storage)),
+                    op_summary: "embed".to_string(),
+                    cdc_events: Vec::new(),
+                },
+                &mut writer,
+            )
+            .await?;
+            reindexable_types
+                .iter()
+                .filter(|type_name| touched_types.contains(*type_name))
+                .count()
+        } else if options.reindex {
+            self.rebuild_vector_indexes_for_types(&reindexable_types)
+                .await?
+        } else {
+            0
+        };
+
+        Ok(EmbedResult {
+            node_types_considered: selected_types.len(),
+            properties_selected,
+            rows_selected,
+            embeddings_generated,
+            reindexed_types,
+            dry_run: options.dry_run,
+        })
     }
 
     pub(crate) async fn apply_append_mutation_locked(
@@ -511,6 +675,132 @@ impl Database {
         super::maintenance::cleanup_stale_dirs(&self.path, &manifest)?;
         Ok(())
     }
+
+    async fn rebuild_vector_indexes_for_types(
+        &self,
+        type_names: &HashSet<String>,
+    ) -> Result<usize> {
+        if type_names.is_empty() {
+            return Ok(0);
+        }
+
+        let storage = self.snapshot();
+        let mut rebuilt = 0usize;
+        for node_def in self.schema_ir.node_types() {
+            if !type_names.contains(&node_def.name) {
+                continue;
+            }
+            let Some(dataset_path) = storage.node_dataset_path(&node_def.name) else {
+                continue;
+            };
+            rebuild_node_vector_indexes(dataset_path, node_def).await?;
+            rebuilt += 1;
+        }
+        Ok(rebuilt)
+    }
+}
+
+fn select_embed_types<'a>(
+    schema_ir: &'a SchemaIR,
+    embed_specs: &'a HashMap<String, Vec<crate::store::loader::EmbedSpec>>,
+    type_name: Option<&str>,
+    property_name: Option<&str>,
+) -> Result<Vec<(&'a crate::catalog::schema_ir::NodeTypeDef, Vec<SelectedEmbedProp>)>> {
+    let mut selected = Vec::new();
+
+    for node_def in schema_ir.node_types() {
+        if let Some(expected) = type_name
+            && node_def.name != expected
+        {
+            continue;
+        }
+        let Some(specs) = embed_specs.get(&node_def.name) else {
+            continue;
+        };
+        let props: Vec<SelectedEmbedProp> = specs
+            .iter()
+            .filter(|spec| property_name.map(|name| spec.target_prop == name).unwrap_or(true))
+            .map(|spec| SelectedEmbedProp {
+                target_prop: spec.target_prop.clone(),
+                source_prop: spec.source_prop.clone(),
+                dim: spec.dim,
+                indexed: node_def
+                    .properties
+                    .iter()
+                    .find(|prop| prop.name == spec.target_prop)
+                    .map(|prop| {
+                        prop.index
+                            && matches!(
+                                ScalarType::from_str_name(&prop.scalar_type),
+                                Some(ScalarType::Vector(_))
+                            )
+                    })
+                    .unwrap_or(false),
+            })
+            .collect();
+        if !props.is_empty() {
+            selected.push((node_def, props));
+        }
+    }
+
+    if selected.is_empty() {
+        return match (type_name, property_name) {
+            (Some(type_name), Some(property_name)) => Err(NanoError::Execution(format!(
+                "type {} has no @embed property {}",
+                type_name, property_name
+            ))),
+            (Some(type_name), None) => Err(NanoError::Execution(format!(
+                "type {} has no @embed properties",
+                type_name
+            ))),
+            (None, Some(property_name)) => Err(NanoError::Execution(format!(
+                "no @embed properties named {} found",
+                property_name
+            ))),
+            (None, None) => Err(NanoError::Execution(
+                "schema has no @embed properties".to_string(),
+            )),
+        };
+    }
+
+    Ok(selected)
+}
+
+fn record_batch_to_json_rows(batch: &RecordBatch) -> Vec<JsonMap<String, JsonValue>> {
+    let mut rows = Vec::with_capacity(batch.num_rows());
+    let schema = batch.schema();
+    for row_idx in 0..batch.num_rows() {
+        let mut row = JsonMap::new();
+        for (col_idx, field) in schema.fields().iter().enumerate() {
+            row.insert(
+                field.name().clone(),
+                array_value_to_json(batch.column(col_idx), row_idx),
+            );
+        }
+        rows.push(row);
+    }
+    rows
+}
+
+fn json_rows_to_record_batch(
+    schema: &arrow_schema::Schema,
+    rows: &[JsonMap<String, JsonValue>],
+) -> Result<RecordBatch> {
+    let mut columns = Vec::with_capacity(schema.fields().len());
+    for field in schema.fields() {
+        let values: Vec<JsonValue> = rows
+            .iter()
+            .map(|row| row.get(field.name()).cloned().unwrap_or(JsonValue::Null))
+            .collect();
+        columns.push(json_values_to_array(
+            &values,
+            field.data_type(),
+            field.is_nullable(),
+        )?);
+    }
+
+    RecordBatch::try_new(std::sync::Arc::new(schema.clone()), columns)
+        .map_err(|e| NanoError::Storage(format!("rebuild embed batch failed: {}", e)))
 }
 
 fn dataset_entity_key(kind: &str, type_name: &str) -> String {

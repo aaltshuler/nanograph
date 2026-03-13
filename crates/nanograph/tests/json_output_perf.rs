@@ -1,3 +1,6 @@
+// Legacy manual performance harness.
+// Prefer the Criterion benchmark in `crates/nanograph/benches/result_transport.rs`.
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

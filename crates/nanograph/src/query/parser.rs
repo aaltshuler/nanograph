@@ -399,6 +399,7 @@ fn parse_match_value(pair: pest::iterators::Pair<Rule>) -> Result<MatchValue> {
                 v.strip_prefix('$').unwrap_or(v).to_string(),
             ))
         }
+        Rule::now_call => Ok(MatchValue::Now),
         Rule::literal => Ok(MatchValue::Literal(parse_literal(value_inner)?)),
         _ => Err(NanoError::Parse(format!(
             "unexpected match value: {:?}",
@@ -470,6 +471,7 @@ fn parse_filter(pair: pest::iterators::Pair<Rule>) -> Result<Filter> {
 fn parse_expr(pair: pest::iterators::Pair<Rule>) -> Result<Expr> {
     let inner = pair.into_inner().next().unwrap();
     match inner.as_rule() {
+        Rule::now_call => Ok(Expr::Now),
         Rule::prop_access => {
             let mut parts = inner.into_inner();
             let var = parts.next().unwrap().as_str();
@@ -1213,6 +1215,42 @@ query dated() {
                 other => panic!("expected datetime literal, got {:?}", other),
             },
             _ => panic!("expected Filter"),
+        }
+    }
+
+    #[test]
+    fn test_parse_now_expression_and_mutation_value() {
+        let input = r#"
+query clock() {
+    match {
+        $e: Event
+        $e.at <= now()
+    }
+    return { now() as ts }
+}
+"#;
+        let qf = parse_query(input).unwrap();
+        let q = &qf.queries[0];
+        match &q.match_clause[1] {
+            Clause::Filter(f) => assert!(matches!(f.right, Expr::Now)),
+            _ => panic!("expected Filter"),
+        }
+        assert!(matches!(q.return_clause[0].expr, Expr::Now));
+
+        let mutation = parse_query(
+            r#"
+query stamp() {
+    update Event set { updated_at: now() } where created_at <= now()
+}
+"#,
+        )
+        .unwrap();
+        match mutation.queries[0].mutation.as_ref().unwrap() {
+            Mutation::Update(update) => {
+                assert!(matches!(update.assignments[0].value, MatchValue::Now));
+                assert!(matches!(update.predicate.value, MatchValue::Now));
+            }
+            _ => panic!("expected update mutation"),
         }
     }
 
