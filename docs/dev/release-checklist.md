@@ -19,9 +19,10 @@
 
 - [ ] CI workflow green on `main` / PRs (`Core Rust`, `CLI E2E`, `TypeScript SDK`, `Swift SDK`)
 - [ ] Local Rust release gate passes:
-  - `cargo test --workspace --all-targets`
-  - `cargo clippy --workspace --all-targets`
+  - `cargo test --workspace --lib --bins --tests`
+  - `cargo clippy --workspace --lib --bins --tests`
 - [ ] CLI e2e pass locally: `cargo test -p nanograph-cli`
+- [ ] Benchmarks stay separate from the normal release gate; run them manually when needed, not as part of the default release checklist
 - [ ] Local SDK checks pass when the release touched those surfaces:
   - `npm test` in `crates/nanograph-ts`
   - `swift test` in `crates/nanograph-ffi/swift`

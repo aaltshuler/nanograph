@@ -39,13 +39,13 @@ jobs:
           restore-keys: ci-core-linux-
 
       - name: Cargo check
-        run: cargo check --workspace --all-targets
+        run: cargo check --workspace --lib --bins --tests
 
       - name: Core tests
-        run: cargo test -p nanograph --all-targets
+        run: cargo test -p nanograph --lib --tests
 
       - name: Workspace clippy
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --lib --bins --tests
 
       - name: Build Rust FFI crate
         run: cargo build -p nanograph-ffi
