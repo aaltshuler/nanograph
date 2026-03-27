@@ -6,7 +6,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { Database, decodeArrow, mediaFile, mediaUri } from "../index.js";
+import { Database, decodeArrow, mediaBase64, mediaFile, mediaUri } from "../index.js";
 
 // ---------- fixtures ----------
 
@@ -1072,6 +1072,30 @@ query products_from_image_search($q: String) {
       );
 
       const rows = await db.run(MEDIA_QUERIES, "photo_by_slug", { slug: "hero" });
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].mime, "image/jpeg");
+      assert.match(rows[0].uri, /^file:\/\//);
+      await db.close();
+    });
+
+    it("loadRows imports base64 media and fills the mime property", async () => {
+      const db = await freshMediaDb();
+
+      await db.loadRows(
+        [
+          {
+            type: "PhotoAsset",
+            data: {
+              slug: "inline",
+              uri: mediaBase64("/9j/2Q==", "image/jpeg"),
+              embedding: placeholderEmbedding,
+            },
+          },
+        ],
+        "overwrite",
+      );
+
+      const rows = await db.run(MEDIA_QUERIES, "photo_by_slug", { slug: "inline" });
       assert.equal(rows.length, 1);
       assert.equal(rows[0].mime, "image/jpeg");
       assert.match(rows[0].uri, /^file:\/\//);

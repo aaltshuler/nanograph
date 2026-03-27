@@ -953,30 +953,162 @@ async fn test_text_query_can_rank_media_nodes_and_traverse_from_images() {
     .await
     .unwrap();
 
-    let mut params = ParamMap::new();
-    params.insert(
-        "q".to_string(),
-        nanograph::query::ast::Literal::String("space".to_string()),
-    );
+    let embedding_rows = match db
+        .run(
+            r#"
+query image_embedding($slug: String) {
+    match { $img: PhotoAsset { slug: $slug } }
+    return { $img.embedding as embedding }
+}
+"#,
+            "image_embedding",
+            &ParamMap::from([(
+                "slug".to_string(),
+                nanograph::query::ast::Literal::String("space".to_string()),
+            )]),
+        )
+        .await
+        .unwrap()
+    {
+        nanograph::RunResult::Query(rows) => rows.to_rust_json(),
+        _ => panic!("expected query result"),
+    };
+    let embedding_values = embedding_rows
+        .as_array()
+        .unwrap()
+        .first()
+        .unwrap()
+        .as_object()
+        .unwrap()["embedding"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| nanograph::query::ast::Literal::Float(value.as_f64().unwrap()))
+        .collect::<Vec<_>>();
+
     let results = run_db_query_test_with_params(
         r#"
-query q($q: String) {
+query q($vq: Vector(16)) {
     match {
         $product: Product
         $product hasPhoto $img
     }
     return { $product.slug as slug, $img.slug as image_slug }
-    order { nearest($img.embedding, $q) }
+    order { nearest($img.embedding, $vq) }
     limit 1
 }
 "#,
         &db,
-        &params,
+        &ParamMap::from([(
+            "vq".to_string(),
+            nanograph::query::ast::Literal::List(embedding_values),
+        )]),
     )
     .await;
 
     assert_eq!(extract_string_column(&results, "slug"), vec!["rocket"]);
     assert_eq!(extract_string_column(&results, "image_slug"), vec!["space"]);
+
+    match prev_mock {
+        Some(value) => unsafe { std::env::set_var("NANOGRAPH_EMBEDDINGS_MOCK", value) },
+        None => unsafe { std::env::remove_var("NANOGRAPH_EMBEDDINGS_MOCK") },
+    }
+}
+
+#[tokio::test]
+async fn test_file_media_load_imports_and_embeds_images() {
+    let _guard = EMBED_ENV_LOCK.lock().await;
+    let prev_mock = std::env::var_os("NANOGRAPH_EMBEDDINGS_MOCK");
+    unsafe {
+        std::env::set_var("NANOGRAPH_EMBEDDINGS_MOCK", "1");
+    }
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let fixture_dir = dir.path().join("fixtures");
+    let image_dir = fixture_dir.join("images");
+    std::fs::create_dir_all(&image_dir).unwrap();
+    std::fs::write(
+        image_dir.join("space.png"),
+        b"\x89PNG\r\n\x1a\nspace-image-for-file-media-e2e",
+    )
+    .unwrap();
+    std::fs::write(
+        image_dir.join("beach.png"),
+        b"\x89PNG\r\n\x1a\nbeach-image-for-file-media-e2e",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture_dir.join("data.jsonl"),
+        r#"{"type":"PhotoAsset","data":{"slug":"space","uri":"@file:images/space.png"}}
+{"type":"PhotoAsset","data":{"slug":"beach","uri":"@file:images/beach.png"}}
+{"type":"Product","data":{"slug":"rocket","name":"Rocket Poster"}}
+{"type":"Product","data":{"slug":"sand","name":"Beach Poster"}}
+{"edge":"HasPhoto","from":"rocket","to":"space"}
+{"edge":"HasPhoto","from":"sand","to":"beach"}
+"#,
+    )
+    .unwrap();
+
+    let db = Database::init(&db_path, media_traversal_schema())
+        .await
+        .unwrap();
+    db.load_file_with_mode(&fixture_dir.join("data.jsonl"), LoadMode::Overwrite)
+        .await
+        .unwrap();
+
+    let rows = match db
+        .run(
+            r#"
+query image_row($slug: String) {
+    match { $img: PhotoAsset { slug: $slug } }
+    return { $img.uri as uri, $img.mime as mime, $img.embedding as embedding }
+}
+"#,
+            "image_row",
+            &ParamMap::from([(
+                "slug".to_string(),
+                nanograph::query::ast::Literal::String("space".to_string()),
+            )]),
+        )
+        .await
+        .unwrap()
+    {
+        nanograph::RunResult::Query(rows) => rows.to_rust_json(),
+        _ => panic!("expected query result"),
+    };
+    let row = rows
+        .as_array()
+        .unwrap()
+        .first()
+        .unwrap()
+        .as_object()
+        .unwrap();
+    assert_eq!(row["mime"].as_str(), Some("image/png"));
+    assert!(row["uri"].as_str().unwrap().starts_with("file://"));
+    assert_eq!(row["embedding"].as_array().unwrap().len(), 16);
+
+    let results = run_db_query_test_with_params(
+        r#"
+query q($slug: String) {
+    match {
+        $img: PhotoAsset { slug: $slug }
+        $product: Product
+        $product hasPhoto $img
+    }
+    return { $product.slug as slug, $img.mime as mime }
+}
+"#,
+        &db,
+        &ParamMap::from([(
+            "slug".to_string(),
+            nanograph::query::ast::Literal::String("space".to_string()),
+        )]),
+    )
+    .await;
+
+    assert_eq!(extract_string_column(&results, "slug"), vec!["rocket"]);
+    assert_eq!(extract_string_column(&results, "mime"), vec!["image/png"]);
 
     match prev_mock {
         Some(value) => unsafe { std::env::set_var("NANOGRAPH_EMBEDDINGS_MOCK", value) },

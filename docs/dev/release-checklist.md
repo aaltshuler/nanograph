@@ -17,6 +17,9 @@
 
 ## Pre-release
 
+- [ ] Release branch state is correct before tagging:
+  - release commit is on `main`
+  - `git status --short` is empty after the release commit
 - [ ] CI workflow green on `main` / PRs (`Core Rust`, `CLI E2E`, `TypeScript SDK`, `Swift SDK`)
 - [ ] Local Rust release gate passes:
   - `cargo test --workspace --lib --bins --tests`
@@ -24,12 +27,21 @@
 - [ ] CLI e2e pass locally: `cargo test -p nanograph-cli`
 - [ ] Benchmarks stay separate from the normal release gate; run them manually when needed, not as part of the default release checklist
 - [ ] Local SDK checks pass when the release touched those surfaces:
+  - `cargo build -p nanograph-ffi`
   - `npm test` in `crates/nanograph-ts`
+  - `bash tools/ts-sdk/smoke_test_consumer.sh`
   - `swift test` in `crates/nanograph-ffi/swift`
-- [ ] Bump version in all Cargo.toml files (currently lockstep: `nanograph`, `nanograph-cli`, `nanograph-ffi`, `nanograph-ts`)
-- [ ] Bump version in `crates/nanograph-ts/package.json`
+- [ ] Local release-artifact smoke checks pass when the release touched SDK/distribution surfaces:
+  - `bash tools/swift-package/build_xcframework.sh`
+  - `bash tools/swift-package/render_package.sh --output /tmp/nanograph-swift --version X.Y.Z --artifact-path "$PWD/target/swift-xcframework/NanoGraphFFI.xcframework"`
+  - `(cd /tmp/nanograph-swift && swift test)`
+- [ ] Bump version in all crate manifests (currently lockstep: `nanograph`, `nanograph-cli`, `nanograph-ffi`, `nanograph-ts`)
+- [ ] Bump version in `crates/nanograph-ts/package.json` and refresh checked-in package metadata:
+  - `package-lock.json`
 - [ ] Update cross-references (`nanograph = { path = "../nanograph", version = "X.Y.Z" }`) in nanograph-cli, nanograph-ffi, nanograph-ts
-- [ ] Confirm the TS package still points at `types.d.ts` and that the npm tarball is sane (`npm pack --dry-run` in `crates/nanograph-ts`)
+- [ ] Confirm the TS package still points at `types.d.ts` and that the npm tarball is sane:
+  - `npm pack --dry-run` in `crates/nanograph-ts`
+  - regenerate the release tarball if you check it into the workspace or want a local artifact before publish
 - [ ] Commit: `release: X.Y.Z — <summary>`
 
 ## Publish

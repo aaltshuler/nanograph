@@ -458,6 +458,30 @@ final class DatabaseTests: XCTestCase {
         XCTAssertTrue((rows[0]["uri"] as? String)?.hasPrefix("file://") == true)
     }
 
+    func testLoadRowsImportsBase64MediaAndFillsMime() throws {
+        let (db, dbPath) = try freshMediaDatabase()
+        defer { cleanup(dbPath: dbPath) }
+        defer { try? db.close() }
+
+        try db.loadRows([
+            .node(type: "PhotoAsset", data: [
+                "slug": "inline",
+                "uri": MediaRef.base64("/9j/2Q==", mimeType: "image/jpeg"),
+                "embedding": placeholderEmbedding,
+            ])
+        ], mode: .overwrite)
+
+        let raw = try db.run(
+            querySource: mediaQueries,
+            queryName: "photo_by_slug",
+            params: ["slug": "inline"]
+        )
+        let rows = try castRows(raw)
+        XCTAssertEqual(rows.count, 1)
+        XCTAssertEqual(rows[0]["mime"] as? String, "image/jpeg")
+        XCTAssertTrue((rows[0]["uri"] as? String)?.hasPrefix("file://") == true)
+    }
+
     func testEmbedBackfillsMediaEmbeddingsAndTraversesFromImages() throws {
         let (db, dbPath) = try freshMediaDatabase()
         defer { cleanup(dbPath: dbPath) }

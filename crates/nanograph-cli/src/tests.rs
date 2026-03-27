@@ -1212,6 +1212,143 @@ edge Knows: Person -> Person"#,
 }
 
 #[tokio::test]
+async fn cli_media_base64_load_embed_and_traversal_work_end_to_end() {
+    let _guard = ENV_LOCK.lock().await;
+    let previous_mock = std::env::var_os("NANOGRAPH_EMBEDDINGS_MOCK");
+    unsafe { std::env::set_var("NANOGRAPH_EMBEDDINGS_MOCK", "1") };
+
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let schema_path = dir.path().join("schema.pg");
+    let data_path = dir.path().join("data.jsonl");
+
+    write_file(
+        &schema_path,
+        r#"node PhotoAsset {
+    slug: String @key
+    uri: String @media_uri(mime)
+    mime: String
+    embedding: Vector(16) @embed(uri) @index
+}
+
+node Product {
+    slug: String @key
+    name: String
+}
+
+edge HasPhoto: Product -> PhotoAsset"#,
+    );
+
+    let space_base64 = "iVBORw0KGgpzcGFjZS1pbWFnZS1mb3ItY2xpLWJhc2U2NC1lMmU=";
+    let beach_base64 = "iVBORw0KGgpiZWFjaC1pbWFnZS1mb3ItY2xpLWJhc2U2NC1lMmU=";
+    write_file(
+        &data_path,
+        &format!(
+            r#"{{"type":"PhotoAsset","data":{{"slug":"space","uri":"@base64:{space_base64}","embedding":[1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]}}}}
+{{"type":"PhotoAsset","data":{{"slug":"beach","uri":"@base64:{beach_base64}","embedding":[0.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]}}}}
+{{"type":"Product","data":{{"slug":"rocket","name":"Rocket Poster"}}}}
+{{"type":"Product","data":{{"slug":"sand","name":"Beach Poster"}}}}
+{{"edge":"HasPhoto","from":"rocket","to":"space"}}
+{{"edge":"HasPhoto","from":"sand","to":"beach"}}
+"#
+        ),
+    );
+
+    cmd_init(&db_path, &schema_path, false, false)
+        .await
+        .unwrap();
+    cmd_load(&db_path, &data_path, LoadModeArg::Overwrite, false, false)
+        .await
+        .unwrap();
+    cmd_embed(
+        &db_path,
+        EmbedOptions {
+            type_name: Some("PhotoAsset".to_string()),
+            property: Some("embedding".to_string()),
+            only_null: false,
+            limit: None,
+            reindex: true,
+            dry_run: false,
+        },
+        false,
+        false,
+    )
+    .await
+    .unwrap();
+
+    let db = Database::open(&db_path).await.unwrap();
+    let image_rows = match db
+        .run(
+            r#"
+query image_embedding($slug: String) {
+    match { $img: PhotoAsset { slug: $slug } }
+    return { $img.embedding as embedding, $img.mime as mime, $img.uri as uri }
+}
+"#,
+            "image_embedding",
+            &ParamMap::from([("slug".to_string(), Literal::String("space".to_string()))]),
+        )
+        .await
+        .unwrap()
+    {
+        nanograph::RunResult::Query(rows) => rows.to_rust_json(),
+        _ => panic!("expected query result"),
+    };
+    let image = image_rows
+        .as_array()
+        .unwrap()
+        .first()
+        .unwrap()
+        .as_object()
+        .unwrap();
+    assert_eq!(image["mime"].as_str(), Some("image/png"));
+    assert!(image["uri"].as_str().unwrap().starts_with("file://"));
+    let embedding_values = image["embedding"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| Literal::Float(value.as_f64().unwrap()))
+        .collect::<Vec<_>>();
+
+    let result_rows = match db
+        .run(
+            r#"
+query products_from_image_vector($vq: Vector(16)) {
+    match {
+        $product: Product
+        $product hasPhoto $img
+    }
+    return { $product.slug as product, $img.slug as image }
+    order { nearest($img.embedding, $vq) }
+    limit 1
+}
+"#,
+            "products_from_image_vector",
+            &ParamMap::from([("vq".to_string(), Literal::List(embedding_values))]),
+        )
+        .await
+        .unwrap()
+    {
+        nanograph::RunResult::Query(rows) => rows.to_rust_json(),
+        _ => panic!("expected query result"),
+    };
+    let row = result_rows
+        .as_array()
+        .unwrap()
+        .first()
+        .unwrap()
+        .as_object()
+        .unwrap();
+    assert_eq!(row["product"].as_str(), Some("rocket"));
+    assert_eq!(row["image"].as_str(), Some("space"));
+
+    match previous_mock {
+        Some(value) => unsafe { std::env::set_var("NANOGRAPH_EMBEDDINGS_MOCK", value) },
+        None => unsafe { std::env::remove_var("NANOGRAPH_EMBEDDINGS_MOCK") },
+    }
+}
+
+#[tokio::test]
 async fn describe_type_filter_and_metadata_fields_are_present() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("db");
