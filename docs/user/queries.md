@@ -5,7 +5,7 @@ slug: queries
 
 # Query Language Reference
 
-NanoGraph queries are defined in `.gq` files. The query language uses typed Datalog semantics with GraphQL-shaped syntax — named, parameterized queries validated against the schema at compile time.
+nanograph queries are defined in `.gq` files. The query language uses typed Datalog semantics with GraphQL-shaped syntax — named, parameterized queries validated against the schema at compile time.
 
 ## Query structure
 

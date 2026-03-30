@@ -5,7 +5,7 @@ slug: typescript-sdk
 
 # TypeScript SDK
 
-`nanograph-db` is a Node.js SDK that embeds NanoGraph directly in your process via napi-rs. Same engine as the CLI — no server, no IPC.
+`nanograph-db` is a Node.js SDK that embeds nanograph directly in your process via napi-rs. Same engine as the CLI — no server, no IPC.
 
 ## Requirements
 

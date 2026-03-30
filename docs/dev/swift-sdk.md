@@ -5,7 +5,7 @@ slug: swift-sdk
 
 # Swift SDK
 
-Swift Package that embeds NanoGraph via C ABI (`nanograph-ffi`). Same engine as the CLI — no server, no IPC.
+Swift Package that embeds nanograph via C ABI (`nanograph-ffi`). Same engine as the CLI — no server, no IPC.
 
 ## Requirements
 

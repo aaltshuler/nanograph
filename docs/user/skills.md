@@ -32,8 +32,8 @@ The operational skill covers the most common agent mistakes and how to avoid the
 - **Schema design** — `@key` on every node type, `@description` and `@instruction` annotations for agent discoverability
 - **Query aliases** — define short positional commands in `nanograph.toml` so agents don't build fragile multi-flag invocations
 - **Search** — lexical predicates (`search`, `fuzzy`, `match_text`), semantic search with `nearest(...)`, hybrid ranking with `bm25` and `rrf`, and graph-constrained search patterns
-- **Blobs and media** — `@media_uri(mime)` for external media, JSONL media formats (`@file:`, `@base64:`, `@uri:`), OpenAI text embeddings, and Gemini multimodal embedding workflows
-- **Embedding providers** — OpenAI and Gemini configuration, auto-detection, dimensionality reduction, and provider switching with re-embed
+- **Blobs and media** — `@media_uri(mime)` for external media, JSONL media formats (`@file:`, `@base64:`, `@uri:`), media-root storage, and media-node modeling
+- **Embedding providers** — OpenAI text embeddings, Gemini multimodal embeddings, provider configuration, auto-detection, dimensionality reduction, and provider switching with re-embed
 - **Post-change workflow** — the correct sequence after editing `.pg` or `.gq` files: check → migrate → embed → smoke test
 - **Output formats** — `--format json`, `--format jsonl`, or `--format kv` for agents; `--quiet` to suppress human-readable output
 

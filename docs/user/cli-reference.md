@@ -129,6 +129,8 @@ Useful modes:
 
 `--property` requires `--type`.
 
+See [embeddings.md](embeddings.md) for provider behavior, media support, and recompute guidance.
+
 ### `check`
 
 Parse and typecheck a query file without executing.

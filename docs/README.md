@@ -1,4 +1,4 @@
-# NanoGraph Documentation
+# nanograph Documentation
 
 ## User Docs
 
@@ -8,7 +8,8 @@
 | [config.md](user/config.md) | `nanograph.toml`, `.env.nano`, defaults, aliases, and precedence |
 | [cli-reference.md](user/cli-reference.md) | All commands, options, and data formats |
 | [schema.md](user/schema.md) | Schema language reference — types, annotations, naming |
-| [blobs.md](user/blobs.md) | External media nodes, media URIs, and multimodal embeddings |
+| [blobs.md](user/blobs.md) | External media nodes, media URIs, and media storage behavior |
+| [embeddings.md](user/embeddings.md) | Text and media embeddings, provider behavior, and backfill |
 | [queries.md](user/queries.md) | Query language reference — match, return, traversal, mutations |
 | [search.md](user/search.md) | Text search, vector search, hybrid fusion |
 | [starwars-example.md](user/starwars-example.md) | Star Wars worked example with search |

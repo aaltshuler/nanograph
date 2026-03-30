@@ -97,7 +97,7 @@ nanograph run why opp-stripe-migration --format kv
 
 ## Why this example matters
 
-This example shows how NanoGraph can represent operational reasoning directly:
+This example shows how nanograph can represent operational reasoning directly:
 
 - `Signal` captures observed evidence
 - `Decision` records why work should happen

@@ -102,6 +102,8 @@ nanograph check --query starwars.gq
 
 - [Schema Language Reference](schema.md) — types, annotations, constraints
 - [Project Config](config.md) — `nanograph.toml`, `.env.nano`, aliases, defaults
+- [Embeddings Guide](embeddings.md) — providers, `@embed(...)`, backfill, media limits
+- [Blobs and Media Nodes](blobs.md) — `@media_uri(...)`, media loading, media-root storage
 - [Query Language Reference](queries.md) — match, return, traversal, mutations
 - [Search Guide](search.md) — text search, vector search, hybrid ranking
 - [CLI Reference](cli-reference.md) — all commands and options

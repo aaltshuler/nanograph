@@ -5,7 +5,7 @@ slug: search
 
 # Search Guide
 
-NanoGraph supports lexical search, semantic search, hybrid ranking, and graph-constrained search in the same query language. The canonical search example is `examples/starwars/`.
+nanograph supports lexical search, semantic search, hybrid ranking, and graph-constrained search in the same query language. The canonical search example is `examples/starwars/`.
 
 ## Setup
 
@@ -23,13 +23,15 @@ This example includes:
 - `Character.embedding: Vector(8) @embed(note) @index` for semantic search
 - `nanograph.toml` with `db.default_path`, query roots, aliases, and mock embeddings
 
-If you want real embeddings instead of the example's default mock provider, put your key in `.env.nano`:
+If you want real embeddings instead of the example's default mock provider, configure a provider in `nanograph.toml` and put the matching key in `.env.nano`:
 
 ```bash
 OPENAI_API_KEY=...
+# or
+GEMINI_API_KEY=...
 ```
 
-See [Project Config](config.md) for config and env precedence.
+See [config.md](config.md) for config and env precedence and [embeddings.md](embeddings.md) for provider behavior.
 
 If you add new `@embed(...)` properties to an existing database, or want to recompute vectors after changing embedding settings, use:
 
@@ -98,6 +100,8 @@ query semantic_search($q: String) {
 
 Use semantic search when the user gives intent or concept language instead of exact terms.
 
+String queries in `nearest(...)` are embedded at query time with the currently configured embedding provider and model. Stored row vectors are generated from `@embed(...)` sources during load or backfill. See [embeddings.md](embeddings.md) for provider setup, media support, and recompute guidance.
+
 ## Hybrid search
 
 Hybrid search combines semantic distance and BM25 with `rrf(...)`:
@@ -126,7 +130,7 @@ nanograph run --query starwars.gq --name students_search --format json \
   --param 'q=dark side'
 ```
 
-This pattern is one of NanoGraph's strengths:
+This pattern is one of nanograph's strengths:
 
 - traverse first to define context
 - rank only inside that context
@@ -152,6 +156,7 @@ For agents, `json` and `jsonl` now carry this query metadata too. `json` wraps t
 ## Next steps
 
 - [Project Config](config.md)
+- [Embeddings Guide](embeddings.md)
 - [Star Wars Example](starwars-example.md)
 - [Context Graph Example](context-graph-example.md)
 - [Schema Language Reference](schema.md)

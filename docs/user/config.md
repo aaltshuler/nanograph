@@ -185,13 +185,13 @@ api_key_env = "OPENAI_API_KEY"
 Supported fields:
 
 - `provider` — `openai`, `gemini`, or `mock`
-- `model`
-- `base_url`
+- `model` — defaults to `text-embedding-3-small` for OpenAI and `gemini-embedding-2-preview` for Gemini
+- `base_url` — maps to `OPENAI_BASE_URL` or `GEMINI_BASE_URL` depending on provider
 - `mock`
 - `batch_size`
-- `chunk_size`
-- `chunk_overlap_chars`
-- `api_key_env`
+- `chunk_size` — config key for text chunk size; env equivalent is `NANOGRAPH_EMBED_CHUNK_CHARS`
+- `chunk_overlap_chars` — env equivalent is `NANOGRAPH_EMBED_CHUNK_OVERLAP_CHARS`
+- `api_key_env` — alternate env var name to read the provider API key from
 
 Do not put raw API keys in `nanograph.toml`.
 
@@ -199,6 +199,8 @@ These settings are used by both:
 
 - automatic `@embed(...)` materialization during `load`
 - explicit backfills via `nanograph embed`
+
+For provider behavior, media support, and Gemini limits, see [embeddings.md](embeddings.md).
 
 ### `[cli]`
 
