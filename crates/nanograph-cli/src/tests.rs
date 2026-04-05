@@ -5,7 +5,9 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use nanograph::store::metadata::DatabaseMetadata;
-use nanograph::store::txlog::read_visible_cdc_entries;
+use nanograph::store::txlog::{
+    VisibleCdcSource, read_visible_cdc_entries, read_visible_cdc_entries_with_source,
+};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -298,6 +300,8 @@ fn parse_changes_range_from_cli() {
         "4",
         "--format",
         "json",
+        "--cdc-source",
+        "lineage-shadow",
     ]);
     match cli.command {
         Commands::Changes {
@@ -305,12 +309,14 @@ fn parse_changes_range_from_cli() {
             from_version,
             to_version,
             format,
+            cdc_source,
             ..
         } => {
             assert_eq!(db, Some(PathBuf::from("/tmp/db")));
             assert_eq!(from_version, Some(2));
             assert_eq!(to_version, Some(4));
             assert_eq!(format.as_deref(), Some("json"));
+            assert_eq!(cdc_source, ChangesSourceArg::LineageShadow);
         }
         _ => panic!("expected changes command"),
     }
@@ -1516,9 +1522,86 @@ async fn changes_no_embeddings_uses_schema_ir_without_opening_datasets() {
         .unwrap();
     std::fs::remove_dir_all(db_path.join(dataset_path)).unwrap();
 
-    cmd_changes(&db_path, None, None, None, "json", true, true)
+    cmd_changes(
+        &db_path,
+        None,
+        None,
+        None,
+        "json",
+        true,
+        true,
+        VisibleCdcSource::Authoritative,
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn changes_lineage_shadow_matches_authoritative_on_v4_database() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let schema_path = dir.path().join("schema.pg");
+    let data_path = dir.path().join("data.jsonl");
+    let merge_path = dir.path().join("merge.jsonl");
+
+    write_file(
+        &schema_path,
+        r#"node Person {
+    slug: String @key
+    name: String
+    age: I32?
+}
+edge Knows: Person -> Person"#,
+    );
+    write_file(
+        &data_path,
+        r#"{"type":"Person","data":{"slug":"alice","name":"Alice","age":30}}
+{"type":"Person","data":{"slug":"bob","name":"Bob","age":25}}
+{"edge":"Knows","from":"alice","to":"bob"}"#,
+    );
+    write_file(
+        &merge_path,
+        r#"{"type":"Person","data":{"slug":"alice","name":"Alice","age":31}}"#,
+    );
+
+    cmd_init(&db_path, &schema_path, false, false)
         .await
         .unwrap();
+    cmd_load(&db_path, &data_path, LoadModeArg::Overwrite, false, false)
+        .await
+        .unwrap();
+    cmd_load(&db_path, &merge_path, LoadModeArg::Merge, false, false)
+        .await
+        .unwrap();
+
+    let authoritative = read_visible_cdc_entries_with_source(
+        &db_path,
+        0,
+        None,
+        nanograph::store::txlog::VisibleCdcSource::Authoritative,
+    )
+    .unwrap();
+    let lineage_shadow = read_visible_cdc_entries_with_source(
+        &db_path,
+        0,
+        None,
+        nanograph::store::txlog::VisibleCdcSource::LineageShadow,
+    )
+    .unwrap();
+    assert_eq!(authoritative, lineage_shadow);
+
+    cmd_changes(
+        &db_path,
+        None,
+        None,
+        None,
+        "json",
+        true,
+        false,
+        VisibleCdcSource::LineageShadow,
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -2289,4 +2372,26 @@ edge Follows: User -> User"#,
     assert!(roundtrip_rows.iter().any(|row| {
         row["edge"] == "Follows" && row["from"] == "usr_01" && row["to"] == "usr_02"
     }));
+}
+
+#[tokio::test]
+async fn storage_migrate_rejects_already_v4_database() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("db.nano");
+    let schema_path = dir.path().join("schema.pg");
+    write_file(
+        &schema_path,
+        r#"node Person {
+    slug: String @key
+}"#,
+    );
+
+    cmd_init(&db_path, &schema_path, false, false)
+        .await
+        .unwrap();
+
+    let err = cmd_storage_migrate(&db_path, StorageTargetArg::LanceV4, false, true)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("already uses lance-v4 storage"));
 }

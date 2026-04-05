@@ -324,6 +324,7 @@ fn graph_change_records_from_batch(batch: &RecordBatch) -> Result<Vec<GraphChang
             type_name: type_name.value(row).to_string(),
             entity_key: entity_key.value(row).to_string(),
             payload,
+            rowid_if_known: None,
             committed_at: committed_at.value(row).to_string(),
         });
     }

@@ -1,6 +1,5 @@
 use std::any::Any;
 use std::fmt;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, BooleanArray, FixedSizeListArray, RecordBatch};
@@ -8,18 +7,17 @@ use arrow_schema::{DataType, Field, SchemaRef};
 use datafusion_common::{DataFusionError, Result};
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::EquivalenceProperties;
-use datafusion_physical_plan::memory::MemoryStream;
 use datafusion_physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
 use futures::StreamExt;
-use lance::Dataset;
 use tracing::debug;
 
 use crate::plan::bindings::split_flat_binding_col;
 use crate::plan::literal_utils;
 use crate::query::ast::{CompOp, Literal};
-use crate::store::lance_io::logical_node_field_to_lance;
+use crate::store::lance_io::{logical_node_field_to_lance, open_dataset_for_locator};
+use crate::store::metadata::DatasetLocator;
 use crate::store::runtime::{DatabaseRuntime, TextSearchKind, build_native_text_query};
 
 #[derive(Debug, Clone)]
@@ -278,11 +276,11 @@ impl NodeScanExec {
         Ok(Some(clauses.join(" AND ")))
     }
 
-    fn maybe_lance_dataset_path(&self) -> Option<PathBuf> {
+    fn maybe_lance_dataset_locator(&self) -> Option<DatasetLocator> {
         self.runtime
-            .node_dataset_path(&self.type_name)
-            .map(|p| p.to_path_buf())
-            .filter(|p| p.exists())
+            .node_dataset_locator(&self.type_name)
+            .cloned()
+            .filter(|locator| !locator.namespace_managed)
     }
 
     fn has_index_eligible_pushdown(&self) -> bool {
@@ -341,7 +339,7 @@ impl ExecutionPlan for NodeScanExec {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        if let Some(dataset_path) = self.maybe_lance_dataset_path() {
+        if let Some(locator) = self.maybe_lance_dataset_locator() {
             let output_schema = self.output_schema.clone();
             let projected_columns = self.projected_column_names()?;
             let pushdown_filters = self.pushdown_filters.clone();
@@ -363,23 +361,12 @@ impl ExecutionPlan for NodeScanExec {
             } else {
                 limit.and_then(|v| i64::try_from(v).ok())
             };
-            let dataset_version = self.runtime.node_dataset_version(&self.type_name);
             let text_query = self.text_query();
+            let debug_dataset_version = locator.dataset_version;
             let stream = futures::stream::once(async move {
-                let uri = dataset_path.to_string_lossy().to_string();
-                let dataset = Dataset::open(&uri).await.map_err(|e| {
+                let dataset = open_dataset_for_locator(&locator).await.map_err(|e| {
                     DataFusionError::Execution(format!("lance dataset open error: {}", e))
                 })?;
-                let dataset = if let Some(version) = dataset_version {
-                    dataset.checkout_version(version).await.map_err(|e| {
-                        DataFusionError::Execution(format!(
-                            "lance dataset checkout version {} error: {}",
-                            version, e
-                        ))
-                    })?
-                } else {
-                    dataset
-                };
                 let mut scanner = dataset.scan();
                 scanner.project(&projected_columns).map_err(|e| {
                     DataFusionError::Execution(format!("lance projection pushdown error: {}", e))
@@ -392,7 +379,7 @@ impl ExecutionPlan for NodeScanExec {
                         }
                         Err(e) => {
                             debug!(
-                                dataset_uri = %uri,
+                                table_id = %locator.table_id,
                                 error = %e,
                                 "lance full-text pushdown unavailable, falling back to post-scan evaluation"
                             );
@@ -472,7 +459,7 @@ impl ExecutionPlan for NodeScanExec {
                 node_type = %self.type_name,
                 filter_sql = ?filter_sql_for_debug,
                 limit = ?self.limit,
-                dataset_version = ?dataset_version,
+                dataset_version = debug_dataset_version,
                 index_eligible = self.has_index_eligible_pushdown(),
                 text_pushdown = self.text_filter.is_some(),
                 apply_filters_after_scan,
@@ -487,11 +474,89 @@ impl ExecutionPlan for NodeScanExec {
             ));
         }
 
-        Ok(Box::pin(MemoryStream::try_new(
-            vec![RecordBatch::new_empty(self.output_schema.clone())],
-            self.output_schema.clone(),
-            None,
-        )?))
+        let output_schema = self.output_schema.clone();
+        let pushdown_filters = self.pushdown_filters.clone();
+        let runtime = self.runtime.clone();
+        let type_name = self.type_name.clone();
+        let text_filter = self.text_filter.clone();
+        let limit = self.limit;
+        let stream = futures::stream::once(async move {
+            let Some(lookup) = runtime.load_node_lookup(&type_name).await.map_err(|e| {
+                DataFusionError::Execution(format!("node lookup load error: {}", e))
+            })?
+            else {
+                return Ok(RecordBatch::new_empty(output_schema.clone()));
+            };
+
+            let mut filtered = NodeScanExec::apply_pushdown_filters_with_predicates(
+                &pushdown_filters,
+                &lookup.batch,
+            )?;
+
+            if let Some(text_filter) = text_filter {
+                let scores = runtime
+                    .native_text_scores(
+                        &type_name,
+                        &text_filter.property,
+                        &text_filter.query,
+                        text_filter.kind.clone(),
+                    )
+                    .await
+                    .map_err(|e| {
+                        DataFusionError::Execution(format!("text search fallback error: {}", e))
+                    })?;
+                let ids = filtered
+                    .column_by_name("id")
+                    .ok_or_else(|| {
+                        DataFusionError::Execution(
+                            "node batch missing id column for text filtering".to_string(),
+                        )
+                    })?
+                    .as_any()
+                    .downcast_ref::<arrow_array::UInt64Array>()
+                    .ok_or_else(|| {
+                        DataFusionError::Execution(
+                            "node id column is not UInt64 for text filtering".to_string(),
+                        )
+                    })?;
+                let mask = BooleanArray::from(
+                    (0..filtered.num_rows())
+                        .map(|row| scores.contains_key(&ids.value(row)))
+                        .collect::<Vec<_>>(),
+                );
+                filtered =
+                    arrow_select::filter::filter_record_batch(&filtered, &mask).map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "text filter batch projection error: {}",
+                            e
+                        ))
+                    })?;
+            }
+
+            if filtered.num_rows() == 0 {
+                return Ok(RecordBatch::new_empty(output_schema.clone()));
+            }
+
+            let filtered = if let Some(limit) = limit {
+                let rows_to_emit = filtered.num_rows().min(limit);
+                if rows_to_emit < filtered.num_rows() {
+                    filtered.slice(0, rows_to_emit)
+                } else {
+                    filtered
+                }
+            } else {
+                filtered
+            };
+
+            NodeScanExec::materialize_batch_for_schema(&output_schema, &filtered)
+        });
+
+        Ok(Box::pin(
+            datafusion_physical_plan::stream::RecordBatchStreamAdapter::new(
+                self.output_schema.clone(),
+                stream,
+            ),
+        ))
     }
 }
 

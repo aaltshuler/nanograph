@@ -1,11 +1,9 @@
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Arc;
 
 use ahash::AHashMap;
 use arrow_array::{Array, Float32Array, RecordBatch, UInt64Array};
 use futures::StreamExt;
-use lance::Dataset;
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::SCORE_COL;
 use lance_index::scalar::inverted::query::{
@@ -18,8 +16,8 @@ use crate::error::{NanoError, Result};
 
 use super::csr::CsrIndex;
 use super::lance_io::{
-    LANCE_INTERNAL_ID_FIELD, logical_node_field_to_lance, read_lance_batches,
-    read_lance_projected_batches,
+    LANCE_INTERNAL_ID_FIELD, logical_node_field_to_lance, open_dataset_for_locator,
+    read_lance_batches_for_locator, read_lance_projected_batches_for_locator,
 };
 use super::metadata::{DatabaseMetadata, DatasetLocator};
 
@@ -90,19 +88,9 @@ async fn load_native_text_scores(
     query: &str,
     kind: TextSearchKind,
 ) -> Result<Vec<(u64, f64)>> {
-    let uri = locator.dataset_path.to_string_lossy().to_string();
-    let dataset = Dataset::open(&uri)
+    let dataset = open_dataset_for_locator(locator)
         .await
         .map_err(|e| NanoError::Lance(format!("fts open error: {}", e)))?;
-    let dataset = dataset
-        .checkout_version(locator.dataset_version)
-        .await
-        .map_err(|e| {
-            NanoError::Lance(format!(
-                "fts checkout version {} error: {}",
-                locator.dataset_version, e
-            ))
-        })?;
 
     let fts_query = build_native_text_query(property, query, &kind).ok_or_else(|| {
         NanoError::Execution(format!(
@@ -230,7 +218,14 @@ impl NodeBatchCache {
             return Ok(batch.clone());
         }
 
-        let batches = read_lance_batches(&locator.dataset_path, locator.dataset_version).await?;
+        let batches = read_lance_batches_for_locator(locator)
+            .await
+            .map_err(|err| {
+                NanoError::Storage(format!(
+                    "load node batches for {} at {} failed: {}",
+                    type_name, locator.table_id, err
+                ))
+            })?;
         let batch = if batches.is_empty() {
             None
         } else if batches.len() == 1 {
@@ -307,19 +302,23 @@ impl EdgeIndexCache {
     pub(crate) async fn get_or_build(
         &self,
         edge_type: &str,
-        dataset_path: &Path,
-        dataset_version: u64,
+        locator: &DatasetLocator,
         max_node_id: u64,
     ) -> Result<Arc<EdgeIndexPair>> {
-        let key = (edge_type.to_string(), dataset_version);
+        let key = (edge_type.to_string(), locator.dataset_version);
         let mut guard = self.inner.lock().await;
         if let Some(pair) = guard.get(&key) {
             return Ok(pair.clone());
         }
 
-        let batches =
-            read_lance_projected_batches(dataset_path, dataset_version, &["id", "src", "dst"])
-                .await?;
+        let batches = read_lance_projected_batches_for_locator(locator, &["id", "src", "dst"])
+            .await
+            .map_err(|err| {
+                NanoError::Storage(format!(
+                    "load edge index batches for {} at {} failed: {}",
+                    edge_type, locator.table_id, err
+                ))
+            })?;
         let mut out_edges = Vec::new();
         let mut in_edges = Vec::new();
         for batch in batches {
@@ -394,9 +393,12 @@ impl DatabaseRuntime {
         runtime.next_edge_id = metadata.manifest().next_edge_id;
         for entry in &metadata.manifest().datasets {
             let locator = DatasetLocator {
+                db_path: metadata.path().to_path_buf(),
+                table_id: entry.effective_table_id().to_string(),
                 dataset_path: metadata.path().join(&entry.dataset_path),
                 dataset_version: entry.dataset_version,
                 row_count: entry.row_count,
+                namespace_managed: true,
             };
             match entry.kind.as_str() {
                 "node" => {
@@ -431,24 +433,28 @@ impl DatabaseRuntime {
         self.edge_locators.get(type_name)
     }
 
-    pub(crate) fn node_dataset_path(&self, type_name: &str) -> Option<&Path> {
-        self.node_dataset_locator(type_name)
-            .map(|locator| locator.dataset_path.as_path())
-    }
-
+    #[allow(dead_code)]
     pub(crate) fn node_dataset_version(&self, type_name: &str) -> Option<u64> {
         self.node_dataset_locator(type_name)
             .map(|locator| locator.dataset_version)
     }
 
-    pub(crate) fn edge_dataset_path(&self, type_name: &str) -> Option<&Path> {
-        self.edge_dataset_locator(type_name)
+    #[allow(dead_code)]
+    pub(crate) fn node_dataset_path(&self, type_name: &str) -> Option<&std::path::Path> {
+        self.node_dataset_locator(type_name)
             .map(|locator| locator.dataset_path.as_path())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn edge_dataset_version(&self, type_name: &str) -> Option<u64> {
         self.edge_dataset_locator(type_name)
             .map(|locator| locator.dataset_version)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn edge_dataset_path(&self, type_name: &str) -> Option<&std::path::Path> {
+        self.edge_dataset_locator(type_name)
+            .map(|locator| locator.dataset_path.as_path())
     }
 
     pub(crate) fn node_dataset_count(&self) -> usize {

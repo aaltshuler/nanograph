@@ -9,6 +9,7 @@ use url::Url;
 use crate::catalog::schema_ir::{PropDef, SchemaIR};
 use crate::embedding::{EmbedRole, EmbeddingClient, MediaSource};
 use crate::error::{NanoError, Result};
+use crate::store::blob_store::parse_managed_blob_id;
 use crate::store::manifest::hash_string;
 use crate::store::media::resolve_media_value;
 use crate::types::ScalarType;
@@ -280,7 +281,7 @@ async fn resolve_embedding_requests_with_chunking(
                 }
             }
             EmbedInput::Media { uri, mime_type } => {
-                let media = media_source_from_uri(uri, mime_type)?;
+                let media = media_source_from_uri(db_path, uri, mime_type)?;
                 let entries = missing_media_by_dim.entry(request.dim).or_default();
                 if !entries.iter().any(|(existing, _)| existing == &key) {
                     entries.push((key, media));
@@ -543,6 +544,7 @@ async fn materialize_embeddings_for_load_to_tempfile_inner_with_chunking<R: BufR
         next_line_id += 1;
 
         let mut runtime = StreamEmbedRuntime {
+            db_path,
             cache: &mut cache,
             model: &model,
             client,
@@ -561,6 +563,7 @@ async fn materialize_embeddings_for_load_to_tempfile_inner_with_chunking<R: BufR
     }
 
     let mut runtime = StreamEmbedRuntime {
+        db_path,
         cache: &mut cache,
         model: &model,
         client,
@@ -642,7 +645,7 @@ async fn materialize_embeddings_for_load_inner_with_chunking(
                 }
             }
             EmbedInput::Media { uri, mime_type } => {
-                let media = media_source_from_uri(uri, mime_type)?;
+                let media = media_source_from_uri(db_path, uri, mime_type)?;
                 let entries = missing_media_by_dim
                     .entry(assignment.request.dim)
                     .or_default();
@@ -960,7 +963,15 @@ fn build_embed_request_for_data_obj(
     }
 }
 
-fn media_source_from_uri(uri: &str, mime_type: &str) -> Result<MediaSource> {
+fn media_source_from_uri(db_path: &Path, uri: &str, mime_type: &str) -> Result<MediaSource> {
+    if let Some(blob_id) = parse_managed_blob_id(uri) {
+        return Ok(MediaSource::ManagedBlob {
+            db_path: db_path.to_path_buf(),
+            blob_id: blob_id.to_string(),
+            mime_type: mime_type.to_string(),
+        });
+    }
+
     let parsed = Url::parse(uri)
         .map_err(|err| NanoError::Storage(format!("invalid media URI '{}': {}", uri, err)))?;
     if parsed.scheme() == "file" {
@@ -1032,9 +1043,10 @@ async fn resolve_pending_stream_batch(
         if seen_keys.insert(cache_key.clone()) {
             match &assignment.request.input {
                 EmbedInput::Text(text) => unique_text_entries.push((cache_key, text.clone())),
-                EmbedInput::Media { uri, mime_type } => {
-                    unique_media_entries.push((cache_key, media_source_from_uri(uri, mime_type)?))
-                }
+                EmbedInput::Media { uri, mime_type } => unique_media_entries.push((
+                    cache_key,
+                    media_source_from_uri(runtime.db_path, uri, mime_type)?,
+                )),
             }
         }
         assignments.push(assignment);
@@ -1170,6 +1182,7 @@ async fn resolve_pending_stream_batch(
 }
 
 struct StreamEmbedRuntime<'a> {
+    db_path: &'a Path,
     cache: &'a mut HashMap<CacheKey, Vec<f32>>,
     model: &'a str,
     client: &'a EmbeddingClient,
@@ -1837,7 +1850,7 @@ node PhotoAsset {
             json["data"]["uri"]
                 .as_str()
                 .unwrap()
-                .starts_with("@uri:file://")
+                .starts_with("@uri:lanceblob://sha256/")
         );
         assert!(json["data"]["embedding"].is_array());
     }

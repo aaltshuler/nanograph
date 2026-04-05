@@ -1085,7 +1085,12 @@ query image_row($slug: String) {
         .as_object()
         .unwrap();
     assert_eq!(row["mime"].as_str(), Some("image/png"));
-    assert!(row["uri"].as_str().unwrap().starts_with("file://"));
+    assert!(
+        row["uri"]
+            .as_str()
+            .unwrap()
+            .starts_with("lanceblob://sha256/")
+    );
     assert_eq!(row["embedding"].as_array().unwrap().len(), 16);
 
     let results = run_db_query_test_with_params(

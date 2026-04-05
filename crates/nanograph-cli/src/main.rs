@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use std::collections::{HashMap, HashSet};
 use std::io::{self, IsTerminal};
 use std::ops::Range;
@@ -42,7 +44,10 @@ use nanograph::store::database::{
 };
 use nanograph::store::metadata::DatabaseMetadata;
 use nanograph::store::migration::{SchemaDiffReport, analyze_schema_diff};
-use nanograph::store::txlog::{CdcLogEntry, read_visible_cdc_entries};
+use nanograph::store::storage_migrate::migrate_storage_to_lance_v4;
+use nanograph::store::txlog::{
+    CdcLogEntry, VisibleCdcSource, read_visible_cdc_entries_with_source,
+};
 use nanograph::{ParamMap, lower_query};
 use schema_ops::{cmd_migrate, cmd_schema_diff, schema_compatibility_label};
 use ui::{
@@ -201,6 +206,9 @@ enum Commands {
         /// Omit vector embedding properties from CDC payloads
         #[arg(long, default_value_t = false)]
         no_embeddings: bool,
+        /// Hidden debug source selector for CDC reads
+        #[arg(long, hide = true, value_enum, default_value_t = ChangesSourceArg::Authoritative)]
+        cdc_source: ChangesSourceArg,
         /// Deprecated positional database directory
         #[arg(hide = true)]
         legacy_db_path: Option<PathBuf>,
@@ -289,6 +297,11 @@ enum Commands {
         #[arg(hide = true)]
         legacy_db_path: Option<PathBuf>,
     },
+    /// One-shot storage generation transitions
+    Storage {
+        #[command(subcommand)]
+        command: StorageCommands,
+    },
     /// Parse and typecheck query files
     Check {
         /// Database directory
@@ -322,11 +335,35 @@ enum Commands {
     },
 }
 
+#[derive(Subcommand)]
+enum StorageCommands {
+    /// Migrate a legacy v3 database to lance-v4 namespace storage
+    Migrate {
+        /// Database directory
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Target storage generation
+        #[arg(long, value_enum)]
+        target: StorageTargetArg,
+    },
+}
+
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 enum LoadModeArg {
     Overwrite,
     Append,
     Merge,
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+enum StorageTargetArg {
+    LanceV4,
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+enum ChangesSourceArg {
+    Authoritative,
+    LineageShadow,
 }
 
 impl From<LoadModeArg> for LoadMode {
@@ -335,6 +372,15 @@ impl From<LoadModeArg> for LoadMode {
             LoadModeArg::Overwrite => LoadMode::Overwrite,
             LoadModeArg::Append => LoadMode::Append,
             LoadModeArg::Merge => LoadMode::Merge,
+        }
+    }
+}
+
+impl From<ChangesSourceArg> for VisibleCdcSource {
+    fn from(value: ChangesSourceArg) -> Self {
+        match value {
+            ChangesSourceArg::Authoritative => VisibleCdcSource::Authoritative,
+            ChangesSourceArg::LineageShadow => VisibleCdcSource::LineageShadow,
         }
     }
 }
@@ -464,6 +510,7 @@ async fn dispatch_cli(
             to_version,
             format,
             no_embeddings,
+            cdc_source,
             legacy_db_path,
         } => {
             let db_path = config.resolve_db_path(db.or(legacy_db_path))?;
@@ -477,6 +524,7 @@ async fn dispatch_cli(
                 &format,
                 json,
                 no_embeddings,
+                cdc_source.into(),
             )
             .await
         }
@@ -558,6 +606,12 @@ async fn dispatch_cli(
             )
             .await
         }
+        Commands::Storage { command } => match command {
+            StorageCommands::Migrate { db, target } => {
+                let db_path = config.resolve_db_path(db)?;
+                cmd_storage_migrate(&db_path, target, json, quiet).await
+            }
+        },
         Commands::Check { db, query, schema } => {
             let db = config.resolve_db_path(db)?;
             let query = config.resolve_query_path(&query)?;
@@ -1118,6 +1172,49 @@ async fn cmd_load(
     Ok(())
 }
 
+#[instrument(fields(db_path = %db_path.display(), target = ?target))]
+async fn cmd_storage_migrate(
+    db_path: &Path,
+    target: StorageTargetArg,
+    json: bool,
+    quiet: bool,
+) -> Result<()> {
+    let result = match target {
+        StorageTargetArg::LanceV4 => migrate_storage_to_lance_v4(db_path).await?,
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "status": "ok",
+                "db_path": result.db_path,
+                "backup_path": result.backup_path,
+                "graph_version": result.graph_version,
+                "node_tables": result.node_tables,
+                "edge_tables": result.edge_tables,
+                "media_uris_rewritten": result.media_uris_rewritten,
+                "target": "lance-v4",
+            })
+        );
+    } else if !quiet {
+        println!(
+            "{}",
+            format_status_line(
+                StatusTone::Ok,
+                &format!(
+                    "Migrated {} to lance-v4 storage (backup: {})",
+                    db_path.display(),
+                    result.backup_path
+                ),
+                stdout_supports_color()
+            )
+        );
+    }
+
+    Ok(())
+}
+
 #[instrument(
     fields(
         db_path = %db_path.display(),
@@ -1319,12 +1416,14 @@ async fn cmd_changes(
     format: &str,
     json: bool,
     no_embeddings: bool,
+    source: VisibleCdcSource,
 ) -> Result<()> {
     let window = resolve_changes_window(since, from_version, to_version)?;
-    let mut rows = read_visible_cdc_entries(
+    let mut rows = read_visible_cdc_entries_with_source(
         db_path,
         window.from_db_version_exclusive,
         window.to_db_version_inclusive,
+        source,
     )?;
     if no_embeddings {
         let metadata = DatabaseMetadata::open(db_path)?;
@@ -2051,6 +2150,7 @@ async fn cmd_doctor(
                 "dataset_storage_formats": dataset_storage_formats,
                 "tx_rows": report.tx_rows,
                 "cdc_rows": report.cdc_rows,
+                "lineage_shadow": report.lineage_shadow,
                 "issues": report.issues,
                 "warnings": report.warnings,
                 "schema_status": schema_status,

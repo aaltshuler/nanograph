@@ -24,8 +24,13 @@ datafusion-expr = { workspace = true }
 datafusion-functions-aggregate = { workspace = true }
 lance = { workspace = true }
 lance-file = { workspace = true }
+lance-io = { workspace = true }
 lance-index = { workspace = true }
 lance-linalg = { workspace = true }
+lance-namespace = { workspace = true }
+lance-namespace-impls = { workspace = true }
+lance-table = { workspace = true }
+object_store = { workspace = true }
 pest = { workspace = true }
 pest_derive = { workspace = true }
 thiserror = { workspace = true }

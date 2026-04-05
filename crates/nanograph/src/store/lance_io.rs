@@ -1,16 +1,24 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow_array::{RecordBatch, RecordBatchIterator};
 use async_trait::async_trait;
 use futures::StreamExt;
 use lance::Dataset;
-use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams};
+use lance::dataset::builder::DatasetBuilder;
+use lance::dataset::{
+    InsertBuilder, MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams,
+};
 use lance_file::version::LanceFileVersion;
 use tracing::info;
 
 use crate::error::{NanoError, Result};
 use crate::store::graph_types::{GraphTableId, GraphTableVersion};
+use crate::store::metadata::DatasetLocator;
+use crate::store::namespace::{
+    namespace_latest_version, open_directory_namespace, resolve_or_declare_table_location,
+    table_id_parts,
+};
 
 pub(crate) const LANCE_INTERNAL_ID_FIELD: &str = "__ng_id";
 pub(crate) const LANCE_INTERNAL_SRC_FIELD: &str = "__ng_src";
@@ -18,7 +26,7 @@ pub(crate) const LANCE_INTERNAL_DST_FIELD: &str = "__ng_dst";
 const DEFAULT_NEW_DATASET_STORAGE_VERSION: LanceFileVersion = LanceFileVersion::V2_2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LanceDatasetKind {
+pub(crate) enum LanceDatasetKind {
     Node,
     Edge,
     Plain,
@@ -36,7 +44,7 @@ pub(crate) fn graph_table_id_for_path(path: &Path) -> GraphTableId {
 }
 
 #[async_trait]
-pub(crate) trait TableStore {
+pub(crate) trait TableStore: Send + Sync {
     async fn overwrite(&self, path: &Path, batch: RecordBatch) -> Result<GraphTableVersion>;
     async fn append(&self, path: &Path, batch: RecordBatch) -> Result<GraphTableVersion>;
     async fn merge_insert_with_key(
@@ -65,6 +73,31 @@ impl V3TableStore {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct V4NamespaceTableStore {
+    db_path: PathBuf,
+}
+
+impl V4NamespaceTableStore {
+    pub(crate) fn new(db_path: &Path) -> Self {
+        Self {
+            db_path: db_path.to_path_buf(),
+        }
+    }
+
+    fn table_id_for_path(&self, path: &Path) -> Result<String> {
+        path.strip_prefix(&self.db_path)
+            .map(|relative| relative.to_string_lossy().to_string())
+            .map_err(|_| {
+                NanoError::Storage(format!(
+                    "dataset path {} is outside database root {}",
+                    path.display(),
+                    self.db_path.display()
+                ))
+            })
+    }
+}
+
 pub(crate) fn logical_edge_field_to_lance(field_name: &str) -> &str {
     match field_name {
         "id" => LANCE_INTERNAL_ID_FIELD,
@@ -83,6 +116,24 @@ fn lance_dataset_kind(path: &Path) -> LanceDatasetKind {
         Some("nodes") => LanceDatasetKind::Node,
         Some("edges") => LanceDatasetKind::Edge,
         _ => LanceDatasetKind::Plain,
+    }
+}
+
+fn lance_dataset_kind_for_table_id(table_id: &str) -> LanceDatasetKind {
+    if table_id.starts_with("nodes/") {
+        LanceDatasetKind::Node
+    } else if table_id.starts_with("edges/") {
+        LanceDatasetKind::Edge
+    } else {
+        LanceDatasetKind::Plain
+    }
+}
+
+fn lance_dataset_kind_for_locator(locator: &DatasetLocator) -> LanceDatasetKind {
+    if locator.namespace_managed {
+        lance_dataset_kind_for_table_id(&locator.table_id)
+    } else {
+        lance_dataset_kind(&locator.dataset_path)
     }
 }
 
@@ -111,7 +162,10 @@ fn rename_batch_fields(batch: &RecordBatch, renames: &[(usize, &str)]) -> Result
     .map_err(|e| NanoError::Storage(format!("rename batch schema error: {}", e)))
 }
 
-fn logical_batch_to_lance(batch: &RecordBatch, kind: LanceDatasetKind) -> Result<RecordBatch> {
+pub(crate) fn logical_batch_to_lance(
+    batch: &RecordBatch,
+    kind: LanceDatasetKind,
+) -> Result<RecordBatch> {
     match kind {
         LanceDatasetKind::Node => rename_batch_fields(batch, &[(0, LANCE_INTERNAL_ID_FIELD)]),
         LanceDatasetKind::Edge => rename_batch_fields(
@@ -150,6 +204,28 @@ fn lance_batch_to_logical(batch: &RecordBatch, kind: LanceDatasetKind) -> Result
     }
 }
 
+fn project_logical_batch(batch: &RecordBatch, columns: &[&str]) -> Result<RecordBatch> {
+    let projected_fields = columns
+        .iter()
+        .map(|column| {
+            let index = batch.schema().index_of(column).map_err(|e| {
+                NanoError::Storage(format!(
+                    "projection column {} missing from batch: {}",
+                    column, e
+                ))
+            })?;
+            Ok((
+                batch.schema().field(index).as_ref().clone(),
+                batch.column(index).clone(),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let (fields, arrays): (Vec<_>, Vec<_>) = projected_fields.into_iter().unzip();
+    RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), arrays)
+        .map_err(|e| NanoError::Storage(format!("project logical batch error: {}", e)))
+}
+
 pub(crate) async fn write_lance_batch(path: &Path, batch: RecordBatch) -> Result<u64> {
     Ok(
         write_lance_batch_with_mode_versioned(path, batch, WriteMode::Overwrite)
@@ -169,18 +245,35 @@ pub(crate) async fn write_lance_batch_with_mode(
         .version)
 }
 
-async fn write_lance_batch_with_mode_versioned(
+pub(crate) async fn write_lance_batch_with_mode_versioned(
     path: &Path,
     batch: RecordBatch,
     mode: WriteMode,
 ) -> Result<GraphTableVersion> {
-    let storage_version = if path.exists() || matches!(mode, WriteMode::Append) {
+    write_lance_batch_with_mode_for_kind_versioned(path, batch, mode, lance_dataset_kind(path))
+        .await
+}
+
+pub(crate) async fn write_lance_batch_with_mode_for_kind_versioned(
+    path: &Path,
+    batch: RecordBatch,
+    mode: WriteMode,
+    kind: LanceDatasetKind,
+) -> Result<GraphTableVersion> {
+    let has_manifest_dir = path.join("_versions").exists();
+    let storage_version = if has_manifest_dir || matches!(mode, WriteMode::Append) {
         None
     } else {
         Some(DEFAULT_NEW_DATASET_STORAGE_VERSION)
     };
-    write_lance_batch_with_mode_and_storage_version_versioned(path, batch, mode, storage_version)
-        .await
+    write_lance_batch_with_mode_and_storage_version_for_kind_versioned(
+        path,
+        batch,
+        mode,
+        storage_version,
+        kind,
+    )
+    .await
 }
 
 #[allow(dead_code)]
@@ -206,13 +299,29 @@ async fn write_lance_batch_with_mode_and_storage_version_versioned(
     mode: WriteMode,
     storage_version: Option<LanceFileVersion>,
 ) -> Result<GraphTableVersion> {
+    write_lance_batch_with_mode_and_storage_version_for_kind_versioned(
+        path,
+        batch,
+        mode,
+        storage_version,
+        lance_dataset_kind(path),
+    )
+    .await
+}
+
+async fn write_lance_batch_with_mode_and_storage_version_for_kind_versioned(
+    path: &Path,
+    batch: RecordBatch,
+    mode: WriteMode,
+    storage_version: Option<LanceFileVersion>,
+    kind: LanceDatasetKind,
+) -> Result<GraphTableVersion> {
     info!(
         dataset_path = %path.display(),
         rows = batch.num_rows(),
         mode = ?mode,
         "writing Lance dataset"
     );
-    let kind = lance_dataset_kind(path);
     let batch = logical_batch_to_lance(&batch, kind)?;
     let schema = batch.schema();
     let uri = path.to_string_lossy().to_string();
@@ -222,10 +331,12 @@ async fn write_lance_batch_with_mode_and_storage_version_versioned(
         Some(version) => {
             let mut params = WriteParams::with_storage_version(version);
             params.mode = mode;
+            params.enable_stable_row_ids = true;
             params
         }
         None => WriteParams {
             mode,
+            enable_stable_row_ids: true,
             ..Default::default()
         },
     };
@@ -237,6 +348,51 @@ async fn write_lance_batch_with_mode_and_storage_version_versioned(
     Ok(GraphTableVersion::new(
         graph_table_id_for_path(path),
         dataset.version().version,
+    ))
+}
+
+pub(crate) async fn append_lance_batch_at_version(
+    path: &Path,
+    pinned_version: &GraphTableVersion,
+    batch: RecordBatch,
+) -> Result<GraphTableVersion> {
+    append_lance_batch_at_version_for_kind(path, pinned_version, batch, lance_dataset_kind(path))
+        .await
+}
+
+pub(crate) async fn append_lance_batch_at_version_for_kind(
+    path: &Path,
+    pinned_version: &GraphTableVersion,
+    batch: RecordBatch,
+    kind: LanceDatasetKind,
+) -> Result<GraphTableVersion> {
+    let batch = logical_batch_to_lance(&batch, kind)?;
+    let uri = path.to_string_lossy().to_string();
+    let dataset = Dataset::open(&uri)
+        .await
+        .map_err(|e| NanoError::Lance(format!("append open error: {}", e)))?;
+    let dataset = dataset
+        .checkout_version(pinned_version.version)
+        .await
+        .map_err(|e| {
+            NanoError::Lance(format!(
+                "append checkout version {} error: {}",
+                pinned_version.version, e
+            ))
+        })?;
+    let params = WriteParams {
+        mode: WriteMode::Append,
+        enable_stable_row_ids: true,
+        ..Default::default()
+    };
+    let appended = InsertBuilder::new(Arc::new(dataset))
+        .with_params(&params)
+        .execute(vec![batch])
+        .await
+        .map_err(|e| NanoError::Lance(format!("append error: {}", e)))?;
+    Ok(GraphTableVersion::new(
+        graph_table_id_for_path(path),
+        appended.version().version,
     ))
 }
 
@@ -263,7 +419,23 @@ async fn run_lance_merge_insert_with_key_versioned(
     source_batch: RecordBatch,
     key_prop: &str,
 ) -> Result<GraphTableVersion> {
-    let kind = lance_dataset_kind(dataset_path);
+    run_lance_merge_insert_with_key_versioned_for_kind(
+        dataset_path,
+        pinned_version,
+        source_batch,
+        key_prop,
+        lance_dataset_kind(dataset_path),
+    )
+    .await
+}
+
+async fn run_lance_merge_insert_with_key_versioned_for_kind(
+    dataset_path: &Path,
+    pinned_version: &GraphTableVersion,
+    source_batch: RecordBatch,
+    key_prop: &str,
+    kind: LanceDatasetKind,
+) -> Result<GraphTableVersion> {
     let uri = dataset_path.to_string_lossy().to_string();
     let dataset = Dataset::open(&uri)
         .await
@@ -378,12 +550,151 @@ async fn latest_lance_dataset_graph_version(path: &Path) -> Result<GraphTableVer
     ))
 }
 
-pub(crate) async fn read_lance_batches(path: &Path, version: u64) -> Result<Vec<RecordBatch>> {
-    read_lance_batches_versioned(&GraphTableVersion::new(
-        graph_table_id_for_path(path),
-        version,
-    ))
-    .await
+pub(crate) async fn cleanup_unpublished_manifest_versions(
+    dataset_uri: &str,
+    published_version: Option<u64>,
+) -> Result<usize> {
+    match Dataset::open(dataset_uri).await {
+        Ok(_dataset) => {}
+        Err(_err) if published_version.is_none() => return Ok(0),
+        Err(err) => return Err(NanoError::Lance(format!("cleanup open error: {}", err))),
+    };
+    let unpublished = std::fs::read_dir(
+        PathBuf::from(dataset_uri.strip_prefix("file://").unwrap_or(dataset_uri)).join("_versions"),
+    )?
+    .filter_map(|entry| entry.ok())
+    .filter_map(|entry| {
+        let path = entry.path();
+        let file_name = path.file_name()?.to_str()?;
+        let version = lance_table::io::commit::ManifestNamingScheme::detect_scheme(file_name)
+            .and_then(|scheme| scheme.parse_version(file_name))
+            .or_else(|| {
+                lance_table::io::commit::ManifestNamingScheme::parse_detached_version(file_name)
+            })?;
+        let should_remove = match published_version {
+            Some(published_version) => version > published_version,
+            None => true,
+        };
+        should_remove.then_some((path, version))
+    })
+    .collect::<Vec<_>>();
+    if unpublished.is_empty() {
+        return Ok(0);
+    }
+
+    for (path, _version) in &unpublished {
+        std::fs::remove_file(path)?;
+    }
+
+    Ok(unpublished.len())
+}
+
+pub(crate) async fn open_dataset_for_locator(locator: &DatasetLocator) -> Result<Dataset> {
+    if locator.namespace_managed {
+        let namespace = open_directory_namespace(&locator.db_path).await?;
+        return DatasetBuilder::from_namespace(namespace, table_id_parts(&locator.table_id))
+            .await
+            .map_err(|e| {
+                NanoError::Lance(format!(
+                    "namespace dataset builder {} error: {}",
+                    locator.table_id, e
+                ))
+            })?
+            .with_version(locator.dataset_version)
+            .load()
+            .await
+            .map_err(|e| {
+                NanoError::Lance(format!(
+                    "namespace dataset {} version {} load error: {}",
+                    locator.table_id, locator.dataset_version, e
+                ))
+            });
+    } else {
+        let uri = locator.dataset_path.to_string_lossy().to_string();
+        let dataset = Dataset::open(&uri)
+            .await
+            .map_err(|e| NanoError::Lance(format!("open error: {}", e)))?;
+        dataset
+            .checkout_version(locator.dataset_version)
+            .await
+            .map_err(|e| {
+                NanoError::Lance(format!(
+                    "checkout version {} error: {}",
+                    locator.dataset_version, e
+                ))
+            })
+    }
+}
+
+pub(crate) async fn read_lance_batches_for_locator(
+    locator: &DatasetLocator,
+) -> Result<Vec<RecordBatch>> {
+    let dataset = open_dataset_for_locator(locator).await?;
+    let kind = lance_dataset_kind_for_locator(locator);
+    let projected_columns: Vec<String> = dataset
+        .schema()
+        .fields
+        .iter()
+        .map(|field| field.name.clone())
+        .collect();
+    let mut scanner = dataset.scan();
+    scanner
+        .project(&projected_columns)
+        .map_err(|e| NanoError::Lance(format!("projection error: {}", e)))?;
+    scanner
+        .try_into_stream()
+        .await
+        .map_err(|e| NanoError::Lance(format!("scan error: {}", e)))?
+        .map(|batch| batch.map_err(|e| NanoError::Lance(format!("stream error: {}", e))))
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .map(|batch| lance_batch_to_logical(&batch, kind))
+        .collect()
+}
+
+pub(crate) async fn read_lance_projected_batches_for_locator(
+    locator: &DatasetLocator,
+    columns: &[&str],
+) -> Result<Vec<RecordBatch>> {
+    if locator.namespace_managed {
+        return read_lance_batches_for_locator(locator)
+            .await?
+            .into_iter()
+            .map(|batch| project_logical_batch(&batch, columns))
+            .collect();
+    }
+
+    let dataset = open_dataset_for_locator(locator).await?;
+    let kind = lance_dataset_kind_for_locator(locator);
+    let projected_columns: Vec<String> = columns
+        .iter()
+        .map(|column| match kind {
+            LanceDatasetKind::Node => logical_node_field_to_lance(column),
+            LanceDatasetKind::Edge => logical_edge_field_to_lance(column),
+            LanceDatasetKind::Plain => column,
+        })
+        .map(ToString::to_string)
+        .collect();
+
+    let mut scanner = dataset.scan();
+    scanner
+        .project(&projected_columns)
+        .map_err(|e| NanoError::Lance(format!("projection error: {}", e)))?;
+    scanner
+        .try_into_stream()
+        .await
+        .map_err(|e| NanoError::Lance(format!("scan error: {}", e)))?
+        .map(|batch| batch.map_err(|e| NanoError::Lance(format!("stream error: {}", e))))
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .map(|batch| lance_batch_to_logical(&batch, kind))
+        .collect()
 }
 
 async fn read_lance_batches_versioned(version: &GraphTableVersion) -> Result<Vec<RecordBatch>> {
@@ -405,7 +716,16 @@ async fn read_lance_batches_versioned(version: &GraphTableVersion) -> Result<Vec
         })?;
 
     let kind = lance_dataset_kind(path);
-    let scanner = dataset.scan();
+    let projected_columns: Vec<String> = dataset
+        .schema()
+        .fields
+        .iter()
+        .map(|field| field.name.clone())
+        .collect();
+    let mut scanner = dataset.scan();
+    scanner
+        .project(&projected_columns)
+        .map_err(|e| NanoError::Lance(format!("projection error: {}", e)))?;
     let batches: Vec<RecordBatch> = scanner
         .try_into_stream()
         .await
@@ -505,6 +825,85 @@ impl TableStore for V3TableStore {
 
     async fn latest_version(&self, path: &Path) -> Result<GraphTableVersion> {
         latest_lance_dataset_graph_version(path).await
+    }
+
+    async fn read_all_batches(&self, version: &GraphTableVersion) -> Result<Vec<RecordBatch>> {
+        read_lance_batches_versioned(version).await
+    }
+}
+
+#[async_trait]
+impl TableStore for V4NamespaceTableStore {
+    async fn overwrite(&self, path: &Path, batch: RecordBatch) -> Result<GraphTableVersion> {
+        let namespace = open_directory_namespace(&self.db_path).await?;
+        let table_id = self.table_id_for_path(path)?;
+        let location = resolve_or_declare_table_location(namespace, &table_id).await?;
+        let location_path = PathBuf::from(location.strip_prefix("file://").unwrap_or(&location));
+        write_lance_batch_with_mode_for_kind_versioned(
+            &location_path,
+            batch,
+            WriteMode::Overwrite,
+            lance_dataset_kind_for_table_id(&table_id),
+        )
+        .await
+    }
+
+    async fn append(&self, path: &Path, batch: RecordBatch) -> Result<GraphTableVersion> {
+        let namespace = open_directory_namespace(&self.db_path).await?;
+        let table_id = self.table_id_for_path(path)?;
+        let published = namespace_latest_version(namespace.clone(), &table_id).await?;
+        let location = resolve_or_declare_table_location(namespace, &table_id).await?;
+        cleanup_unpublished_manifest_versions(&location, Some(published.version)).await?;
+        let location_path = PathBuf::from(location.strip_prefix("file://").unwrap_or(&location));
+        append_lance_batch_at_version_for_kind(
+            &location_path,
+            &published,
+            batch,
+            lance_dataset_kind_for_table_id(&table_id),
+        )
+        .await
+    }
+
+    async fn merge_insert_with_key(
+        &self,
+        path: &Path,
+        pinned_version: &GraphTableVersion,
+        source_batch: RecordBatch,
+        key_prop: &str,
+    ) -> Result<GraphTableVersion> {
+        let table_id = self.table_id_for_path(path)?;
+        let namespace = open_directory_namespace(&self.db_path).await?;
+        let location = resolve_or_declare_table_location(namespace, &table_id).await?;
+        cleanup_unpublished_manifest_versions(&location, Some(pinned_version.version)).await?;
+        let location_path = PathBuf::from(location.strip_prefix("file://").unwrap_or(&location));
+        run_lance_merge_insert_with_key_versioned_for_kind(
+            &location_path,
+            pinned_version,
+            source_batch,
+            key_prop,
+            lance_dataset_kind_for_table_id(&table_id),
+        )
+        .await
+    }
+
+    async fn delete_by_ids(
+        &self,
+        path: &Path,
+        pinned_version: &GraphTableVersion,
+        ids: &[u64],
+    ) -> Result<GraphTableVersion> {
+        let table_id = self.table_id_for_path(path)?;
+        let namespace = open_directory_namespace(&self.db_path).await?;
+        let location = resolve_or_declare_table_location(namespace, &table_id).await?;
+        cleanup_unpublished_manifest_versions(&location, Some(pinned_version.version)).await?;
+        let location_path = PathBuf::from(location.strip_prefix("file://").unwrap_or(&location));
+        run_lance_delete_by_ids_versioned(&location_path, pinned_version, ids).await
+    }
+
+    async fn latest_version(&self, path: &Path) -> Result<GraphTableVersion> {
+        let namespace = open_directory_namespace(&self.db_path).await?;
+        let table_id = self.table_id_for_path(path)?;
+        namespace_latest_version(namespace, &table_id).await
     }
 
     async fn read_all_batches(&self, version: &GraphTableVersion) -> Result<Vec<RecordBatch>> {

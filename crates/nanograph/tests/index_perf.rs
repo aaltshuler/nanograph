@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 // Legacy manual performance harness.
 // Prefer the Criterion benchmark in `crates/nanograph/benches/query_lookup.rs`.
 

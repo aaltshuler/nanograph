@@ -32,7 +32,6 @@ use datafusion_physical_plan::{
     projection::{ProjectionExec, ProjectionExpr},
     sorts::sort::SortExec,
 };
-use lance::Dataset;
 use lance_index::DatasetIndexExt;
 
 use crate::embedding::{EmbedRole, EmbeddingClient};
@@ -1774,20 +1773,17 @@ async fn try_execute_single_node_nearest_ann_fast_path(
         _ => return Ok(None),
     };
 
-    let dataset_path = match runtime
-        .node_dataset_path(&candidate.type_name)
-        .filter(|p| p.exists())
-    {
-        Some(path) => path.to_path_buf(),
-        None => return Ok(None),
+    let Some(locator) = runtime.node_dataset_locator(&candidate.type_name).cloned() else {
+        return Ok(None);
     };
-    let dataset_version = runtime.node_dataset_version(&candidate.type_name);
+    if locator.namespace_managed {
+        return Ok(None);
+    }
 
     let query_vec = resolve_nearest_query_vector(&candidate.query, params, vector_dim)?;
     let query_array = Float32Array::from(query_vec);
 
-    let uri = dataset_path.to_string_lossy().to_string();
-    let dataset = match Dataset::open(&uri).await {
+    let dataset = match crate::store::lance_io::open_dataset_for_locator(&locator).await {
         Ok(dataset) => dataset,
         Err(e) => {
             debug!(
@@ -1797,21 +1793,6 @@ async fn try_execute_single_node_nearest_ann_fast_path(
             );
             return Ok(None);
         }
-    };
-    let dataset = match dataset_version {
-        Some(version) => match dataset.checkout_version(version).await {
-            Ok(dataset) => dataset,
-            Err(e) => {
-                debug!(
-                    node_type = %candidate.type_name,
-                    dataset_version = version,
-                    error = %e,
-                    "nearest ANN fast path unavailable, falling back to exact path"
-                );
-                return Ok(None);
-            }
-        },
-        None => dataset,
     };
 
     let field_idx = node_type

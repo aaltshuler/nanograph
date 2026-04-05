@@ -96,6 +96,8 @@ OPENAI_API_KEY=sk-...
 GEMINI_API_KEY=...
 ```
 
+You can get a free Gemini API key from [Google AI Studio](https://aistudio.google.com/).
+
 You can also override provider/model at runtime with:
 
 - `NANOGRAPH_EMBED_PROVIDER`

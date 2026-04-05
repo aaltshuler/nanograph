@@ -7,6 +7,7 @@ use serde::Deserialize;
 use tokio::time::sleep;
 
 use crate::error::{NanoError, Result};
+use crate::store::blob_store::read_managed_blob_bytes;
 
 const DEFAULT_OPENAI_EMBED_MODEL: &str = "text-embedding-3-small";
 const DEFAULT_GEMINI_EMBED_MODEL: &str = "gemini-embedding-2-preview";
@@ -47,6 +48,11 @@ pub(crate) enum MediaSource {
         mime_type: String,
         size_bytes: u64,
     },
+    ManagedBlob {
+        db_path: PathBuf,
+        blob_id: String,
+        mime_type: String,
+    },
     RemoteUri {
         uri: String,
         mime_type: String,
@@ -56,7 +62,9 @@ pub(crate) enum MediaSource {
 impl MediaSource {
     pub(crate) fn mime_type(&self) -> &str {
         match self {
-            Self::LocalFile { mime_type, .. } | Self::RemoteUri { mime_type, .. } => mime_type,
+            Self::LocalFile { mime_type, .. }
+            | Self::ManagedBlob { mime_type, .. }
+            | Self::RemoteUri { mime_type, .. } => mime_type,
         }
     }
 
@@ -67,6 +75,11 @@ impl MediaSource {
                 mime_type,
                 size_bytes,
             } => format!("local:{}:{}:{}", path.display(), mime_type, size_bytes),
+            Self::ManagedBlob {
+                db_path,
+                blob_id,
+                mime_type,
+            } => format!("managed:{}:{}:{}", db_path.display(), blob_id, mime_type),
             Self::RemoteUri { uri, mime_type } => format!("remote:{}:{}", uri, mime_type),
         }
     }
@@ -672,6 +685,35 @@ impl EmbeddingClient {
                         },
                     }
                 }
+                MediaSource::ManagedBlob {
+                    db_path,
+                    blob_id,
+                    mime_type,
+                } => {
+                    let bytes = read_managed_blob_bytes(db_path, blob_id)
+                        .await
+                        .map_err(|err| EmbedCallError {
+                            message: format!(
+                                "failed to read managed media blob {} from {}: {}",
+                                blob_id,
+                                db_path.display(),
+                                err
+                            ),
+                            retryable: false,
+                        })?;
+                    validate_gemini_media_bytes(
+                        media_kind,
+                        mime_type,
+                        &bytes,
+                        &format!("lanceblob://sha256/{}", blob_id),
+                    )?;
+                    GeminiPart::InlineData {
+                        inline_data: GeminiInlineData {
+                            mime_type: mime_type.clone(),
+                            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                        },
+                    }
+                }
                 MediaSource::RemoteUri { uri, mime_type } => {
                     let parsed = reqwest::Url::parse(uri).map_err(|err| EmbedCallError {
                         message: format!("invalid media URI {}: {}", uri, err),
@@ -1207,6 +1249,7 @@ fn normalize_mock_media_key(input: &MediaSource) -> String {
             .file_stem()
             .and_then(|stem| stem.to_str())
             .map(str::to_string),
+        MediaSource::ManagedBlob { blob_id, .. } => Some(blob_id.clone()),
         MediaSource::RemoteUri { uri, .. } => {
             let parsed = reqwest::Url::parse(uri).ok();
             parsed

@@ -7,7 +7,7 @@ use serde_json::Value as JsonValue;
 use crate::catalog::schema_ir::PropDef;
 use crate::error::{NanoError, Result};
 use crate::json_output::array_value_to_json;
-use crate::store::lance_io::read_lance_batches;
+use crate::store::lance_io::read_lance_batches_for_locator;
 use crate::store::metadata::{DatabaseMetadata, DatasetLocator};
 
 pub async fn build_export_rows_at_path(
@@ -186,7 +186,7 @@ async fn read_dataset_batch(locator: Option<DatasetLocator>) -> Result<Option<Re
     let Some(locator) = locator else {
         return Ok(None);
     };
-    let batches = read_lance_batches(&locator.dataset_path, locator.dataset_version).await?;
+    let batches = read_lance_batches_for_locator(&locator).await?;
     if batches.is_empty() {
         return Ok(None);
     }

@@ -1,13 +1,24 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::thread;
 
+use arrow_array::{Array, UInt64Array};
+use futures::TryStreamExt;
+use lance::Dataset;
+use lance::dataset::scanner::DatasetRecordBatchStream;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{NanoError, Result};
 use crate::store::graph_types::{GraphChangeRecord, GraphCommitRecord, GraphTableVersion};
-use crate::store::manifest::GraphManifest;
+use crate::store::lance_io::{LANCE_INTERNAL_ID_FIELD, open_dataset_for_locator};
+use crate::store::manifest::{DatasetEntry, GraphManifest};
+use crate::store::metadata::DatasetLocator;
+use crate::store::namespace_commit::commit_with_namespace_adapter;
+use crate::store::snapshot::{publish_committed_graph_snapshot, read_committed_graph_snapshot};
+use crate::store::storage_generation::{StorageGeneration, detect_storage_generation};
+use crate::store::v4_graph_log::{read_graph_change_records, read_graph_commit_records};
 
 const WAL_FILENAME: &str = "_wal.jsonl";
 
@@ -33,6 +44,12 @@ pub struct CdcLogEntry {
     pub committed_at: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisibleCdcSource {
+    Authoritative,
+    LineageShadow,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WalEntry {
     pub tx_id: String,
@@ -52,6 +69,7 @@ pub(crate) struct LogPruneStats {
     pub(crate) cdc_rows_kept: usize,
 }
 
+#[allow(dead_code)]
 pub(crate) trait GraphCommitStore {
     fn read_commits(&self, db_dir: &Path) -> Result<Vec<GraphCommitRecord>>;
 }
@@ -68,6 +86,27 @@ pub(crate) trait GraphChangeStore {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct JsonlGraphStore;
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct LineageShadowCdcEntries {
+    pub(crate) shadow_entries: Vec<CdcLogEntry>,
+    pub(crate) authoritative_entries_compared: Vec<CdcLogEntry>,
+    pub(crate) skipped_windows: Vec<LineageShadowCdcSkip>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ShadowLineageChangeSet {
+    inserts: BTreeSet<(u64, u64)>,
+    updates: BTreeSet<(u64, u64)>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct LineageShadowCdcSkip {
+    pub(crate) graph_version: u64,
+    pub(crate) kind: String,
+    pub(crate) type_name: String,
+    pub(crate) reason: String,
+}
 
 impl WalEntry {
     fn graph_commit_record(&self) -> GraphCommitRecord {
@@ -131,6 +170,7 @@ fn graph_change_from_cdc_entry(entry: CdcLogEntry) -> GraphChangeRecord {
         type_name: entry.type_name,
         entity_key: entry.entity_key,
         payload: entry.payload,
+        rowid_if_known: None,
         committed_at: entry.committed_at,
     }
 }
@@ -142,11 +182,27 @@ fn graph_commit_from_manifest(manifest: &GraphManifest, op_summary: &str) -> Gra
         table_versions: manifest
             .datasets
             .iter()
-            .map(|entry| GraphTableVersion::new(entry.dataset_path.clone(), entry.dataset_version))
+            .map(|entry| {
+                GraphTableVersion::new(
+                    entry.effective_table_id().to_string(),
+                    entry.dataset_version,
+                )
+            })
             .collect(),
         committed_at: manifest.committed_at.clone(),
         op_summary: op_summary.to_string(),
     }
+}
+
+fn run_v4_async<T, F>(label: &str, work: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    let label = label.to_string();
+    thread::spawn(move || work())
+        .join()
+        .map_err(|_| NanoError::Storage(format!("{} worker thread panicked", label)))?
 }
 
 fn wal_entry_from_graph_records(
@@ -209,6 +265,13 @@ fn repair_wal_log(db_dir: &Path) -> Result<()> {
 }
 
 pub(crate) fn reconcile_logs_to_manifest(db_dir: &Path, manifest_db_version: u64) -> Result<()> {
+    if matches!(
+        detect_storage_generation(db_dir)?,
+        Some(StorageGeneration::V4Namespace)
+    ) {
+        let _ = manifest_db_version;
+        return Ok(());
+    }
     repair_wal_log(db_dir)?;
     let path = wal_path(db_dir);
     let keep_len = compute_wal_visible_prefix(&path, manifest_db_version)?;
@@ -240,14 +303,24 @@ pub fn read_wal_entries(db_dir: &Path) -> Result<Vec<WalEntry>> {
 }
 
 pub fn read_tx_catalog_entries(db_dir: &Path) -> Result<Vec<TxCatalogEntry>> {
-    Ok(JsonlGraphStore
-        .read_commits(db_dir)?
+    Ok(read_visible_graph_commit_records(db_dir)?
         .into_iter()
         .map(|entry| graph_commit_to_tx_catalog_entry(&entry))
         .collect())
 }
 
 pub(crate) fn read_cdc_log_entries(db_dir: &Path) -> Result<Vec<CdcLogEntry>> {
+    if matches!(
+        detect_storage_generation(db_dir)?,
+        Some(StorageGeneration::V4Namespace)
+    ) {
+        let manifest = read_committed_graph_snapshot(db_dir)?;
+        let upper = manifest.db_version;
+        return Ok(read_visible_graph_change_records(db_dir, 0, Some(upper))?
+            .into_iter()
+            .map(graph_change_to_cdc_entry)
+            .collect());
+    }
     Ok(JsonlGraphStore
         .read_changes(db_dir)?
         .into_iter()
@@ -266,11 +339,125 @@ pub fn read_visible_cdc_entries(
     from_db_version_exclusive: u64,
     to_db_version_inclusive: Option<u64>,
 ) -> Result<Vec<CdcLogEntry>> {
-    Ok(JsonlGraphStore
-        .read_visible_changes(db_dir, from_db_version_exclusive, to_db_version_inclusive)?
+    read_visible_cdc_entries_with_source(
+        db_dir,
+        from_db_version_exclusive,
+        to_db_version_inclusive,
+        VisibleCdcSource::Authoritative,
+    )
+}
+
+pub fn read_visible_cdc_entries_with_source(
+    db_dir: &Path,
+    from_db_version_exclusive: u64,
+    to_db_version_inclusive: Option<u64>,
+    source: VisibleCdcSource,
+) -> Result<Vec<CdcLogEntry>> {
+    match source {
+        VisibleCdcSource::Authoritative => Ok(JsonlGraphStore
+            .read_visible_changes(db_dir, from_db_version_exclusive, to_db_version_inclusive)?
+            .into_iter()
+            .map(graph_change_to_cdc_entry)
+            .collect()),
+        VisibleCdcSource::LineageShadow => {
+            let shadow = collect_visible_lineage_shadow_cdc_entries(
+                db_dir,
+                from_db_version_exclusive,
+                to_db_version_inclusive,
+            )?;
+            if !shadow.skipped_windows.is_empty() {
+                let sample = shadow
+                    .skipped_windows
+                    .iter()
+                    .take(3)
+                    .map(|skip| {
+                        format!(
+                            "{} {} @ graph_version {} ({})",
+                            skip.kind, skip.type_name, skip.graph_version, skip.reason
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(NanoError::Storage(format!(
+                    "lineage shadow CDC is incomplete for {} window(s): {}",
+                    shadow.skipped_windows.len(),
+                    sample
+                )));
+            }
+            if shadow.shadow_entries != shadow.authoritative_entries_compared {
+                return Err(NanoError::Storage(format!(
+                    "lineage shadow CDC diverged from authoritative CDC: {}",
+                    summarize_cdc_shadow_mismatch(
+                        &shadow.authoritative_entries_compared,
+                        &shadow.shadow_entries
+                    )
+                )));
+            }
+            Ok(shadow.shadow_entries)
+        }
+    }
+}
+
+pub(crate) fn collect_visible_lineage_shadow_cdc_entries(
+    db_dir: &Path,
+    from_db_version_exclusive: u64,
+    to_db_version_inclusive: Option<u64>,
+) -> Result<LineageShadowCdcEntries> {
+    if !matches!(
+        detect_storage_generation(db_dir)?,
+        Some(StorageGeneration::V4Namespace)
+    ) {
+        let rows = JsonlGraphStore
+            .read_visible_changes(db_dir, from_db_version_exclusive, to_db_version_inclusive)?
+            .into_iter()
+            .map(graph_change_to_cdc_entry)
+            .collect::<Vec<_>>();
+        return Ok(LineageShadowCdcEntries {
+            shadow_entries: rows.clone(),
+            authoritative_entries_compared: rows,
+            skipped_windows: Vec::new(),
+        });
+    }
+
+    let manifest = read_committed_graph_snapshot(db_dir)?;
+    let upper = to_db_version_inclusive
+        .unwrap_or(manifest.db_version)
+        .min(manifest.db_version);
+    if upper <= from_db_version_exclusive {
+        return Ok(LineageShadowCdcEntries::default());
+    }
+
+    let commits = read_visible_graph_commit_records(db_dir)?
         .into_iter()
-        .map(graph_change_to_cdc_entry)
-        .collect())
+        .filter(|commit| {
+            let version = commit.graph_version.value();
+            version > from_db_version_exclusive && version <= upper
+        })
+        .collect::<Vec<_>>();
+    let visible_changes =
+        read_visible_graph_change_records(db_dir, from_db_version_exclusive, Some(upper))?;
+    let db_dir = db_dir.to_path_buf();
+
+    run_v4_async("v4 lineage shadow cdc", move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| {
+                NanoError::Storage(format!(
+                    "initialize v4 lineage shadow cdc runtime error: {}",
+                    err
+                ))
+            })?;
+        runtime.block_on(async move {
+            collect_visible_lineage_shadow_cdc_entries_v4(
+                &db_dir,
+                &manifest,
+                &commits,
+                &visible_changes,
+            )
+            .await
+        })
+    })
 }
 
 pub(crate) fn commit_manifest_and_logs(
@@ -294,9 +481,15 @@ pub(crate) fn commit_graph_records_and_manifest(
     graph_changes: &[GraphChangeRecord],
     manifest: &GraphManifest,
 ) -> Result<()> {
+    if matches!(
+        detect_storage_generation(db_dir)?,
+        Some(StorageGeneration::V4Namespace)
+    ) {
+        return commit_with_namespace_adapter(db_dir, graph_commit, graph_changes, manifest);
+    }
     let wal_entry = wal_entry_from_graph_records(graph_commit, graph_changes);
     append_wal_entry(db_dir, &wal_entry)?;
-    manifest.write_atomic(db_dir)?;
+    publish_committed_graph_snapshot(db_dir, manifest)?;
     Ok(())
 }
 
@@ -305,13 +498,20 @@ pub(crate) fn prune_logs_for_replay_window(
     db_dir: &Path,
     retain_tx_versions: u64,
 ) -> Result<LogPruneStats> {
+    if matches!(
+        detect_storage_generation(db_dir)?,
+        Some(StorageGeneration::V4Namespace)
+    ) {
+        let _ = retain_tx_versions;
+        return Ok(LogPruneStats::default());
+    }
     if retain_tx_versions == 0 {
         return Err(NanoError::Manifest(
             "retain_tx_versions must be >= 1".to_string(),
         ));
     }
 
-    let manifest = GraphManifest::read(db_dir)?;
+    let manifest = read_committed_graph_snapshot(db_dir)?;
     reconcile_logs_to_manifest(db_dir, manifest.db_version)?;
 
     let wal_rows = read_wal_entries(db_dir)?;
@@ -357,7 +557,31 @@ pub(crate) fn prune_logs_for_replay_window(
 }
 
 pub(crate) fn read_visible_graph_commit_records(db_dir: &Path) -> Result<Vec<GraphCommitRecord>> {
-    let manifest = GraphManifest::read(db_dir)?;
+    if matches!(
+        detect_storage_generation(db_dir)?,
+        Some(StorageGeneration::V4Namespace)
+    ) {
+        let manifest = read_committed_graph_snapshot(db_dir)?;
+        let Some(entry) = manifest
+            .datasets
+            .iter()
+            .find(|entry| entry.effective_table_id() == "__graph_tx")
+            .cloned()
+        else {
+            return Ok(Vec::new());
+        };
+        let db_dir = db_dir.to_path_buf();
+        return run_v4_async("v4 graph tx read", move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|err| {
+                    NanoError::Storage(format!("initialize v4 graph tx runtime error: {}", err))
+                })?;
+            runtime.block_on(async move { read_graph_commit_records(&db_dir, &entry).await })
+        });
+    }
+    let manifest = read_committed_graph_snapshot(db_dir)?;
     reconcile_logs_to_manifest(db_dir, manifest.db_version)?;
     Ok(read_wal_entries(db_dir)?
         .into_iter()
@@ -371,7 +595,46 @@ pub(crate) fn read_visible_graph_change_records(
     from_graph_version_exclusive: u64,
     to_graph_version_inclusive: Option<u64>,
 ) -> Result<Vec<GraphChangeRecord>> {
-    let manifest = GraphManifest::read(db_dir)?;
+    if matches!(
+        detect_storage_generation(db_dir)?,
+        Some(StorageGeneration::V4Namespace)
+    ) {
+        let manifest = read_committed_graph_snapshot(db_dir)?;
+        let upper = to_graph_version_inclusive
+            .unwrap_or(manifest.db_version)
+            .min(manifest.db_version);
+        if upper <= from_graph_version_exclusive {
+            return Ok(Vec::new());
+        }
+        let Some(entry) = manifest
+            .datasets
+            .iter()
+            .find(|entry| entry.effective_table_id() == "__graph_changes")
+            .cloned()
+        else {
+            return Ok(Vec::new());
+        };
+        let db_dir = db_dir.to_path_buf();
+        return run_v4_async("v4 graph change read", move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|err| {
+                    NanoError::Storage(format!("initialize v4 graph change runtime error: {}", err))
+                })?;
+            runtime.block_on(async move {
+                let rows = read_graph_change_records(&db_dir, &entry).await?;
+                Ok(rows
+                    .into_iter()
+                    .filter(|row| {
+                        let version = row.graph_version.value();
+                        version > from_graph_version_exclusive && version <= upper
+                    })
+                    .collect())
+            })
+        });
+    }
+    let manifest = read_committed_graph_snapshot(db_dir)?;
     reconcile_logs_to_manifest(db_dir, manifest.db_version)?;
 
     let upper = to_graph_version_inclusive
@@ -403,6 +666,342 @@ fn flatten_graph_change_rows(entries: Vec<WalEntry>) -> Vec<GraphChangeRecord> {
             .then(a.tx_id.as_str().cmp(b.tx_id.as_str()))
     });
     rows
+}
+
+async fn collect_visible_lineage_shadow_cdc_entries_v4(
+    db_dir: &Path,
+    manifest: &GraphManifest,
+    commits: &[GraphCommitRecord],
+    visible_changes: &[GraphChangeRecord],
+) -> Result<LineageShadowCdcEntries> {
+    let data_entries_by_table_id = manifest
+        .datasets
+        .iter()
+        .filter(|entry| matches!(entry.kind.as_str(), "node" | "edge"))
+        .map(|entry| (entry.effective_table_id().to_string(), entry.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let authoritative_by_window = visible_changes.iter().cloned().fold(
+        BTreeMap::<(u64, String, String), Vec<GraphChangeRecord>>::new(),
+        |mut out, row| {
+            out.entry((
+                row.graph_version.value(),
+                row.entity_kind.clone(),
+                row.type_name.clone(),
+            ))
+            .or_default()
+            .push(row);
+            out
+        },
+    );
+
+    let mut shadow_entries = visible_changes
+        .iter()
+        .filter(|row| row.op == "delete")
+        .cloned()
+        .map(graph_change_to_cdc_entry)
+        .collect::<Vec<_>>();
+    let mut authoritative_entries_compared = shadow_entries.clone();
+    let mut skipped_windows = Vec::new();
+    let mut previous_versions = BTreeMap::<String, u64>::new();
+
+    for commit in commits {
+        let graph_version = commit.graph_version.value();
+        let mut next_versions = BTreeMap::<String, u64>::new();
+        for table_version in &commit.table_versions {
+            let Some(entry) = data_entries_by_table_id.get(table_version.table_id.as_str()) else {
+                continue;
+            };
+            let table_id = entry.effective_table_id().to_string();
+            let previous_version = previous_versions.get(&table_id).copied();
+            next_versions.insert(table_id.clone(), table_version.version);
+
+            let window_rows = authoritative_by_window
+                .get(&(graph_version, entry.kind.clone(), entry.type_name.clone()))
+                .cloned()
+                .unwrap_or_default();
+            let window_live_rows = window_rows
+                .into_iter()
+                .filter(|row| matches!(row.op.as_str(), "insert" | "update"))
+                .collect::<Vec<_>>();
+            if window_live_rows.is_empty() && previous_version == Some(table_version.version) {
+                continue;
+            }
+
+            let Some(mut authoritative_lookup) =
+                build_authoritative_lineage_lookup(&window_live_rows)
+            else {
+                skipped_windows.push(LineageShadowCdcSkip {
+                    graph_version,
+                    kind: entry.kind.clone(),
+                    type_name: entry.type_name.clone(),
+                    reason: "graph changes are missing row ids".to_string(),
+                });
+                continue;
+            };
+            let actual = match collect_actual_lineage_changes_for_commit_shadow(
+                db_dir,
+                entry,
+                table_version.version,
+                previous_version,
+            )
+            .await
+            {
+                Ok(Some(actual)) => actual,
+                Ok(None) => {
+                    skipped_windows.push(LineageShadowCdcSkip {
+                        graph_version,
+                        kind: entry.kind.clone(),
+                        type_name: entry.type_name.clone(),
+                        reason: "historical table versions are unavailable".to_string(),
+                    });
+                    continue;
+                }
+                Err(err) => {
+                    skipped_windows.push(LineageShadowCdcSkip {
+                        graph_version,
+                        kind: entry.kind.clone(),
+                        type_name: entry.type_name.clone(),
+                        reason: err.to_string(),
+                    });
+                    continue;
+                }
+            };
+
+            authoritative_entries_compared.extend(
+                window_live_rows
+                    .iter()
+                    .cloned()
+                    .map(graph_change_to_cdc_entry),
+            );
+            shadow_entries.extend(match_lineage_changes_to_graph_changes(
+                &mut authoritative_lookup,
+                &actual,
+            ));
+        }
+        previous_versions = next_versions;
+    }
+
+    sort_cdc_entries(&mut shadow_entries);
+    sort_cdc_entries(&mut authoritative_entries_compared);
+    Ok(LineageShadowCdcEntries {
+        shadow_entries,
+        authoritative_entries_compared,
+        skipped_windows,
+    })
+}
+
+fn build_authoritative_lineage_lookup(
+    rows: &[GraphChangeRecord],
+) -> Option<BTreeMap<(String, u64, u64), Vec<GraphChangeRecord>>> {
+    let mut out = BTreeMap::<(String, u64, u64), Vec<GraphChangeRecord>>::new();
+    for row in rows {
+        let entity_id = shadow_graph_change_entity_id(row)?;
+        let rowid = row.rowid_if_known?;
+        out.entry((row.op.clone(), entity_id, rowid))
+            .or_default()
+            .push(row.clone());
+    }
+    Some(out)
+}
+
+fn match_lineage_changes_to_graph_changes(
+    authoritative_lookup: &mut BTreeMap<(String, u64, u64), Vec<GraphChangeRecord>>,
+    actual: &ShadowLineageChangeSet,
+) -> Vec<CdcLogEntry> {
+    let mut out = Vec::new();
+    for (entity_id, rowid) in &actual.inserts {
+        if let Some(entry) =
+            pop_authoritative_lineage_match(authoritative_lookup, "insert", *entity_id, *rowid)
+        {
+            out.push(graph_change_to_cdc_entry(entry));
+        }
+    }
+    for (entity_id, rowid) in &actual.updates {
+        if let Some(entry) =
+            pop_authoritative_lineage_match(authoritative_lookup, "update", *entity_id, *rowid)
+        {
+            out.push(graph_change_to_cdc_entry(entry));
+        }
+    }
+    out
+}
+
+fn pop_authoritative_lineage_match(
+    authoritative_lookup: &mut BTreeMap<(String, u64, u64), Vec<GraphChangeRecord>>,
+    op: &str,
+    entity_id: u64,
+    rowid: u64,
+) -> Option<GraphChangeRecord> {
+    let key = (op.to_string(), entity_id, rowid);
+    let bucket = authoritative_lookup.get_mut(&key)?;
+    if bucket.is_empty() {
+        return None;
+    }
+    Some(bucket.remove(0))
+}
+
+fn sort_cdc_entries(rows: &mut [CdcLogEntry]) {
+    rows.sort_by(|a, b| {
+        a.db_version
+            .cmp(&b.db_version)
+            .then(a.seq_in_tx.cmp(&b.seq_in_tx))
+            .then(a.tx_id.cmp(&b.tx_id))
+    });
+}
+
+fn summarize_cdc_shadow_mismatch(authoritative: &[CdcLogEntry], shadow: &[CdcLogEntry]) -> String {
+    let common_len = authoritative.len().min(shadow.len());
+    for idx in 0..common_len {
+        let expected = &authoritative[idx];
+        let actual = &shadow[idx];
+        if expected != actual {
+            return format!(
+                "first mismatch at row {} expected {} {} {} {} but shadow had {} {} {} {}",
+                idx + 1,
+                expected.db_version,
+                expected.seq_in_tx,
+                expected.op,
+                expected.entity_key,
+                actual.db_version,
+                actual.seq_in_tx,
+                actual.op,
+                actual.entity_key
+            );
+        }
+    }
+    format!(
+        "row count mismatch authoritative={} shadow={}",
+        authoritative.len(),
+        shadow.len()
+    )
+}
+
+async fn collect_actual_lineage_changes_for_commit_shadow(
+    db_dir: &Path,
+    entry: &DatasetEntry,
+    current_version: u64,
+    previous_version: Option<u64>,
+) -> Result<Option<ShadowLineageChangeSet>> {
+    let locator = DatasetLocator {
+        db_path: db_dir.to_path_buf(),
+        table_id: entry.effective_table_id().to_string(),
+        dataset_path: db_dir.join(&entry.dataset_path),
+        dataset_version: current_version,
+        row_count: entry.row_count,
+        namespace_managed: true,
+    };
+    let dataset = match open_dataset_for_locator(&locator).await {
+        Ok(dataset) => dataset,
+        Err(err) => {
+            return match err {
+                NanoError::Lance(_) | NanoError::Storage(_) => Ok(None),
+                _ => Err(err),
+            };
+        }
+    };
+
+    let mut changes = ShadowLineageChangeSet::default();
+    if let Some(previous_version) = previous_version {
+        let delta = dataset
+            .delta()
+            .compared_against_version(previous_version)
+            .build()
+            .map_err(|err| {
+                NanoError::Lance(format!(
+                    "build delta {} current {} vs previous {} error: {}",
+                    entry.effective_table_id(),
+                    current_version,
+                    previous_version,
+                    err
+                ))
+            })?;
+        changes.inserts = collect_entity_rowids_from_lineage_stream_shadow(
+            delta.get_inserted_rows().await.map_err(|err| {
+                NanoError::Lance(format!(
+                    "read inserted lineage rows {} current {} vs previous {} error: {}",
+                    entry.effective_table_id(),
+                    current_version,
+                    previous_version,
+                    err
+                ))
+            })?,
+        )
+        .await?;
+        changes.updates = collect_entity_rowids_from_lineage_stream_shadow(
+            delta.get_updated_rows().await.map_err(|err| {
+                NanoError::Lance(format!(
+                    "read updated lineage rows {} current {} vs previous {} error: {}",
+                    entry.effective_table_id(),
+                    current_version,
+                    previous_version,
+                    err
+                ))
+            })?,
+        )
+        .await?;
+    } else {
+        changes.inserts = collect_entity_rowids_from_live_dataset_shadow(&dataset).await?;
+    }
+
+    Ok(Some(changes))
+}
+
+async fn collect_entity_rowids_from_live_dataset_shadow(
+    dataset: &Dataset,
+) -> Result<BTreeSet<(u64, u64)>> {
+    let mut scanner = dataset.scan();
+    scanner
+        .project(&[LANCE_INTERNAL_ID_FIELD, "_rowid"])
+        .map_err(|err| NanoError::Lance(format!("project baseline lineage scan error: {}", err)))?;
+    let stream = scanner
+        .try_into_stream()
+        .await
+        .map_err(|err| NanoError::Lance(format!("scan baseline lineage dataset error: {}", err)))?;
+    collect_entity_rowids_from_lineage_stream_shadow(stream).await
+}
+
+async fn collect_entity_rowids_from_lineage_stream_shadow(
+    stream: DatasetRecordBatchStream,
+) -> Result<BTreeSet<(u64, u64)>> {
+    let batches = stream
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|err| NanoError::Lance(format!("collect lineage stream error: {}", err)))?;
+    let mut out = BTreeSet::new();
+    for batch in batches {
+        let entity_ids = batch
+            .column_by_name(LANCE_INTERNAL_ID_FIELD)
+            .ok_or_else(|| {
+                NanoError::Storage(format!(
+                    "lineage batch missing {} column",
+                    LANCE_INTERNAL_ID_FIELD
+                ))
+            })?
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| {
+                NanoError::Storage(format!(
+                    "lineage {} column is not UInt64",
+                    LANCE_INTERNAL_ID_FIELD
+                ))
+            })?;
+        let rowids = batch
+            .column_by_name("_rowid")
+            .ok_or_else(|| NanoError::Storage("lineage batch missing _rowid column".to_string()))?
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .ok_or_else(|| NanoError::Storage("lineage _rowid column is not UInt64".to_string()))?;
+        for row in 0..batch.num_rows() {
+            out.insert((entity_ids.value(row), rowids.value(row)));
+        }
+    }
+    Ok(out)
+}
+
+fn shadow_graph_change_entity_id(record: &GraphChangeRecord) -> Option<u64> {
+    let key = record.entity_key.strip_prefix("id=")?;
+    let value = key.split(',').next()?;
+    value.parse::<u64>().ok()
 }
 
 fn append_jsonl_row<T: Serialize>(path: &Path, row: &T) -> Result<(u64, u64)> {

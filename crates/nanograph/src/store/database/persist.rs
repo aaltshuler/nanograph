@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Cursor};
 use std::path::Path;
 use std::sync::Arc;
@@ -24,7 +24,10 @@ use crate::store::graph_types::{GraphChangeRecord, GraphCommitRecord, GraphTable
 use crate::store::indexing::{
     rebuild_node_scalar_indexes, rebuild_node_text_indexes, rebuild_node_vector_indexes,
 };
-use crate::store::lance_io::{TableStore, V3TableStore, read_lance_batches};
+use crate::store::lance_io::{
+    LANCE_INTERNAL_ID_FIELD, TableStore, V3TableStore, V4NamespaceTableStore,
+    latest_lance_dataset_version, open_dataset_for_locator, read_lance_batches_for_locator,
+};
 use crate::store::loader::{
     EmbedInput, EmbedSourceKind, EmbedValueRequest, build_next_storage_for_load,
     build_next_storage_for_load_reader, build_next_storage_for_load_reader_internal,
@@ -33,8 +36,12 @@ use crate::store::loader::{
 };
 use crate::store::manifest::{DatasetEntry, GraphManifest, hash_string};
 use crate::store::metadata::DatabaseMetadata;
+use crate::store::namespace::{open_directory_namespace, resolve_table_location};
 use crate::store::runtime::DatabaseRuntime;
+use crate::store::snapshot::read_committed_graph_snapshot;
+use crate::store::storage_generation::{StorageGeneration, detect_storage_generation};
 use crate::store::txlog::{CdcLogEntry, commit_graph_records_and_manifest};
+use crate::store::v4_internal::merge_v4_internal_dataset_entries;
 use crate::types::ScalarType;
 
 use super::cdc::{
@@ -505,10 +512,10 @@ impl Database {
             if !type_names.contains(&node_def.name) {
                 continue;
             }
-            let Some(dataset_path) = runtime.node_dataset_path(&node_def.name) else {
+            let Some(locator) = runtime.node_dataset_locator(&node_def.name) else {
                 continue;
             };
-            rebuild_node_vector_indexes(dataset_path, node_def).await?;
+            rebuild_node_vector_indexes(&locator.dataset_path, node_def).await?;
             rebuilt += 1;
         }
         Ok(rebuilt)
@@ -1147,13 +1154,36 @@ pub(crate) fn collect_ids_from_batch(batch: &RecordBatch) -> Result<Vec<u64>> {
     Ok((0..batch.num_rows()).map(|row| id_arr.value(row)).collect())
 }
 
+async fn resolve_manifest_dataset_path(
+    db_path: &Path,
+    table_id: &str,
+    fallback_rel_path: &str,
+    storage_generation: Option<StorageGeneration>,
+) -> Result<String> {
+    if !matches!(storage_generation, Some(StorageGeneration::V4Namespace)) {
+        return Ok(fallback_rel_path.to_string());
+    }
+
+    let namespace = open_directory_namespace(db_path).await?;
+    let location = resolve_table_location(namespace, table_id).await?;
+    let normalized = location.strip_prefix("file://").unwrap_or(&location);
+    Ok(std::path::PathBuf::from(normalized)
+        .strip_prefix(db_path)
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|_| fallback_rel_path.to_string()))
+}
+
 pub(crate) async fn persist_dataset_mutation_plan_at_path(
     db_path: &Path,
     schema_ir: &SchemaIR,
     plan: &DatasetMutationPlan,
 ) -> Result<()> {
-    let table_store = V3TableStore::new();
-    let previous_manifest = GraphManifest::read(db_path)?;
+    let storage_generation = detect_storage_generation(db_path)?;
+    let table_store: Box<dyn TableStore> = match storage_generation {
+        Some(StorageGeneration::V4Namespace) => Box::new(V4NamespaceTableStore::new(db_path)),
+        None => Box::new(V3TableStore::new()),
+    };
+    let previous_manifest = read_committed_graph_snapshot(db_path)?;
     let mut dataset_entries = Vec::new();
     let mut previous_entries_by_key: HashMap<String, DatasetEntry> = HashMap::new();
     for entry in &previous_manifest.datasets {
@@ -1182,11 +1212,18 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
         let node_delta = node_delta.cloned().unwrap_or_default();
 
         let row_count = batch.num_rows() as u64;
+        let table_id = previous_entry
+            .as_ref()
+            .map(|entry| entry.effective_table_id().to_string())
+            .unwrap_or_else(|| format!("nodes/{}", SchemaIR::dir_name(node_def.type_id)));
         let dataset_rel_path = previous_entry
             .as_ref()
             .map(|entry| entry.dataset_path.clone())
-            .unwrap_or_else(|| format!("nodes/{}", SchemaIR::dir_name(node_def.type_id)));
-        let dataset_path = db_path.join(&dataset_rel_path);
+            .unwrap_or_else(|| table_id.clone());
+        let dataset_path = match storage_generation {
+            Some(StorageGeneration::V4Namespace) => db_path.join(&table_id),
+            None => db_path.join(&dataset_rel_path),
+        };
         let duplicate_field_names = schema_has_duplicate_field_names(batch.schema().as_ref());
         let key_prop = node_def
             .properties
@@ -1216,7 +1253,7 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
             && node_delta.inserts.is_none()
             && node_delta.upserts.is_none()
             && !node_delta.delete_ids.is_empty();
-        if can_merge_upsert {
+        let _staged_dataset_version = if can_merge_upsert {
             let source_batch = node_delta.upserts.clone().ok_or_else(|| {
                 NanoError::Storage(format!("missing node upsert batch for {}", node_def.name))
             })?;
@@ -1224,7 +1261,10 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
             let pinned_version = previous_entry
                 .as_ref()
                 .map(|entry| {
-                    GraphTableVersion::new(dataset_rel_path.clone(), entry.dataset_version)
+                    GraphTableVersion::new(
+                        entry.effective_table_id().to_string(),
+                        entry.dataset_version,
+                    )
                 })
                 .ok_or_else(|| {
                     NanoError::Storage(format!(
@@ -1240,7 +1280,8 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
             );
             table_store
                 .merge_insert_with_key(&dataset_path, &pinned_version, source_batch, key_prop)
-                .await?;
+                .await?
+                .version
         } else if can_append {
             let delta_batch = node_delta.inserts.clone().ok_or_else(|| {
                 NanoError::Storage(format!("missing node insert batch for {}", node_def.name))
@@ -1250,12 +1291,18 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
                 rows = delta_batch.num_rows(),
                 "appending node delta to existing Lance dataset"
             );
-            table_store.append(&dataset_path, delta_batch).await?;
+            table_store
+                .append(&dataset_path, delta_batch)
+                .await?
+                .version
         } else if can_native_delete {
             let pinned_version = previous_entry
                 .as_ref()
                 .map(|entry| {
-                    GraphTableVersion::new(dataset_rel_path.clone(), entry.dataset_version)
+                    GraphTableVersion::new(
+                        entry.effective_table_id().to_string(),
+                        entry.dataset_version,
+                    )
                 })
                 .ok_or_else(|| {
                     NanoError::Storage(format!(
@@ -1270,27 +1317,37 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
             );
             table_store
                 .delete_by_ids(&dataset_path, &pinned_version, &node_delta.delete_ids)
-                .await?;
+                .await?
+                .version
         } else {
             debug!(
                 node_type = %node_def.name,
                 rows = row_count,
                 "writing full node dataset from dataset mutation plan"
             );
-            table_store.overwrite(&dataset_path, batch).await?;
-        }
-        rebuild_node_scalar_indexes(&dataset_path, node_def).await?;
-        rebuild_node_text_indexes(&dataset_path, node_def).await?;
-        rebuild_node_vector_indexes(&dataset_path, node_def).await?;
-        let dataset_version = table_store.latest_version(&dataset_path).await?.version;
-        dataset_entries.push(DatasetEntry {
-            type_id: node_def.type_id,
-            type_name: node_def.name.clone(),
-            kind: "node".to_string(),
-            dataset_path: dataset_rel_path,
+            table_store.overwrite(&dataset_path, batch).await?.version
+        };
+        let manifest_dataset_rel_path = resolve_manifest_dataset_path(
+            db_path,
+            &table_id,
+            &dataset_rel_path,
+            storage_generation,
+        )
+        .await?;
+        let dataset_physical_path = db_path.join(&manifest_dataset_rel_path);
+        rebuild_node_scalar_indexes(&dataset_physical_path, node_def).await?;
+        rebuild_node_text_indexes(&dataset_physical_path, node_def).await?;
+        rebuild_node_vector_indexes(&dataset_physical_path, node_def).await?;
+        let dataset_version = latest_lance_dataset_version(&dataset_physical_path).await?;
+        dataset_entries.push(DatasetEntry::new(
+            node_def.type_id,
+            node_def.name.clone(),
+            "node",
+            table_id,
+            manifest_dataset_rel_path,
             dataset_version,
             row_count,
-        });
+        ));
     }
 
     for edge_def in schema_ir.edge_types() {
@@ -1312,11 +1369,18 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
         let edge_delta = edge_delta.cloned().unwrap_or_default();
 
         let row_count = batch.num_rows() as u64;
+        let table_id = previous_entry
+            .as_ref()
+            .map(|entry| entry.effective_table_id().to_string())
+            .unwrap_or_else(|| format!("edges/{}", SchemaIR::dir_name(edge_def.type_id)));
         let dataset_rel_path = previous_entry
             .as_ref()
             .map(|entry| entry.dataset_path.clone())
-            .unwrap_or_else(|| format!("edges/{}", SchemaIR::dir_name(edge_def.type_id)));
-        let dataset_path = db_path.join(&dataset_rel_path);
+            .unwrap_or_else(|| table_id.clone());
+        let dataset_path = match storage_generation {
+            Some(StorageGeneration::V4Namespace) => db_path.join(&table_id),
+            None => db_path.join(&dataset_rel_path),
+        };
         let duplicate_field_names = schema_has_duplicate_field_names(batch.schema().as_ref());
         let can_append = previous_entry.is_some()
             && !duplicate_field_names
@@ -1346,7 +1410,10 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
             let pinned_version = previous_entry
                 .as_ref()
                 .map(|entry| {
-                    GraphTableVersion::new(dataset_rel_path.clone(), entry.dataset_version)
+                    GraphTableVersion::new(
+                        entry.effective_table_id().to_string(),
+                        entry.dataset_version,
+                    )
                 })
                 .ok_or_else(|| {
                     NanoError::Storage(format!(
@@ -1371,15 +1438,25 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
             );
             table_store.overwrite(&dataset_path, batch).await?.version
         };
-        dataset_entries.push(DatasetEntry {
-            type_id: edge_def.type_id,
-            type_name: edge_def.name.clone(),
-            kind: "edge".to_string(),
-            dataset_path: dataset_rel_path,
+        let manifest_dataset_rel_path = resolve_manifest_dataset_path(
+            db_path,
+            &table_id,
+            &dataset_rel_path,
+            storage_generation,
+        )
+        .await?;
+        dataset_entries.push(DatasetEntry::new(
+            edge_def.type_id,
+            edge_def.name.clone(),
+            "edge",
+            table_id,
+            manifest_dataset_rel_path,
             dataset_version,
             row_count,
-        });
+        ));
     }
+
+    merge_v4_internal_dataset_entries(db_path, &mut dataset_entries).await?;
 
     let ir_json = serde_json::to_string_pretty(schema_ir)
         .map_err(|e| NanoError::Manifest(format!("serialize IR error: {}", e)))?;
@@ -1407,12 +1484,17 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
         table_versions: manifest
             .datasets
             .iter()
-            .map(|entry| GraphTableVersion::new(entry.dataset_path.clone(), entry.dataset_version))
+            .map(|entry| {
+                GraphTableVersion::new(
+                    entry.effective_table_id().to_string(),
+                    entry.dataset_version,
+                )
+            })
             .collect(),
         committed_at: manifest.committed_at.clone(),
         op_summary: plan.op_summary.clone(),
     };
-    let graph_changes: Vec<GraphChangeRecord> = committed_cdc_events
+    let mut graph_changes: Vec<GraphChangeRecord> = committed_cdc_events
         .iter()
         .cloned()
         .map(|entry| GraphChangeRecord {
@@ -1424,16 +1506,23 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
             type_name: entry.type_name,
             entity_key: entry.entity_key,
             payload: entry.payload,
+            rowid_if_known: None,
             committed_at: entry.committed_at,
         })
         .collect();
+    if matches!(storage_generation, Some(StorageGeneration::V4Namespace)) {
+        populate_delete_graph_change_rowids_from_committed_snapshot(db_path, &mut graph_changes)
+            .await?;
+    }
     commit_graph_records_and_manifest(db_path, &graph_commit, &graph_changes, &manifest)?;
-    if let Err(err) = rebuild_graph_mirror_from_wal(db_path).await {
-        warn!(
-            error = %err,
-            db_path = %db_path.display(),
-            "graph mirror rebuild failed after commit; authoritative WAL remains intact"
-        );
+    if !matches!(storage_generation, Some(StorageGeneration::V4Namespace)) {
+        if let Err(err) = rebuild_graph_mirror_from_wal(db_path).await {
+            warn!(
+                error = %err,
+                db_path = %db_path.display(),
+                "graph mirror rebuild failed after commit; authoritative WAL remains intact"
+            );
+        }
     }
 
     super::maintenance::cleanup_stale_dirs(db_path, &manifest)?;
@@ -1575,7 +1664,7 @@ async fn restore_sparse_existing_storage(
         };
         let dataset_path = locator.dataset_path.clone();
         let dataset_version = locator.dataset_version;
-        let batches = read_lance_batches(&dataset_path, dataset_version).await?;
+        let batches = read_lance_batches_for_locator(&locator).await?;
         for batch in batches {
             storage.load_node_batch(&type_name, batch)?;
         }
@@ -1589,7 +1678,7 @@ async fn restore_sparse_existing_storage(
         let Some(locator) = metadata.edge_dataset_locator(&type_name) else {
             continue;
         };
-        let batches = read_lance_batches(&locator.dataset_path, locator.dataset_version).await?;
+        let batches = read_lance_batches_for_locator(&locator).await?;
         for batch in batches {
             storage.load_edge_batch(&type_name, batch)?;
         }
@@ -1605,7 +1694,7 @@ pub(crate) async fn read_sparse_node_batch(
     let Some(locator) = metadata.node_dataset_locator(type_name) else {
         return Ok(None);
     };
-    let batches = read_lance_batches(&locator.dataset_path, locator.dataset_version).await?;
+    let batches = read_lance_batches_for_locator(&locator).await?;
     if batches.is_empty() {
         return Ok(None);
     }
@@ -1625,7 +1714,7 @@ pub(crate) async fn read_sparse_edge_batch(
     let Some(locator) = metadata.edge_dataset_locator(type_name) else {
         return Ok(None);
     };
-    let batches = read_lance_batches(&locator.dataset_path, locator.dataset_version).await?;
+    let batches = read_lance_batches_for_locator(&locator).await?;
     if batches.is_empty() {
         return Ok(None);
     }
@@ -1911,7 +2000,7 @@ fn select_embed_types<'a>(
     Ok(selected)
 }
 
-fn record_batch_to_json_rows(batch: &RecordBatch) -> Vec<JsonMap<String, JsonValue>> {
+pub(crate) fn record_batch_to_json_rows(batch: &RecordBatch) -> Vec<JsonMap<String, JsonValue>> {
     let mut rows = Vec::with_capacity(batch.num_rows());
     let schema = batch.schema();
     for row_idx in 0..batch.num_rows() {
@@ -1927,7 +2016,7 @@ fn record_batch_to_json_rows(batch: &RecordBatch) -> Vec<JsonMap<String, JsonVal
     rows
 }
 
-fn json_rows_to_record_batch(
+pub(crate) fn json_rows_to_record_batch(
     schema: &arrow_schema::Schema,
     rows: &[JsonMap<String, JsonValue>],
 ) -> Result<RecordBatch> {
@@ -1950,6 +2039,134 @@ fn json_rows_to_record_batch(
 
 fn dataset_entity_key(kind: &str, type_name: &str) -> String {
     format!("{}:{}", kind, type_name)
+}
+
+async fn populate_delete_graph_change_rowids_from_committed_snapshot(
+    db_path: &Path,
+    graph_changes: &mut [GraphChangeRecord],
+) -> Result<()> {
+    let mut ids_by_locator = BTreeMap::<(String, String), BTreeSet<u64>>::new();
+    for record in graph_changes.iter() {
+        if record.op != "delete" {
+            continue;
+        }
+        let Some(entity_id) = graph_change_entity_id(record) else {
+            continue;
+        };
+        ids_by_locator
+            .entry((record.entity_kind.clone(), record.type_name.clone()))
+            .or_default()
+            .insert(entity_id);
+    }
+
+    if ids_by_locator.is_empty() {
+        return Ok(());
+    }
+
+    let metadata = DatabaseMetadata::open(db_path)?;
+    let mut rowids_by_entity = BTreeMap::<(String, String, u64), u64>::new();
+    for ((kind, type_name), entity_ids) in ids_by_locator {
+        let Some(locator) = metadata.dataset_locator(&kind, &type_name) else {
+            continue;
+        };
+        for (entity_id, rowid) in
+            resolve_rowids_for_locator_from_committed_snapshot(&locator, &entity_ids).await?
+        {
+            rowids_by_entity.insert((kind.clone(), type_name.clone(), entity_id), rowid);
+        }
+    }
+
+    for record in graph_changes.iter_mut() {
+        if record.op != "delete" {
+            continue;
+        }
+        let Some(entity_id) = graph_change_entity_id(record) else {
+            continue;
+        };
+        record.rowid_if_known = rowids_by_entity
+            .get(&(
+                record.entity_kind.clone(),
+                record.type_name.clone(),
+                entity_id,
+            ))
+            .copied();
+    }
+
+    Ok(())
+}
+
+fn graph_change_entity_id(record: &GraphChangeRecord) -> Option<u64> {
+    let key = record.entity_key.strip_prefix("id=")?;
+    let value = key.split(',').next()?;
+    value.parse::<u64>().ok()
+}
+
+async fn resolve_rowids_for_locator_from_committed_snapshot(
+    locator: &crate::store::metadata::DatasetLocator,
+    entity_ids: &BTreeSet<u64>,
+) -> Result<BTreeMap<u64, u64>> {
+    if entity_ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    let dataset = open_dataset_for_locator(locator).await?;
+    let filter = entity_ids
+        .iter()
+        .map(|id| format!("{LANCE_INTERNAL_ID_FIELD} = {id}"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let mut scanner = dataset.scan();
+    scanner
+        .project(&[LANCE_INTERNAL_ID_FIELD, "_rowid"])
+        .map_err(|err| {
+            NanoError::Lance(format!(
+                "project delete rowid resolution {} error: {}",
+                locator.table_id, err
+            ))
+        })?;
+    scanner.filter(&filter).map_err(|err| {
+        NanoError::Lance(format!(
+            "filter delete rowid resolution {} error: {}",
+            locator.table_id, err
+        ))
+    })?;
+    let batch = scanner.try_into_batch().await.map_err(|err| {
+        NanoError::Lance(format!(
+            "execute delete rowid resolution {} error: {}",
+            locator.table_id, err
+        ))
+    })?;
+
+    let entity_ids = batch
+        .column_by_name(LANCE_INTERNAL_ID_FIELD)
+        .ok_or_else(|| {
+            NanoError::Storage(format!(
+                "delete rowid batch missing {} column",
+                LANCE_INTERNAL_ID_FIELD
+            ))
+        })?
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| {
+            NanoError::Storage(format!(
+                "delete rowid {} column is not UInt64",
+                LANCE_INTERNAL_ID_FIELD
+            ))
+        })?;
+    let rowids = batch
+        .column_by_name("_rowid")
+        .ok_or_else(|| NanoError::Storage("delete rowid batch missing _rowid column".to_string()))?
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| {
+            NanoError::Storage("delete rowid _rowid column is not UInt64".to_string())
+        })?;
+
+    let mut out = BTreeMap::new();
+    for row in 0..batch.num_rows() {
+        out.insert(entity_ids.value(row), rowids.value(row));
+    }
+    Ok(out)
 }
 
 fn build_pending_cdc_entries_from_delta(delta: &MutationDelta) -> Result<Vec<CdcLogEntry>> {

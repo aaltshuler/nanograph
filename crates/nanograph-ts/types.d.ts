@@ -146,6 +146,30 @@ export interface DoctorReport {
   datasetsChecked: number
   txRows: number
   cdcRows: number
+  lineageShadow?: DoctorLineageShadowReport | null
+}
+
+export interface DoctorLineageShadowReport {
+  windowsConsidered: number
+  windowsVerified: number
+  windowsSkipped: number
+  windowsMismatched: number
+  missingRowidWindows: number
+  windows: DoctorLineageShadowWindowReport[]
+}
+
+export interface DoctorLineageShadowWindowReport {
+  kind: string
+  typeName: string
+  graphVersion: number
+  previousTableVersion?: number | null
+  currentTableVersion: number
+  expectedInserts: number
+  expectedUpdates: number
+  actualInserts?: number | null
+  actualUpdates?: number | null
+  status: string
+  detail?: string | null
 }
 
 export declare class Database {

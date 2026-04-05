@@ -864,6 +864,30 @@ pub extern "C" fn nanograph_db_doctor(handle: *mut NanoGraphHandle) -> *mut c_ch
     let result = with_handle(handle, |handle| {
         let db = handle.db()?;
         let report = handle.runtime.block_on(db.doctor()).map_err(to_ffi_err)?;
+        let lineage_shadow = report.lineage_shadow.map(|shadow| {
+            serde_json::json!({
+                "windowsConsidered": shadow.windows_considered,
+                "windowsVerified": shadow.windows_verified,
+                "windowsSkipped": shadow.windows_skipped,
+                "windowsMismatched": shadow.windows_mismatched,
+                "missingRowidWindows": shadow.missing_rowid_windows,
+                "windows": shadow.windows.into_iter().map(|window| {
+                    serde_json::json!({
+                        "kind": window.kind,
+                        "typeName": window.type_name,
+                        "graphVersion": window.graph_version,
+                        "previousTableVersion": window.previous_table_version,
+                        "currentTableVersion": window.current_table_version,
+                        "expectedInserts": window.expected_inserts,
+                        "expectedUpdates": window.expected_updates,
+                        "actualInserts": window.actual_inserts,
+                        "actualUpdates": window.actual_updates,
+                        "status": window.status,
+                        "detail": window.detail,
+                    })
+                }).collect::<Vec<_>>(),
+            })
+        });
         Ok(serde_json::json!({
             "healthy": report.healthy,
             "issues": report.issues,
@@ -871,6 +895,7 @@ pub extern "C" fn nanograph_db_doctor(handle: *mut NanoGraphHandle) -> *mut c_ch
             "datasetsChecked": report.datasets_checked,
             "txRows": report.tx_rows,
             "cdcRows": report.cdc_rows,
+            "lineageShadow": lineage_shadow,
         }))
     });
     json_result_to_ptr(result)

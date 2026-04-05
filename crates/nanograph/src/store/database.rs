@@ -27,7 +27,13 @@ use crate::result::{MutationResult, QueryResult, RunResult};
 use crate::schema::parser::parse_schema;
 use crate::store::manifest::{GraphManifest, hash_string};
 use crate::store::metadata::{DatabaseMetadata, SCHEMA_IR_FILENAME};
+use crate::store::namespace::{
+    cleanup_namespace_orphan_versions, cleanup_namespace_snapshot_orphan_versions,
+};
 use crate::store::runtime::DatabaseRuntime;
+use crate::store::snapshot::{publish_committed_graph_snapshot, read_committed_graph_snapshot};
+use crate::store::storage_generation::{StorageGeneration, write_storage_generation};
+use crate::store::v4_internal::ensure_v4_internal_dataset_entries;
 use crate::{lower_mutation_query, lower_query};
 
 const SCHEMA_PG_FILENAME: &str = "schema.pg";
@@ -173,6 +179,31 @@ pub struct DoctorDatasetReport {
     pub storage_version: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DoctorLineageShadowWindowReport {
+    pub kind: String,
+    pub type_name: String,
+    pub graph_version: u64,
+    pub previous_table_version: Option<u64>,
+    pub current_table_version: u64,
+    pub expected_inserts: usize,
+    pub expected_updates: usize,
+    pub actual_inserts: Option<usize>,
+    pub actual_updates: Option<usize>,
+    pub status: String,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DoctorLineageShadowReport {
+    pub windows_considered: usize,
+    pub windows_verified: usize,
+    pub windows_skipped: usize,
+    pub windows_mismatched: usize,
+    pub missing_rowid_windows: usize,
+    pub windows: Vec<DoctorLineageShadowWindowReport>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct DoctorReport {
     pub healthy: bool,
@@ -183,6 +214,7 @@ pub struct DoctorReport {
     pub datasets: Vec<DoctorDatasetReport>,
     pub tx_rows: usize,
     pub cdc_rows: usize,
+    pub lineage_shadow: Option<DoctorLineageShadowReport>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -363,8 +395,10 @@ impl Database {
         let (next_type_id, next_prop_id) = next_schema_identity_counters(&schema_ir);
         manifest.next_type_id = next_type_id;
         manifest.next_prop_id = next_prop_id;
+        write_storage_generation(db_path, StorageGeneration::V4Namespace)?;
         manifest.committed_at = now_unix_seconds_string();
-        manifest.write_atomic(db_path)?;
+        manifest.datasets = ensure_v4_internal_dataset_entries(db_path).await?;
+        publish_committed_graph_snapshot(db_path, &manifest)?;
 
         let runtime = Arc::new(DatabaseRuntime::empty(catalog.clone()));
         info!("database initialized");
@@ -382,6 +416,14 @@ impl Database {
     #[instrument(fields(db_path = %db_path.display()))]
     pub async fn open(db_path: &Path) -> Result<Self> {
         info!("opening database");
+        if matches!(
+            crate::store::storage_generation::detect_storage_generation(db_path)?,
+            Some(StorageGeneration::V4Namespace)
+        ) {
+            cleanup_namespace_snapshot_orphan_versions(db_path).await?;
+            let snapshot = read_committed_graph_snapshot(db_path)?;
+            cleanup_namespace_orphan_versions(db_path, &snapshot).await?;
+        }
         let metadata = DatabaseMetadata::open(db_path)?;
         let schema_ir = metadata.schema_ir().clone();
         let catalog = metadata.catalog().clone();

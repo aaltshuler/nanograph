@@ -98,5 +98,7 @@ pub(crate) struct GraphChangeRecord {
     pub(crate) type_name: String,
     pub(crate) entity_key: String,
     pub(crate) payload: serde_json::Value,
+    #[serde(default)]
+    pub(crate) rowid_if_known: Option<u64>,
     pub(crate) committed_at: String,
 }

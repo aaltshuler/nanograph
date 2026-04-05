@@ -20,10 +20,18 @@ use crate::store::graph_mirror::rebuild_graph_mirror_from_wal;
 use crate::store::indexing::{
     rebuild_node_scalar_indexes, rebuild_node_text_indexes, rebuild_node_vector_indexes,
 };
-use crate::store::lance_io::{latest_lance_dataset_version, read_lance_batches, write_lance_batch};
+use crate::store::lance_io::{
+    latest_lance_dataset_version, read_lance_batches_for_locator, write_lance_batch,
+};
 use crate::store::manifest::{DatasetEntry, GraphManifest, hash_string};
 use crate::store::metadata::{DatabaseMetadata, DatasetLocator};
+use crate::store::namespace::{
+    open_directory_namespace, resolve_table_location, write_namespace_batch,
+};
+use crate::store::snapshot::read_committed_graph_snapshot;
+use crate::store::storage_generation::{StorageGeneration, detect_storage_generation};
 use crate::store::txlog::commit_manifest_and_logs;
+use crate::store::v4_internal::merge_v4_internal_dataset_entries;
 use crate::types::ScalarType;
 
 const SCHEMA_PG_FILENAME: &str = "schema.pg";
@@ -436,7 +444,7 @@ async fn plan_schema_migration(
     let old_ir_json = std::fs::read_to_string(db_path.join(SCHEMA_IR_FILENAME))?;
     let old_ir: SchemaIR = serde_json::from_str(&old_ir_json)
         .map_err(|e| NanoError::Manifest(format!("parse IR error: {}", e)))?;
-    let mut manifest = GraphManifest::read(db_path)?;
+    let mut manifest = read_committed_graph_snapshot(db_path)?;
     bootstrap_identity_counters(&old_ir, &mut manifest);
 
     let mut warnings = Vec::new();
@@ -2197,6 +2205,7 @@ async fn get_property_column(
 async fn apply_planned_migration(db_path: &Path, planned: &PlannedMigration) -> Result<()> {
     let lock = acquire_migration_lock(db_path)?;
     let names = migration_sidecar_paths(db_path)?;
+    let storage_generation = detect_storage_generation(db_path)?;
 
     if names.journal_path.exists() {
         drop(lock);
@@ -2233,6 +2242,38 @@ async fn apply_planned_migration(db_path: &Path, planned: &PlannedMigration) -> 
     let new_storage =
         transform_storage_for_new_schema(&mut data_view, &planned.new_ir, &new_catalog).await?;
 
+    if matches!(storage_generation, Some(StorageGeneration::V4Namespace)) {
+        journal.state = JournalState::Applying;
+        write_journal(&names.journal_path, &journal)?;
+
+        std::fs::rename(db_path, &names.backup_path)?;
+        let write_result = write_staged_db(
+            db_path,
+            &planned.schema_source,
+            &planned.new_ir,
+            &new_storage,
+            &planned.manifest,
+            storage_generation,
+        )
+        .await;
+        if let Err(err) = write_result {
+            let _ = std::fs::remove_dir_all(db_path);
+            let _ = std::fs::rename(&names.backup_path, db_path);
+            journal.state = JournalState::Aborted;
+            let _ = write_journal(&names.journal_path, &journal);
+            drop(lock);
+            return Err(err);
+        }
+
+        journal.state = JournalState::Committed;
+        write_journal(&names.journal_path, &journal)?;
+        std::fs::remove_dir_all(&names.backup_path)?;
+        std::fs::remove_file(&names.journal_path)?;
+
+        drop(lock);
+        return Ok(());
+    }
+
     if names.staging_path.exists() {
         std::fs::remove_dir_all(&names.staging_path)?;
     }
@@ -2242,6 +2283,7 @@ async fn apply_planned_migration(db_path: &Path, planned: &PlannedMigration) -> 
         &planned.new_ir,
         &new_storage,
         &planned.manifest,
+        storage_generation,
     )
     .await?;
 
@@ -2594,7 +2636,7 @@ async fn read_dataset_batch(locator: Option<DatasetLocator>) -> Result<Option<Re
     let Some(locator) = locator else {
         return Ok(None);
     };
-    let batches = read_lance_batches(&locator.dataset_path, locator.dataset_version).await?;
+    let batches = read_lance_batches_for_locator(&locator).await?;
     if batches.is_empty() {
         return Ok(None);
     }
@@ -2642,71 +2684,176 @@ async fn write_staged_db(
     schema_ir: &SchemaIR,
     storage: &DatasetAccumulator,
     manifest_seed: &GraphManifest,
+    storage_generation: Option<StorageGeneration>,
 ) -> Result<()> {
-    std::fs::create_dir_all(path)?;
-    std::fs::create_dir_all(path.join("nodes"))?;
-    std::fs::create_dir_all(path.join("edges"))?;
-    std::fs::write(path.join(SCHEMA_PG_FILENAME), schema_source)?;
-
     let ir_json = serde_json::to_string_pretty(schema_ir)
         .map_err(|e| NanoError::Manifest(format!("serialize IR error: {}", e)))?;
-    std::fs::write(path.join(SCHEMA_IR_FILENAME), &ir_json)?;
+    match storage_generation {
+        Some(StorageGeneration::V4Namespace) => {
+            let db = crate::store::database::Database::init(path, schema_source).await?;
+            drop(db);
+            std::fs::write(path.join(SCHEMA_PG_FILENAME), schema_source)?;
+            std::fs::write(path.join(SCHEMA_IR_FILENAME), &ir_json)?;
+            let namespace = open_directory_namespace(path).await?;
+            let mut dataset_entries = Vec::new();
 
-    let mut dataset_entries = Vec::new();
-    for node_def in schema_ir.node_types() {
-        if let Some(batch) = storage.get_all_nodes(&node_def.name)? {
-            let row_count = batch.num_rows() as u64;
-            let dataset_rel_path = format!("nodes/{}", SchemaIR::dir_name(node_def.type_id));
-            let dataset_path = path.join(&dataset_rel_path);
-            write_lance_batch(&dataset_path, batch).await?;
-            rebuild_node_scalar_indexes(&dataset_path, node_def).await?;
-            rebuild_node_text_indexes(&dataset_path, node_def).await?;
-            rebuild_node_vector_indexes(&dataset_path, node_def).await?;
-            let dataset_version = latest_lance_dataset_version(&dataset_path).await?;
-            dataset_entries.push(DatasetEntry {
-                type_id: node_def.type_id,
-                type_name: node_def.name.clone(),
-                kind: "node".to_string(),
-                dataset_path: dataset_rel_path,
-                dataset_version,
-                row_count,
-            });
+            for node_def in schema_ir.node_types() {
+                if let Some(batch) = storage.get_all_nodes(&node_def.name)? {
+                    let row_count = batch.num_rows() as u64;
+                    let table_id = format!("nodes/{}", SchemaIR::dir_name(node_def.type_id));
+                    write_namespace_batch(
+                        namespace.clone(),
+                        &table_id,
+                        batch.clone(),
+                        lance::dataset::WriteMode::Overwrite,
+                        None,
+                    )
+                    .await?;
+                    let dataset_rel_path =
+                        resolve_manifest_dataset_path(path, namespace.clone(), &table_id).await?;
+                    let dataset_path = path.join(&dataset_rel_path);
+                    rebuild_node_scalar_indexes(&dataset_path, node_def).await?;
+                    rebuild_node_text_indexes(&dataset_path, node_def).await?;
+                    rebuild_node_vector_indexes(&dataset_path, node_def).await?;
+                    let dataset_version = latest_lance_dataset_version(&dataset_path).await?;
+                    dataset_entries.push(DatasetEntry::new(
+                        node_def.type_id,
+                        node_def.name.clone(),
+                        "node",
+                        table_id,
+                        dataset_rel_path,
+                        dataset_version,
+                        row_count,
+                    ));
+                }
+            }
+
+            for edge_def in schema_ir.edge_types() {
+                if let Some(batch) = storage.edge_batch_for_save(&edge_def.name)? {
+                    let row_count = batch.num_rows() as u64;
+                    let table_id = format!("edges/{}", SchemaIR::dir_name(edge_def.type_id));
+                    let version = write_namespace_batch(
+                        namespace.clone(),
+                        &table_id,
+                        batch.clone(),
+                        lance::dataset::WriteMode::Overwrite,
+                        None,
+                    )
+                    .await?;
+                    let dataset_rel_path =
+                        resolve_manifest_dataset_path(path, namespace.clone(), &table_id).await?;
+                    dataset_entries.push(DatasetEntry::new(
+                        edge_def.type_id,
+                        edge_def.name.clone(),
+                        "edge",
+                        table_id,
+                        dataset_rel_path,
+                        version.version,
+                        row_count,
+                    ));
+                }
+            }
+
+            let mut manifest = read_committed_graph_snapshot(path)?;
+            manifest.schema_ir_hash = hash_string(&ir_json);
+            manifest.db_version = manifest_seed.db_version.saturating_add(1);
+            manifest.last_tx_id = format!("migration-{}", manifest.db_version);
+            manifest.committed_at = now_unix_seconds_string();
+            manifest.next_node_id = storage.next_node_id();
+            manifest.next_edge_id = storage.next_edge_id();
+            manifest.next_type_id = manifest_seed.next_type_id;
+            manifest.next_prop_id = manifest_seed.next_prop_id;
+            manifest.schema_identity_version = manifest_seed
+                .schema_identity_version
+                .saturating_add(1)
+                .max(1);
+            manifest.datasets = dataset_entries;
+            merge_v4_internal_dataset_entries(path, &mut manifest.datasets).await?;
+
+            commit_manifest_and_logs(path, &manifest, &[], "schema_migration")?;
+            Ok(())
+        }
+        None => {
+            std::fs::create_dir_all(path)?;
+            std::fs::create_dir_all(path.join("nodes"))?;
+            std::fs::create_dir_all(path.join("edges"))?;
+            std::fs::write(path.join(SCHEMA_PG_FILENAME), schema_source)?;
+            std::fs::write(path.join(SCHEMA_IR_FILENAME), &ir_json)?;
+
+            let mut dataset_entries = Vec::new();
+            for node_def in schema_ir.node_types() {
+                if let Some(batch) = storage.get_all_nodes(&node_def.name)? {
+                    let row_count = batch.num_rows() as u64;
+                    let dataset_rel_path =
+                        format!("nodes/{}", SchemaIR::dir_name(node_def.type_id));
+                    let dataset_path = path.join(&dataset_rel_path);
+                    write_lance_batch(&dataset_path, batch).await?;
+                    rebuild_node_scalar_indexes(&dataset_path, node_def).await?;
+                    rebuild_node_text_indexes(&dataset_path, node_def).await?;
+                    rebuild_node_vector_indexes(&dataset_path, node_def).await?;
+                    let dataset_version = latest_lance_dataset_version(&dataset_path).await?;
+                    dataset_entries.push(DatasetEntry::new(
+                        node_def.type_id,
+                        node_def.name.clone(),
+                        "node",
+                        dataset_rel_path.clone(),
+                        dataset_rel_path,
+                        dataset_version,
+                        row_count,
+                    ));
+                }
+            }
+            for edge_def in schema_ir.edge_types() {
+                if let Some(batch) = storage.edge_batch_for_save(&edge_def.name)? {
+                    let row_count = batch.num_rows() as u64;
+                    let dataset_rel_path =
+                        format!("edges/{}", SchemaIR::dir_name(edge_def.type_id));
+                    let dataset_path = path.join(&dataset_rel_path);
+                    let dataset_version = write_lance_batch(&dataset_path, batch).await?;
+                    dataset_entries.push(DatasetEntry::new(
+                        edge_def.type_id,
+                        edge_def.name.clone(),
+                        "edge",
+                        dataset_rel_path.clone(),
+                        dataset_rel_path,
+                        dataset_version,
+                        row_count,
+                    ));
+                }
+            }
+
+            let mut manifest = GraphManifest::new(hash_string(&ir_json));
+            manifest.db_version = manifest_seed.db_version.saturating_add(1);
+            manifest.last_tx_id = format!("migration-{}", manifest.db_version);
+            manifest.committed_at = now_unix_seconds_string();
+            manifest.next_node_id = storage.next_node_id();
+            manifest.next_edge_id = storage.next_edge_id();
+            manifest.next_type_id = manifest_seed.next_type_id;
+            manifest.next_prop_id = manifest_seed.next_prop_id;
+            manifest.schema_identity_version = manifest_seed
+                .schema_identity_version
+                .saturating_add(1)
+                .max(1);
+            manifest.datasets = dataset_entries;
+
+            commit_manifest_and_logs(path, &manifest, &[], "schema_migration")?;
+            let _ = rebuild_graph_mirror_from_wal(path).await;
+            Ok(())
         }
     }
-    for edge_def in schema_ir.edge_types() {
-        if let Some(batch) = storage.edge_batch_for_save(&edge_def.name)? {
-            let row_count = batch.num_rows() as u64;
-            let dataset_rel_path = format!("edges/{}", SchemaIR::dir_name(edge_def.type_id));
-            let dataset_path = path.join(&dataset_rel_path);
-            let dataset_version = write_lance_batch(&dataset_path, batch).await?;
-            dataset_entries.push(DatasetEntry {
-                type_id: edge_def.type_id,
-                type_name: edge_def.name.clone(),
-                kind: "edge".to_string(),
-                dataset_path: dataset_rel_path,
-                dataset_version,
-                row_count,
-            });
-        }
-    }
+}
 
-    let mut manifest = GraphManifest::new(hash_string(&ir_json));
-    manifest.db_version = manifest_seed.db_version.saturating_add(1);
-    manifest.last_tx_id = format!("migration-{}", manifest.db_version);
-    manifest.committed_at = now_unix_seconds_string();
-    manifest.next_node_id = storage.next_node_id();
-    manifest.next_edge_id = storage.next_edge_id();
-    manifest.next_type_id = manifest_seed.next_type_id;
-    manifest.next_prop_id = manifest_seed.next_prop_id;
-    manifest.schema_identity_version = manifest_seed
-        .schema_identity_version
-        .saturating_add(1)
-        .max(1);
-    manifest.datasets = dataset_entries;
-
-    commit_manifest_and_logs(path, &manifest, &[], "schema_migration")?;
-    let _ = rebuild_graph_mirror_from_wal(path).await;
-    Ok(())
+async fn resolve_manifest_dataset_path(
+    db_path: &Path,
+    namespace: std::sync::Arc<dyn lance_namespace::LanceNamespace>,
+    table_id: &str,
+) -> Result<String> {
+    let location = resolve_table_location(namespace, table_id).await?;
+    let normalized = location.strip_prefix("file://").unwrap_or(&location);
+    Ok(PathBuf::from(normalized)
+        .strip_prefix(db_path)
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|_| table_id.to_string()))
 }
 
 fn now_unix_seconds_string() -> String {

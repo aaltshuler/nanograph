@@ -716,6 +716,10 @@ query coworkers() {
       assert.equal(typeof report.datasetsChecked, "number");
       assert.equal(typeof report.txRows, "number");
       assert.equal(typeof report.cdcRows, "number");
+      assert.ok(report.lineageShadow);
+      assert.equal(typeof report.lineageShadow.windowsConsidered, "number");
+      assert.equal(typeof report.lineageShadow.windowsVerified, "number");
+      assert.ok(Array.isArray(report.lineageShadow.windows));
       await db.close();
     });
   });

@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
@@ -10,12 +12,12 @@ use nanograph::schema::parser::parse_schema;
 use nanograph::schema_ir::SchemaIR;
 use nanograph::store::database::Database;
 use nanograph::store::export::build_export_rows_at_path;
-use nanograph::store::manifest::GraphManifest;
 use nanograph::store::migration::{
     MigrationStatus, MigrationStep, SchemaCompatibility, analyze_schema_diff,
     execute_schema_migration,
 };
 use nanograph::store::scalar_index_name;
+use nanograph::store::snapshot::{publish_committed_graph_snapshot, read_committed_graph_snapshot};
 use nanograph::store::txlog::read_tx_catalog_entries;
 
 fn base_schema() -> &'static str {
@@ -644,7 +646,7 @@ async fn migration_sequential_runs_increment_schema_identity_version() {
         .expect("second migration");
     assert_eq!(second.status, MigrationStatus::Applied);
 
-    let manifest = GraphManifest::read(&db_path).expect("read manifest");
+    let manifest = read_committed_graph_snapshot(&db_path).expect("read manifest");
     assert_eq!(manifest.schema_identity_version, 3);
 }
 
@@ -658,7 +660,7 @@ async fn migration_appends_tx_catalog_row() {
         .expect("apply migration");
     assert_eq!(exec.status, MigrationStatus::Applied);
 
-    let manifest = GraphManifest::read(&db_path).expect("read manifest");
+    let manifest = read_committed_graph_snapshot(&db_path).expect("read manifest");
     let tx_rows = read_tx_catalog_entries(&db_path).expect("read tx catalog");
     let last = tx_rows.last().expect("at least one tx row");
 
@@ -765,13 +767,11 @@ async fn migration_bootstraps_identity_counters_from_legacy_manifest() {
         .expect("at least one type");
     drop(old_db);
 
-    let mut manifest = GraphManifest::read(&db_path).expect("read manifest");
+    let mut manifest = read_committed_graph_snapshot(&db_path).expect("read manifest");
     manifest.next_type_id = 0;
     manifest.next_prop_id = 0;
     manifest.schema_identity_version = 0;
-    manifest
-        .write_atomic(&db_path)
-        .expect("write legacy manifest");
+    publish_committed_graph_snapshot(&db_path, &manifest).expect("write committed snapshot");
 
     write_schema(
         &db_path,

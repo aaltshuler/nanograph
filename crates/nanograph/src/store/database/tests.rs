@@ -1,23 +1,42 @@
 use super::maintenance::read_cdc_analytics_state;
+use super::persist::json_rows_to_record_batch;
 use super::*;
+use crate::store::export::build_export_rows_at_path;
 use crate::store::graph_mirror::{
     GRAPH_CHANGES_DATASET_DIR, GRAPH_COMMITS_DATASET_DIR, inspect_graph_mirror,
     read_graph_change_mirror, read_graph_commit_mirror, rebuild_graph_mirror_from_wal,
 };
-use crate::store::lance_io::LANCE_INTERNAL_ID_FIELD;
+use crate::store::graph_types::{GraphChangeRecord, GraphCommitRecord, GraphTableVersion};
 use crate::store::lance_io::write_lance_batch_with_mode_and_storage_version;
+use crate::store::lance_io::{
+    LANCE_INTERNAL_ID_FIELD, TableStore, V4NamespaceTableStore, open_dataset_for_locator,
+};
 use crate::store::manifest::DatasetEntry;
 use crate::store::metadata::DatabaseMetadata;
 use crate::store::migration::{MigrationStatus, execute_schema_migration};
-use crate::store::txlog::{
-    append_tx_catalog_entry, read_tx_catalog_entries, read_visible_cdc_entries,
+use crate::store::namespace::{
+    GRAPH_CHANGES_TABLE_ID, GRAPH_SNAPSHOT_TABLE_ID, GRAPH_TX_TABLE_ID,
+    cleanup_namespace_orphan_versions, open_directory_namespace, resolve_table_location,
+    write_namespace_batch,
 };
-use arrow_array::{Array, StringArray, UInt64Array};
+use crate::store::namespace_commit::{build_graph_update_bundle, publish_graph_commit_bundle};
+use crate::store::snapshot::{
+    graph_snapshot_table_present, publish_committed_graph_snapshot, read_committed_graph_snapshot,
+};
+use crate::store::storage_generation::storage_metadata_path;
+use crate::store::txlog::{
+    VisibleCdcSource, append_tx_catalog_entry, collect_visible_lineage_shadow_cdc_entries,
+    read_tx_catalog_entries, read_visible_cdc_entries, read_visible_cdc_entries_with_source,
+    read_visible_graph_change_records, read_visible_graph_commit_records,
+};
+use arrow_array::{Array, StringArray, UInt32Array, UInt64Array};
+use arrow_schema::{Field, Schema};
 use lance::Dataset;
 use lance::dataset::WriteMode;
 use lance_file::version::LanceFileVersion;
 use lance_index::DatasetIndexExt;
 use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
 use tempfile::TempDir;
 
 fn test_schema_src() -> &'static str {
@@ -44,6 +63,23 @@ fn test_data_src() -> &'static str {
 {"edge": "Knows", "from": "Alice", "to": "Charlie"}
 {"edge": "WorksAt", "from": "Alice", "to": "Acme"}
 "#
+}
+
+fn assert_lineage_shadow_cdc_matches_authoritative(
+    path: &std::path::Path,
+    from_db_version_exclusive: u64,
+    to_db_version_inclusive: Option<u64>,
+) {
+    let shadow = collect_visible_lineage_shadow_cdc_entries(
+        path,
+        from_db_version_exclusive,
+        to_db_version_inclusive,
+    )
+    .unwrap();
+    assert_eq!(
+        shadow.shadow_entries, shadow.authoritative_entries_compared,
+        "expected lineage shadow CDC to match authoritative CDC"
+    );
 }
 
 fn duplicate_edge_data_src() -> &'static str {
@@ -280,6 +316,31 @@ fn person_id_by_name(batch: &RecordBatch, name: &str) -> u64 {
         .unwrap()
 }
 
+fn edge_id_by_endpoints(batch: &RecordBatch, src_id: u64, dst_id: u64) -> u64 {
+    let id_col = batch
+        .column_by_name("id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::UInt64Array>()
+        .unwrap();
+    let src_col = batch
+        .column_by_name("src")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::UInt64Array>()
+        .unwrap();
+    let dst_col = batch
+        .column_by_name("dst")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::UInt64Array>()
+        .unwrap();
+    (0..batch.num_rows())
+        .find(|&i| src_col.value(i) == src_id && dst_col.value(i) == dst_id)
+        .map(|i| id_col.value(i))
+        .unwrap()
+}
+
 fn person_age_by_name(batch: &RecordBatch, name: &str) -> Option<i32> {
     let name_col = batch
         .column(1)
@@ -401,6 +462,38 @@ fn write_data_file(dir: &TempDir, name: &str, data: &str) -> std::path::PathBuf 
     path
 }
 
+async fn manifest_file_for_table_version(
+    db_path: &std::path::Path,
+    table_id: &str,
+    version: u64,
+) -> std::path::PathBuf {
+    let namespace = open_directory_namespace(db_path).await.unwrap();
+    let location = resolve_table_location(namespace, table_id).await.unwrap();
+    let versions_dir =
+        std::path::PathBuf::from(location.strip_prefix("file://").unwrap_or(&location))
+            .join("_versions");
+    std::fs::read_dir(&versions_dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .find_map(|entry| {
+            let path = entry.path();
+            let file_name = path.file_name()?.to_str()?;
+            let scheme = lance_table::io::commit::ManifestNamingScheme::detect_scheme(file_name)?;
+            let parsed = scheme.parse_version(file_name).or_else(|| {
+                lance_table::io::commit::ManifestNamingScheme::parse_detached_version(file_name)
+            })?;
+            (parsed == version).then_some(path)
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "expected manifest file for {} version {} under {}",
+                table_id,
+                version,
+                versions_dir.display()
+            )
+        })
+}
+
 #[test]
 fn trim_surrounding_quotes_single_quote_does_not_panic() {
     assert_eq!(trim_surrounding_quotes("'"), "'");
@@ -425,6 +518,48 @@ fn dataset_rel_path_for(manifest: &GraphManifest, kind: &str, type_name: &str) -
         .unwrap()
 }
 
+fn graph_change_for_manifest(
+    manifest: &GraphManifest,
+    seq_in_tx: u32,
+    op: &str,
+    entity_kind: &str,
+    type_name: &str,
+    entity_key: &str,
+    payload: serde_json::Value,
+) -> GraphChangeRecord {
+    GraphChangeRecord {
+        tx_id: manifest.last_tx_id.clone().into(),
+        graph_version: manifest.db_version.into(),
+        seq_in_tx,
+        op: op.to_string(),
+        entity_kind: entity_kind.to_string(),
+        type_name: type_name.to_string(),
+        entity_key: entity_key.to_string(),
+        payload,
+        rowid_if_known: None,
+        committed_at: manifest.committed_at.clone(),
+    }
+}
+
+fn graph_commit_for_manifest(manifest: &GraphManifest, op_summary: &str) -> GraphCommitRecord {
+    GraphCommitRecord {
+        tx_id: manifest.last_tx_id.clone().into(),
+        graph_version: manifest.db_version.into(),
+        table_versions: manifest
+            .datasets
+            .iter()
+            .map(|entry| {
+                GraphTableVersion::new(
+                    entry.effective_table_id().to_string(),
+                    entry.dataset_version,
+                )
+            })
+            .collect(),
+        committed_at: manifest.committed_at.clone(),
+        op_summary: op_summary.to_string(),
+    }
+}
+
 async fn dataset_storage_version(dataset_path: &std::path::Path) -> LanceFileVersion {
     let uri = dataset_path.to_string_lossy().to_string();
     let dataset = Dataset::open(&uri).await.unwrap();
@@ -432,6 +567,146 @@ async fn dataset_storage_version(dataset_path: &std::path::Path) -> LanceFileVer
         .manifest
         .data_storage_format
         .lance_file_version()
+        .unwrap()
+}
+
+async fn rowid_for_entity(db_path: &std::path::Path, kind: &str, type_name: &str, id: u64) -> u64 {
+    let metadata = DatabaseMetadata::open(db_path).unwrap();
+    let locator = match kind {
+        "node" => metadata.node_dataset_locator(type_name).unwrap(),
+        "edge" => metadata.edge_dataset_locator(type_name).unwrap(),
+        other => panic!("unsupported kind {other}"),
+    };
+    let dataset = open_dataset_for_locator(&locator).await.unwrap();
+    let mut scanner = dataset.scan();
+    scanner.with_row_id();
+    scanner
+        .project(&[LANCE_INTERNAL_ID_FIELD, "_rowid"])
+        .unwrap();
+    scanner
+        .filter(&format!("{LANCE_INTERNAL_ID_FIELD} = {id}"))
+        .unwrap();
+    let batch = scanner.try_into_batch().await.unwrap();
+    let rowids = batch
+        .column_by_name("_rowid")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .unwrap();
+    rowids.value(0)
+}
+
+fn graph_change_records_batch(records: &[GraphChangeRecord]) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("tx_id", arrow_schema::DataType::Utf8, false),
+            Field::new("db_version", arrow_schema::DataType::UInt64, false),
+            Field::new("seq_in_tx", arrow_schema::DataType::UInt32, false),
+            Field::new("op", arrow_schema::DataType::Utf8, false),
+            Field::new("entity_kind", arrow_schema::DataType::Utf8, false),
+            Field::new("type_name", arrow_schema::DataType::Utf8, false),
+            Field::new("entity_key", arrow_schema::DataType::Utf8, false),
+            Field::new("payload_json", arrow_schema::DataType::Utf8, false),
+            Field::new("rowid_if_known", arrow_schema::DataType::UInt64, true),
+            Field::new("committed_at", arrow_schema::DataType::Utf8, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(
+                records
+                    .iter()
+                    .map(|record| record.tx_id.as_str().to_string())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                records
+                    .iter()
+                    .map(|record| record.graph_version.value())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt32Array::from(
+                records
+                    .iter()
+                    .map(|record| record.seq_in_tx)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                records
+                    .iter()
+                    .map(|record| record.op.clone())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                records
+                    .iter()
+                    .map(|record| record.entity_kind.clone())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                records
+                    .iter()
+                    .map(|record| record.type_name.clone())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                records
+                    .iter()
+                    .map(|record| record.entity_key.clone())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                records
+                    .iter()
+                    .map(|record| serde_json::to_string(&record.payload).unwrap())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(UInt64Array::from(
+                records
+                    .iter()
+                    .map(|record| record.rowid_if_known)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                records
+                    .iter()
+                    .map(|record| record.committed_at.clone())
+                    .collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap()
+}
+
+async fn overwrite_committed_graph_changes(
+    db_path: &std::path::Path,
+    records: &[GraphChangeRecord],
+) {
+    let namespace = open_directory_namespace(db_path).await.unwrap();
+    let version = write_namespace_batch(
+        namespace,
+        GRAPH_CHANGES_TABLE_ID,
+        graph_change_records_batch(records),
+        WriteMode::Overwrite,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let mut snapshot = read_committed_graph_snapshot(db_path).unwrap();
+    let entry = snapshot
+        .datasets
+        .iter_mut()
+        .find(|entry| entry.effective_table_id() == GRAPH_CHANGES_TABLE_ID)
+        .unwrap();
+    entry.dataset_version = version.version;
+    entry.row_count = records.len() as u64;
+    publish_committed_graph_snapshot(db_path, &snapshot).unwrap();
+}
+
+fn entity_id_from_key(entity_key: &str) -> u64 {
+    entity_key
+        .strip_prefix("id=")
+        .and_then(|value| value.split(',').next())
+        .and_then(|value| value.parse::<u64>().ok())
         .unwrap()
 }
 
@@ -461,13 +736,13 @@ async fn write_fixture_database_with_storage_version(
         .await
         .unwrap();
     let schema_ir = source_db.schema_ir.clone();
-    let source_manifest = GraphManifest::read(source_db.path()).unwrap();
+    let source_manifest = read_committed_graph_snapshot(source_db.path()).unwrap();
     let source_metadata = DatabaseMetadata::open(source_db.path()).unwrap();
 
     let fixture_db = Database::init(db_path, schema_source).await.unwrap();
     drop(fixture_db);
 
-    let mut manifest = GraphManifest::read(db_path).unwrap();
+    let mut manifest = read_committed_graph_snapshot(db_path).unwrap();
     manifest.committed_at = now_unix_seconds_string();
     manifest.last_tx_id = format!("fixture-{}", storage_version);
     manifest.next_node_id = source_manifest.next_node_id;
@@ -491,14 +766,15 @@ async fn write_fixture_database_with_storage_version(
             )
             .await
             .unwrap();
-            datasets.push(DatasetEntry {
-                type_id: node_def.type_id,
-                type_name: node_def.name.clone(),
-                kind: "node".to_string(),
-                dataset_path: dataset_rel_path,
+            datasets.push(DatasetEntry::new(
+                node_def.type_id,
+                node_def.name.clone(),
+                "node",
+                dataset_rel_path.clone(),
+                dataset_rel_path,
                 dataset_version,
                 row_count,
-            });
+            ));
         }
     }
 
@@ -519,19 +795,20 @@ async fn write_fixture_database_with_storage_version(
             )
             .await
             .unwrap();
-            datasets.push(DatasetEntry {
-                type_id: edge_def.type_id,
-                type_name: edge_def.name.clone(),
-                kind: "edge".to_string(),
-                dataset_path: dataset_rel_path,
+            datasets.push(DatasetEntry::new(
+                edge_def.type_id,
+                edge_def.name.clone(),
+                "edge",
+                dataset_rel_path.clone(),
+                dataset_rel_path,
                 dataset_version,
                 row_count,
-            });
+            ));
         }
     }
 
     manifest.datasets = datasets;
-    manifest.write_atomic(db_path).unwrap();
+    publish_committed_graph_snapshot(db_path, &manifest).unwrap();
 }
 
 #[tokio::test]
@@ -543,12 +820,437 @@ async fn test_init_creates_directory_structure() {
 
     assert!(path.join("schema.pg").exists());
     assert!(path.join("schema.ir.json").exists());
-    assert!(path.join("graph.manifest.json").exists());
+    assert!(!path.join("graph.manifest.json").exists());
     assert!(path.join("nodes").exists());
     assert!(path.join("edges").exists());
 
     assert_eq!(db.catalog.node_types.len(), 2);
     assert_eq!(db.catalog.edge_types.len(), 2);
+}
+
+#[tokio::test]
+async fn test_v4_init_bootstraps_internal_tables_without_wal() {
+    let dir = test_dir("v4_init_internal_tables");
+    let path = dir.path();
+
+    let _db = Database::init(path, test_schema_src()).await.unwrap();
+
+    assert!(storage_metadata_path(path).exists());
+    assert!(!path.join("_wal.jsonl").exists());
+
+    let manifest = read_committed_graph_snapshot(path).unwrap();
+    assert!(
+        manifest
+            .datasets
+            .iter()
+            .any(|entry| entry.effective_table_id() == "__graph_tx")
+    );
+    assert!(
+        manifest
+            .datasets
+            .iter()
+            .any(|entry| entry.effective_table_id() == "__graph_changes")
+    );
+    assert!(
+        manifest
+            .datasets
+            .iter()
+            .any(|entry| entry.effective_table_id() == "__blob_store")
+    );
+    assert!(graph_snapshot_table_present(path).await.unwrap());
+}
+
+#[tokio::test]
+async fn test_v4_unpublished_table_write_is_invisible_until_snapshot_publish() {
+    let dir = test_dir("v4_snapshot_visibility");
+    let path = dir.path();
+
+    let db = Database::init(path, test_schema_src()).await.unwrap();
+    db.load(test_data_src()).await.unwrap();
+
+    let metadata = DatabaseMetadata::open(path).unwrap();
+    let locator = metadata.node_dataset_locator("Person").unwrap();
+    let person_batches = crate::store::lance_io::read_lance_batches_for_locator(&locator)
+        .await
+        .unwrap();
+    let person_schema = person_batches[0].schema();
+    let extra_row = serde_json::json!({
+        "id": 999_u64,
+        "name": "Zoe",
+        "age": 29
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    let append_batch = json_rows_to_record_batch(person_schema.as_ref(), &[extra_row]).unwrap();
+
+    let table_store = V4NamespaceTableStore::new(path);
+    let unpublished_version = table_store
+        .append(&path.join(&locator.table_id), append_batch)
+        .await
+        .unwrap()
+        .version;
+
+    let snapshot_before_publish = read_committed_graph_snapshot(path).unwrap();
+    let person_entry_before_publish = snapshot_before_publish
+        .datasets
+        .iter()
+        .find(|entry| entry.kind == "node" && entry.type_name == "Person")
+        .unwrap();
+    assert!(unpublished_version > person_entry_before_publish.dataset_version);
+
+    let exported_before_publish = build_export_rows_at_path(path, false, true).await.unwrap();
+    assert!(
+        !exported_before_publish
+            .iter()
+            .any(|row| { row["type"] == "Person" && row["data"]["name"] == "Zoe" }),
+        "unpublished row should stay invisible until snapshot publish"
+    );
+
+    let mut next_snapshot = snapshot_before_publish.clone();
+    let person_entry = next_snapshot
+        .datasets
+        .iter_mut()
+        .find(|entry| entry.kind == "node" && entry.type_name == "Person")
+        .unwrap();
+    person_entry.dataset_version = unpublished_version;
+    person_entry.row_count += 1;
+    next_snapshot.db_version += 1;
+    next_snapshot.last_tx_id = format!("manual-snapshot-{}", next_snapshot.db_version);
+    next_snapshot.committed_at = now_unix_seconds_string();
+    publish_committed_graph_snapshot(path, &next_snapshot).unwrap();
+
+    let exported_after_publish = build_export_rows_at_path(path, false, true).await.unwrap();
+    assert!(
+        exported_after_publish
+            .iter()
+            .any(|row| { row["type"] == "Person" && row["data"]["name"] == "Zoe" })
+    );
+}
+
+#[tokio::test]
+async fn test_v4_cleanup_removes_orphan_unpublished_versions() {
+    let dir = test_dir("v4_cleanup_orphan_unpublished_versions");
+    let path = dir.path();
+
+    let db = Database::init(path, test_schema_src()).await.unwrap();
+    db.load(test_data_src()).await.unwrap();
+
+    let metadata = DatabaseMetadata::open(path).unwrap();
+    let locator = metadata.node_dataset_locator("Person").unwrap();
+    let person_batches = crate::store::lance_io::read_lance_batches_for_locator(&locator)
+        .await
+        .unwrap();
+    let person_schema = person_batches[0].schema();
+    let extra_row = serde_json::json!({
+        "id": 1_000_u64,
+        "name": "Orphaned",
+        "age": 31
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    let append_batch = json_rows_to_record_batch(person_schema.as_ref(), &[extra_row]).unwrap();
+
+    let table_store = V4NamespaceTableStore::new(path);
+    let unpublished_version = table_store
+        .append(&path.join(&locator.table_id), append_batch)
+        .await
+        .unwrap()
+        .version;
+    assert!(unpublished_version > locator.dataset_version);
+
+    let dataset_uri = locator.dataset_path.to_string_lossy().to_string();
+    let dataset_before = Dataset::open(&dataset_uri).await.unwrap();
+    let versions_before = dataset_before.versions().await.unwrap();
+    assert!(
+        versions_before
+            .iter()
+            .any(|version| version.version == unpublished_version)
+    );
+    let versions_dir = locator.dataset_path.join("_versions");
+    let unpublished_manifest_path = std::fs::read_dir(&versions_dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .find_map(|entry| {
+            let path = entry.path();
+            let file_name = path.file_name()?.to_str()?;
+            let scheme = lance_table::io::commit::ManifestNamingScheme::detect_scheme(file_name)?;
+            let version = scheme.parse_version(file_name).or_else(|| {
+                lance_table::io::commit::ManifestNamingScheme::parse_detached_version(file_name)
+            })?;
+            (version == unpublished_version).then_some(path)
+        })
+        .expect("expected unpublished manifest file");
+
+    let snapshot = read_committed_graph_snapshot(path).unwrap();
+    let removed = crate::store::namespace::cleanup_namespace_orphan_versions(path, &snapshot)
+        .await
+        .unwrap();
+    assert!(removed > 0);
+    assert!(!unpublished_manifest_path.exists());
+
+    drop(db);
+    let reopened = Database::open(path).await.unwrap();
+
+    let exported = build_export_rows_at_path(reopened.path(), false, true)
+        .await
+        .unwrap();
+    assert!(
+        !exported
+            .iter()
+            .any(|row| { row["type"] == "Person" && row["data"]["name"] == "Orphaned" })
+    );
+}
+
+#[tokio::test]
+async fn test_v4_open_uses_namespace_snapshot_without_manifest_file() {
+    let dir = test_dir("v4_namespace_snapshot_without_file");
+    let path = dir.path();
+
+    let db = Database::init(path, test_schema_src()).await.unwrap();
+    db.load(test_data_src()).await.unwrap();
+
+    assert!(!path.join("graph.manifest.json").exists());
+
+    let reopened = Database::open(path).await.unwrap();
+    let exported = build_export_rows_at_path(reopened.path(), false, true)
+        .await
+        .unwrap();
+
+    assert!(
+        exported
+            .iter()
+            .any(|row| { row["type"] == "Person" && row["data"]["name"] == "Alice" })
+    );
+    assert!(graph_snapshot_table_present(path).await.unwrap());
+}
+
+#[tokio::test]
+async fn test_v4_staged_internal_bundle_is_invisible_until_publish() {
+    let dir = test_dir("v4_internal_bundle_visibility");
+    let path = dir.path();
+
+    let db = Database::init(path, test_schema_src()).await.unwrap();
+    db.load(test_data_src()).await.unwrap();
+    drop(db);
+
+    let committed_before = read_committed_graph_snapshot(path).unwrap();
+    let tx_before = read_tx_catalog_entries(path).unwrap();
+    let cdc_before = read_visible_cdc_entries(path, 0, Some(committed_before.db_version)).unwrap();
+
+    let mut next_snapshot = committed_before.clone();
+    next_snapshot.db_version += 1;
+    next_snapshot.last_tx_id = format!("bundle-test-{}", next_snapshot.db_version);
+    next_snapshot.committed_at = now_unix_seconds_string();
+
+    let graph_change = graph_change_for_manifest(
+        &next_snapshot,
+        0,
+        "insert",
+        "node",
+        "Person",
+        "bundle:person",
+        serde_json::json!({"name": "Bundle Person", "age": 42}),
+    );
+    let graph_commit = graph_commit_for_manifest(&next_snapshot, "test:bundle-visibility");
+    let bundle = build_graph_update_bundle(
+        path,
+        &graph_commit,
+        std::slice::from_ref(&graph_change),
+        &next_snapshot,
+    )
+    .unwrap();
+
+    let committed_after_stage = read_committed_graph_snapshot(path).unwrap();
+    let tx_after_stage = read_tx_catalog_entries(path).unwrap();
+    let cdc_after_stage =
+        read_visible_cdc_entries(path, 0, Some(committed_after_stage.db_version)).unwrap();
+    let exported_before_publish = build_export_rows_at_path(path, false, true).await.unwrap();
+
+    assert_eq!(
+        committed_after_stage.db_version,
+        committed_before.db_version
+    );
+    assert_eq!(tx_after_stage.len(), tx_before.len());
+    assert_eq!(cdc_after_stage.len(), cdc_before.len());
+    assert!(
+        !exported_before_publish
+            .iter()
+            .any(|row| { row["type"] == "Person" && row["data"]["name"] == "Bundle Person" })
+    );
+
+    publish_graph_commit_bundle(path, &bundle).unwrap();
+
+    let committed_after_publish = read_committed_graph_snapshot(path).unwrap();
+    let tx_after_publish = read_tx_catalog_entries(path).unwrap();
+    let cdc_after_publish =
+        read_visible_cdc_entries(path, 0, Some(committed_after_publish.db_version)).unwrap();
+    let visible_commits = read_visible_graph_commit_records(path).unwrap();
+
+    assert_eq!(committed_after_publish.db_version, next_snapshot.db_version);
+    assert_eq!(tx_after_publish.len(), tx_before.len() + 1);
+    assert_eq!(cdc_after_publish.len(), cdc_before.len() + 1);
+    assert_eq!(
+        tx_after_publish.last().unwrap().db_version,
+        next_snapshot.db_version
+    );
+    assert_eq!(
+        cdc_after_publish.last().unwrap().entity_key,
+        "bundle:person"
+    );
+    assert_eq!(
+        visible_commits.last().unwrap().graph_version.value(),
+        next_snapshot.db_version
+    );
+}
+
+#[tokio::test]
+async fn test_v4_open_recovers_from_orphan_staged_internal_bundle_versions() {
+    let dir = test_dir("v4_open_recovers_orphan_internal_bundle");
+    let path = dir.path();
+
+    let db = Database::init(path, test_schema_src()).await.unwrap();
+    db.load(test_data_src()).await.unwrap();
+    drop(db);
+
+    let committed_before = read_committed_graph_snapshot(path).unwrap();
+    let tx_before = read_tx_catalog_entries(path).unwrap();
+    let cdc_before = read_visible_cdc_entries(path, 0, Some(committed_before.db_version)).unwrap();
+
+    let mut next_snapshot = committed_before.clone();
+    next_snapshot.db_version += 1;
+    next_snapshot.last_tx_id = format!("bundle-open-recover-{}", next_snapshot.db_version);
+    next_snapshot.committed_at = now_unix_seconds_string();
+
+    let graph_change = graph_change_for_manifest(
+        &next_snapshot,
+        0,
+        "update",
+        "node",
+        "Person",
+        "bundle:recover",
+        serde_json::json!({"name": "Recovered Bundle Person", "age": 43}),
+    );
+    let graph_commit = graph_commit_for_manifest(&next_snapshot, "test:bundle-open-recover");
+    let bundle = build_graph_update_bundle(
+        path,
+        &graph_commit,
+        std::slice::from_ref(&graph_change),
+        &next_snapshot,
+    )
+    .unwrap();
+
+    let staged_internal_versions = bundle
+        .published_versions
+        .iter()
+        .filter(|version| {
+            matches!(
+                version.table_id.as_str(),
+                GRAPH_TX_TABLE_ID | GRAPH_CHANGES_TABLE_ID | GRAPH_SNAPSHOT_TABLE_ID
+            )
+        })
+        .map(|version| (version.table_id.clone(), version.version))
+        .collect::<Vec<_>>();
+    let mut staged_internal_paths = Vec::new();
+    for (table_id, version) in staged_internal_versions {
+        staged_internal_paths.push(manifest_file_for_table_version(path, &table_id, version).await);
+    }
+    assert!(staged_internal_paths.iter().all(|path| path.exists()));
+
+    let reopened = Database::open(path).await.unwrap();
+    let committed_after = read_committed_graph_snapshot(path).unwrap();
+    let tx_after = read_tx_catalog_entries(path).unwrap();
+    let cdc_after = read_visible_cdc_entries(path, 0, Some(committed_after.db_version)).unwrap();
+    let exported = build_export_rows_at_path(reopened.path(), false, true)
+        .await
+        .unwrap();
+
+    assert_eq!(committed_after.db_version, committed_before.db_version);
+    assert_eq!(tx_after.len(), tx_before.len());
+    assert_eq!(cdc_after.len(), cdc_before.len());
+    assert!(staged_internal_paths.iter().all(|path| !path.exists()));
+    assert!(!exported.iter().any(|row| {
+        row["type"] == "Person" && row["data"]["name"] == "Recovered Bundle Person"
+    }));
+}
+
+#[tokio::test]
+async fn test_v4_cleanup_removes_orphan_staged_internal_bundle_versions() {
+    let dir = test_dir("v4_cleanup_internal_bundle_orphans");
+    let path = dir.path();
+
+    let db = Database::init(path, test_schema_src()).await.unwrap();
+    db.load(test_data_src()).await.unwrap();
+    drop(db);
+
+    let committed_before = read_committed_graph_snapshot(path).unwrap();
+    let tx_before = read_tx_catalog_entries(path).unwrap();
+    let cdc_before = read_visible_cdc_entries(path, 0, Some(committed_before.db_version)).unwrap();
+
+    let mut next_snapshot = committed_before.clone();
+    next_snapshot.db_version += 1;
+    next_snapshot.last_tx_id = format!("bundle-orphan-{}", next_snapshot.db_version);
+    next_snapshot.committed_at = now_unix_seconds_string();
+
+    let graph_change = graph_change_for_manifest(
+        &next_snapshot,
+        0,
+        "delete",
+        "edge",
+        "Knows",
+        "bundle:orphan",
+        serde_json::json!({"from": "Alice", "to": "Bob"}),
+    );
+    let graph_commit = graph_commit_for_manifest(&next_snapshot, "test:bundle-cleanup");
+    let bundle = build_graph_update_bundle(
+        path,
+        &graph_commit,
+        std::slice::from_ref(&graph_change),
+        &next_snapshot,
+    )
+    .unwrap();
+
+    let staged_internal_versions = bundle
+        .published_versions
+        .iter()
+        .filter(|version| {
+            matches!(
+                version.table_id.as_str(),
+                GRAPH_TX_TABLE_ID | GRAPH_CHANGES_TABLE_ID | GRAPH_SNAPSHOT_TABLE_ID
+            )
+        })
+        .map(|version| (version.table_id.clone(), version.version))
+        .collect::<Vec<_>>();
+    assert_eq!(staged_internal_versions.len(), 3);
+    let mut staged_internal_paths = Vec::new();
+    for (table_id, version) in staged_internal_versions {
+        staged_internal_paths.push(manifest_file_for_table_version(path, &table_id, version).await);
+    }
+    assert!(staged_internal_paths.iter().all(|path| path.exists()));
+
+    let removed = cleanup_namespace_orphan_versions(path, &committed_before)
+        .await
+        .unwrap();
+    assert!(removed >= 3);
+    assert!(staged_internal_paths.iter().all(|path| !path.exists()));
+
+    let reopened = Database::open(path).await.unwrap();
+    let committed_after = read_committed_graph_snapshot(path).unwrap();
+    let tx_after = read_tx_catalog_entries(path).unwrap();
+    let cdc_after = read_visible_cdc_entries(path, 0, Some(committed_after.db_version)).unwrap();
+    let exported = build_export_rows_at_path(reopened.path(), false, true)
+        .await
+        .unwrap();
+
+    assert_eq!(committed_after.db_version, committed_before.db_version);
+    assert_eq!(tx_after.len(), tx_before.len());
+    assert_eq!(cdc_after.len(), cdc_before.len());
+    assert!(
+        !exported
+            .iter()
+            .any(|row| { row["type"] == "Person" && row["data"]["name"] == "Bundle Person" })
+    );
 }
 
 #[tokio::test]
@@ -559,7 +1261,7 @@ async fn test_new_datasets_use_lance_v2_2_storage_format() {
     let db = Database::init(path, test_schema_src()).await.unwrap();
     db.load(test_data_src()).await.unwrap();
 
-    let manifest = GraphManifest::read(path).unwrap();
+    let manifest = read_committed_graph_snapshot(path).unwrap();
     for entry in &manifest.datasets {
         let dataset_path = path.join(&entry.dataset_path);
         assert_eq!(
@@ -585,7 +1287,7 @@ async fn test_lance_v2_0_datasets_remain_operational_in_v0_11_0() {
     )
     .await;
 
-    let manifest_before = GraphManifest::read(path).unwrap();
+    let manifest_before = read_committed_graph_snapshot(path).unwrap();
     for entry in &manifest_before.datasets {
         let dataset_path = path.join(&entry.dataset_path);
         assert_eq!(
@@ -621,7 +1323,7 @@ async fn test_lance_v2_0_datasets_remain_operational_in_v0_11_0() {
     .await
     .unwrap();
 
-    let manifest_after = GraphManifest::read(path).unwrap();
+    let manifest_after = read_committed_graph_snapshot(path).unwrap();
     for entry in &manifest_after.datasets {
         let dataset_path = path.join(&entry.dataset_path);
         assert_eq!(
@@ -1182,7 +1884,7 @@ async fn test_load_append_rewrites_only_changed_node_dataset_version() {
     db.load_with_mode(test_data_src(), LoadMode::Overwrite)
         .await
         .unwrap();
-    let manifest_before = GraphManifest::read(path).unwrap();
+    let manifest_before = read_committed_graph_snapshot(path).unwrap();
     let person_version_before = dataset_version_for(&manifest_before, "node", "Person");
     let company_version_before = dataset_version_for(&manifest_before, "node", "Company");
     let knows_version_before = dataset_version_for(&manifest_before, "edge", "Knows");
@@ -1198,7 +1900,7 @@ async fn test_load_append_rewrites_only_changed_node_dataset_version() {
     .await
     .unwrap();
 
-    let manifest_after = GraphManifest::read(path).unwrap();
+    let manifest_after = read_committed_graph_snapshot(path).unwrap();
     assert_eq!(
         dataset_rel_path_for(&manifest_after, "node", "Person"),
         person_path_before
@@ -1238,7 +1940,7 @@ async fn test_load_append_rewrites_only_changed_edge_dataset_version() {
     db.load_with_mode(test_data_src(), LoadMode::Overwrite)
         .await
         .unwrap();
-    let manifest_before = GraphManifest::read(path).unwrap();
+    let manifest_before = read_committed_graph_snapshot(path).unwrap();
     let person_version_before = dataset_version_for(&manifest_before, "node", "Person");
     let knows_version_before = dataset_version_for(&manifest_before, "edge", "Knows");
     let works_at_version_before = dataset_version_for(&manifest_before, "edge", "WorksAt");
@@ -1251,7 +1953,7 @@ async fn test_load_append_rewrites_only_changed_edge_dataset_version() {
     .await
     .unwrap();
 
-    let manifest_after = GraphManifest::read(path).unwrap();
+    let manifest_after = read_committed_graph_snapshot(path).unwrap();
     assert_eq!(
         dataset_rel_path_for(&manifest_after, "edge", "Knows"),
         knows_path_before
@@ -1279,7 +1981,7 @@ async fn test_load_merge_rewrites_only_changed_dataset_versions() {
     db.load_with_mode(keyed_data_initial(), LoadMode::Overwrite)
         .await
         .unwrap();
-    let manifest_before = GraphManifest::read(path).unwrap();
+    let manifest_before = read_committed_graph_snapshot(path).unwrap();
     let person_version_before = dataset_version_for(&manifest_before, "node", "Person");
     let company_version_before = dataset_version_for(&manifest_before, "node", "Company");
     let knows_version_before = dataset_version_for(&manifest_before, "edge", "Knows");
@@ -1290,7 +1992,7 @@ async fn test_load_merge_rewrites_only_changed_dataset_versions() {
         .await
         .unwrap();
 
-    let manifest_after = GraphManifest::read(path).unwrap();
+    let manifest_after = read_committed_graph_snapshot(path).unwrap();
     assert_eq!(
         dataset_rel_path_for(&manifest_after, "node", "Person"),
         person_path_before
@@ -1328,7 +2030,7 @@ async fn test_native_append_preserves_reserved_physical_names_on_disk() {
     .await
     .unwrap();
 
-    let manifest_before = GraphManifest::read(path).unwrap();
+    let manifest_before = read_committed_graph_snapshot(path).unwrap();
     let dataset_rel_path = dataset_rel_path_for(&manifest_before, "node", "Doc");
     let dataset_path = path.join(&dataset_rel_path);
     let uri = dataset_path.to_string_lossy().to_string();
@@ -1345,7 +2047,7 @@ async fn test_native_append_preserves_reserved_physical_names_on_disk() {
         .await
         .unwrap();
 
-    let manifest_after = GraphManifest::read(path).unwrap();
+    let manifest_after = read_committed_graph_snapshot(path).unwrap();
     let dataset_rel_path_after = dataset_rel_path_for(&manifest_after, "node", "Doc");
     assert_eq!(dataset_rel_path_after, dataset_rel_path);
     let reopened = Dataset::open(&uri).await.unwrap();
@@ -1373,7 +2075,7 @@ async fn test_native_merge_preserves_reserved_physical_names_on_disk() {
     .await
     .unwrap();
 
-    let manifest_before = GraphManifest::read(path).unwrap();
+    let manifest_before = read_committed_graph_snapshot(path).unwrap();
     let dataset_rel_path = dataset_rel_path_for(&manifest_before, "node", "Doc");
     let dataset_path = path.join(&dataset_rel_path);
     let uri = dataset_path.to_string_lossy().to_string();
@@ -1390,7 +2092,7 @@ async fn test_native_merge_preserves_reserved_physical_names_on_disk() {
         .await
         .unwrap();
 
-    let manifest_after = GraphManifest::read(path).unwrap();
+    let manifest_after = read_committed_graph_snapshot(path).unwrap();
     let dataset_rel_path_after = dataset_rel_path_for(&manifest_after, "node", "Doc");
     assert_eq!(dataset_rel_path_after, dataset_rel_path);
     let reopened = Dataset::open(&uri).await.unwrap();
@@ -1462,7 +2164,7 @@ async fn test_delete_nodes_uses_lance_native_delete_path() {
     db.load_with_mode(keyed_data_initial(), LoadMode::Overwrite)
         .await
         .unwrap();
-    let manifest_before = GraphManifest::read(path).unwrap();
+    let manifest_before = read_committed_graph_snapshot(path).unwrap();
     let person_path_before = dataset_rel_path_for(&manifest_before, "node", "Person");
     let company_version_before = dataset_version_for(&manifest_before, "node", "Company");
 
@@ -1477,7 +2179,7 @@ async fn test_delete_nodes_uses_lance_native_delete_path() {
     .await
     .unwrap();
 
-    let manifest_after = GraphManifest::read(path).unwrap();
+    let manifest_after = read_committed_graph_snapshot(path).unwrap();
     let person_path_after = dataset_rel_path_for(&manifest_after, "node", "Person");
     assert_eq!(person_path_before, person_path_after);
     assert_eq!(
@@ -1518,7 +2220,7 @@ async fn test_compact_advances_dataset_versions_and_commits_manifest() {
     .await
     .unwrap();
 
-    let manifest_before = GraphManifest::read(path).unwrap();
+    let manifest_before = read_committed_graph_snapshot(path).unwrap();
     let result = db
         .compact(CompactOptions {
             target_rows_per_fragment: 1_024,
@@ -1529,7 +2231,7 @@ async fn test_compact_advances_dataset_versions_and_commits_manifest() {
         .unwrap();
 
     assert!(result.datasets_considered >= 1);
-    let manifest_after = GraphManifest::read(path).unwrap();
+    let manifest_after = read_committed_graph_snapshot(path).unwrap();
     let version_advanced = manifest_after.datasets.iter().any(|entry| {
         manifest_before
             .datasets
@@ -1568,7 +2270,7 @@ async fn test_cleanup_prunes_old_dataset_versions_but_keeps_manifest_visible_sta
     .unwrap();
     db.compact(CompactOptions::default()).await.unwrap();
 
-    let manifest_before = GraphManifest::read(path).unwrap();
+    let manifest_before = read_committed_graph_snapshot(path).unwrap();
     let result = db
         .cleanup(CleanupOptions {
             retain_tx_versions: 1,
@@ -1578,7 +2280,7 @@ async fn test_cleanup_prunes_old_dataset_versions_but_keeps_manifest_visible_sta
         .unwrap();
     assert!(result.tx_rows_kept > 0);
 
-    let manifest_after = GraphManifest::read(path).unwrap();
+    let manifest_after = read_committed_graph_snapshot(path).unwrap();
     assert_eq!(manifest_after.db_version, manifest_before.db_version);
 
     let reopened = Database::open(path).await.unwrap();
@@ -1601,6 +2303,11 @@ async fn test_doctor_reports_healthy_database() {
         report.issues
     );
     assert!(report.issues.is_empty());
+    assert!(
+        report.warnings.is_empty(),
+        "expected no warnings for healthy v4 database: {:?}",
+        report.warnings
+    );
     assert!(report.datasets_checked >= 1);
     assert_eq!(report.datasets.len(), report.datasets_checked);
     assert!(
@@ -1609,6 +2316,53 @@ async fn test_doctor_reports_healthy_database() {
             .iter()
             .all(|dataset| dataset.storage_version == "2.2"),
         "expected doctor to report Lance 2.2 storage versions for new datasets"
+    );
+    let lineage_shadow = report
+        .lineage_shadow
+        .as_ref()
+        .expect("expected v4 doctor report to include lineage shadow details");
+    assert!(lineage_shadow.windows_considered >= 1);
+    assert!(lineage_shadow.windows_verified >= 1);
+    assert_eq!(lineage_shadow.windows_mismatched, 0);
+}
+
+#[tokio::test]
+async fn test_v4_doctor_reports_graph_change_rowid_mismatches() {
+    let dir = test_dir("doctor_v4_rowid_mismatch");
+    let path = dir.path();
+
+    let db = Database::init(path, test_schema_src()).await.unwrap();
+    db.load(test_data_src()).await.unwrap();
+    drop(db);
+
+    let mut changes = read_visible_graph_change_records(path, 0, None).unwrap();
+    let alice_entity_key = {
+        let alice_insert = changes
+            .iter_mut()
+            .find(|row| {
+                row.op == "insert"
+                    && row.entity_kind == "node"
+                    && row.type_name == "Person"
+                    && row.payload.get("name").and_then(|value| value.as_str()) == Some("Alice")
+            })
+            .unwrap();
+        alice_insert.rowid_if_known = Some(alice_insert.rowid_if_known.unwrap() + 1);
+        alice_insert.entity_key.clone()
+    };
+
+    overwrite_committed_graph_changes(path, &changes).await;
+
+    let reopened = Database::open(path).await.unwrap();
+    let report = reopened.doctor().await.unwrap();
+    assert!(!report.healthy);
+    assert!(
+        report.issues.iter().any(|issue| {
+            issue.contains("recorded rowid")
+                && issue.contains("Person")
+                && issue.contains(&alice_entity_key)
+        }),
+        "expected doctor to report rowid mismatch, got {:?}",
+        report.issues
     );
 }
 
@@ -1793,6 +2547,220 @@ async fn test_migration_rebuilds_scalar_indexes_for_indexed_properties() {
 }
 
 #[tokio::test]
+async fn test_v4_schema_migration_preserves_internal_tables() {
+    let dir = test_dir("v4_schema_migration_internal_tables");
+    let path = dir.path();
+
+    let db = Database::init(path, indexed_schema_src()).await.unwrap();
+    db.load(indexed_data_src()).await.unwrap();
+    drop(db);
+
+    std::fs::write(
+        path.join("schema.pg"),
+        r#"node Person {
+    name: String @key
+    handle: String @index
+    age: I32?
+    city: String?
+}
+"#,
+    )
+    .unwrap();
+    let result = execute_schema_migration(path, None, false, true)
+        .await
+        .unwrap();
+    assert_eq!(result.status, MigrationStatus::Applied);
+
+    let manifest = read_committed_graph_snapshot(path).unwrap();
+    for table_id in [GRAPH_TX_TABLE_ID, GRAPH_CHANGES_TABLE_ID, "__blob_store"] {
+        assert!(
+            manifest
+                .datasets
+                .iter()
+                .any(|entry| entry.effective_table_id() == table_id),
+            "expected {} in committed v4 snapshot after schema migration",
+            table_id
+        );
+    }
+
+    let reopened = Database::open(path).await.unwrap();
+    drop(reopened);
+
+    let tx_rows = read_tx_catalog_entries(path).unwrap();
+    assert_eq!(tx_rows.last().unwrap().op_summary, "schema_migration");
+}
+
+#[tokio::test]
+async fn test_v4_graph_changes_capture_stable_row_ids_for_live_rows() {
+    let dir = test_dir("v4_graph_changes_rowids");
+    let path = dir.path();
+
+    let db = Database::init(path, test_schema_src()).await.unwrap();
+    db.load(test_data_src()).await.unwrap();
+
+    let manifest_after_insert = read_committed_graph_snapshot(path).unwrap();
+    let insert_rows =
+        read_visible_graph_change_records(path, 0, Some(manifest_after_insert.db_version)).unwrap();
+    let alice_insert = insert_rows
+        .iter()
+        .find(|row| {
+            row.op == "insert"
+                && row.entity_kind == "node"
+                && row.type_name == "Person"
+                && row.payload.get("name").and_then(|value| value.as_str()) == Some("Alice")
+        })
+        .unwrap();
+    let alice_entity_id = entity_id_from_key(&alice_insert.entity_key);
+    let alice_rowid_before = rowid_for_entity(path, "node", "Person", alice_entity_id).await;
+    assert_eq!(alice_insert.rowid_if_known, Some(alice_rowid_before));
+
+    db.load_with_mode(
+        r#"{"type":"Person","data":{"name":"Alice","age":31}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+
+    let manifest_after_update = read_committed_graph_snapshot(path).unwrap();
+    let alice_rowid_after = rowid_for_entity(path, "node", "Person", alice_entity_id).await;
+    let update_rows = read_visible_graph_change_records(
+        path,
+        manifest_after_insert.db_version,
+        Some(manifest_after_update.db_version),
+    )
+    .unwrap();
+    let alice_update = update_rows
+        .iter()
+        .find(|row| {
+            row.op == "update"
+                && row.entity_kind == "node"
+                && row.type_name == "Person"
+                && row
+                    .payload
+                    .get("after")
+                    .and_then(|value| value.get("name"))
+                    .and_then(|value| value.as_str())
+                    == Some("Alice")
+        })
+        .unwrap();
+
+    assert_eq!(alice_rowid_after, alice_rowid_before);
+    assert_eq!(alice_update.rowid_if_known, Some(alice_rowid_before));
+    assert_lineage_shadow_cdc_matches_authoritative(
+        path,
+        0,
+        Some(manifest_after_update.db_version),
+    );
+    let report = db.doctor().await.unwrap();
+    assert!(
+        report.healthy,
+        "expected healthy report after insert/update lineage flow: {report:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_v4_doctor_reports_lineage_shadow_mismatches() {
+    let dir = test_dir("doctor_v4_lineage_shadow_mismatch");
+    let path = dir.path();
+
+    let db = Database::init(path, test_schema_src()).await.unwrap();
+    db.load(test_data_src()).await.unwrap();
+    db.load_with_mode(
+        r#"{"type":"Person","data":{"name":"Alice","age":31}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    drop(db);
+
+    let mut changes = read_visible_graph_change_records(path, 0, None).unwrap();
+    let alice_update = changes
+        .iter_mut()
+        .find(|row| {
+            row.op == "update"
+                && row.entity_kind == "node"
+                && row.type_name == "Person"
+                && row
+                    .payload
+                    .get("after")
+                    .and_then(|value| value.get("name"))
+                    .and_then(|value| value.as_str())
+                    == Some("Alice")
+        })
+        .unwrap();
+    alice_update.op = "insert".to_string();
+
+    overwrite_committed_graph_changes(path, &changes).await;
+
+    let reopened = Database::open(path).await.unwrap();
+    let report = reopened.doctor().await.unwrap();
+    assert!(!report.healthy);
+    assert!(
+        report
+            .issues
+            .iter()
+            .any(|issue| issue.contains("lineage shadow mismatch") && issue.contains("Person")),
+        "expected lineage shadow mismatch in doctor report, got {:?}",
+        report.issues
+    );
+    assert!(
+        report
+            .issues
+            .iter()
+            .any(|issue| issue.contains("lineage shadow CDC mismatch")),
+        "expected doctor to report CDC shadow mismatch, got {:?}",
+        report.issues
+    );
+    let err = read_visible_cdc_entries_with_source(path, 0, None, VisibleCdcSource::LineageShadow)
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("lineage shadow CDC diverged from authoritative CDC"),
+        "expected strict lineage shadow reader mismatch error, got {err}"
+    );
+    let lineage_shadow = report
+        .lineage_shadow
+        .as_ref()
+        .expect("expected v4 doctor report to include lineage shadow details");
+    assert!(lineage_shadow.windows_mismatched >= 1);
+    assert!(
+        lineage_shadow.windows.iter().any(|window| {
+            window.type_name == "Person" && window.status.starts_with("mismatch")
+        })
+    );
+}
+
+#[tokio::test]
+async fn test_v4_lineage_shadow_cdc_source_errors_when_rowids_are_missing() {
+    let dir = test_dir("v4_lineage_shadow_missing_rowids");
+    let path = dir.path();
+
+    let db = Database::init(path, test_schema_src()).await.unwrap();
+    db.load(test_data_src()).await.unwrap();
+    drop(db);
+
+    let mut changes = read_visible_graph_change_records(path, 0, None).unwrap();
+    let alice_insert = changes
+        .iter_mut()
+        .find(|row| {
+            row.op == "insert"
+                && row.entity_kind == "node"
+                && row.type_name == "Person"
+                && row.payload.get("name").and_then(|value| value.as_str()) == Some("Alice")
+        })
+        .unwrap();
+    alice_insert.rowid_if_known = None;
+    overwrite_committed_graph_changes(path, &changes).await;
+
+    let err = read_visible_cdc_entries_with_source(path, 0, None, VisibleCdcSource::LineageShadow)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("lineage shadow CDC is incomplete"),
+        "expected strict lineage shadow reader incompleteness error, got {err}"
+    );
+}
+
+#[tokio::test]
 async fn test_migration_rebuilds_vector_indexes_for_indexed_vector_properties() {
     let dir = test_dir("migration_vector_indexed_props");
     let path = dir.path();
@@ -1841,6 +2809,9 @@ async fn test_delete_nodes_cascades_edges() {
 
     let db = Database::init(path, test_schema_src()).await.unwrap();
     db.load(test_data_src()).await.unwrap();
+    let persons_before = read_node_batch_for_db(&db, "Person").await.unwrap();
+    let alice_id = person_id_by_name(&persons_before, "Alice");
+    let alice_rowid_before = rowid_for_entity(path, "node", "Person", alice_id).await;
 
     let result = db
         .delete_nodes(
@@ -1888,6 +2859,26 @@ async fn test_delete_nodes_cascades_edges() {
             .iter()
             .any(|e| { e.op == "delete" && e.entity_kind == "edge" })
     );
+    let delete_rows = read_visible_graph_change_records(path, 1, Some(2)).unwrap();
+    let alice_delete = delete_rows
+        .iter()
+        .find(|row| {
+            row.op == "delete"
+                && row.entity_kind == "node"
+                && row.type_name == "Person"
+                && row.entity_key == format!("id={alice_id}")
+        })
+        .unwrap();
+    assert_eq!(alice_delete.rowid_if_known, Some(alice_rowid_before));
+    assert!(
+        delete_rows
+            .iter()
+            .filter(|row| row.op == "delete")
+            .all(|row| row.rowid_if_known.is_some()),
+        "expected all delete rows to carry row ids: {:?}",
+        delete_rows
+    );
+    assert_lineage_shadow_cdc_matches_authoritative(path, 1, Some(2));
 
     drop(db);
     let reopened = Database::open(path).await.unwrap();
@@ -1895,6 +2886,11 @@ async fn test_delete_nodes_cascades_edges() {
     assert_eq!(persons2.num_rows(), 2);
     assert!(read_edge_batch_for_db(&reopened, "Knows").await.is_none());
     assert!(read_edge_batch_for_db(&reopened, "WorksAt").await.is_none());
+    let report = reopened.doctor().await.unwrap();
+    assert!(
+        report.healthy,
+        "expected healthy report after delete cascade: {report:?}"
+    );
 }
 
 #[tokio::test]
@@ -1951,12 +2947,16 @@ async fn test_delete_edges_uses_lance_native_delete_path() {
 
     let db = Database::init(path, test_schema_src()).await.unwrap();
     db.load(test_data_src()).await.unwrap();
-    let manifest_before = GraphManifest::read(path).unwrap();
+    let manifest_before = read_committed_graph_snapshot(path).unwrap();
     let knows_path_before = dataset_rel_path_for(&manifest_before, "edge", "Knows");
     let works_at_version_before = dataset_version_for(&manifest_before, "edge", "WorksAt");
 
     let persons = read_node_batch_for_db(&db, "Person").await.unwrap();
+    let alice_id = person_id_by_name(&persons, "Alice");
     let bob_id = person_id_by_name(&persons, "Bob");
+    let knows_before = read_edge_batch_for_db(&db, "Knows").await.unwrap();
+    let alice_bob_edge_id = edge_id_by_endpoints(&knows_before, alice_id, bob_id);
+    let alice_bob_rowid_before = rowid_for_entity(path, "edge", "Knows", alice_bob_edge_id).await;
     let result = db
         .delete_edges(
             "Knows",
@@ -1970,7 +2970,7 @@ async fn test_delete_edges_uses_lance_native_delete_path() {
         .unwrap();
     assert_eq!(result.deleted_edges, 1);
 
-    let manifest_after = GraphManifest::read(path).unwrap();
+    let manifest_after = read_committed_graph_snapshot(path).unwrap();
     let knows_path_after = dataset_rel_path_for(&manifest_after, "edge", "Knows");
     assert_eq!(knows_path_before, knows_path_after);
     assert_eq!(
@@ -1983,6 +2983,20 @@ async fn test_delete_edges_uses_lance_native_delete_path() {
     assert!(
         dataset.count_deleted_rows().await.unwrap() > 0,
         "expected native delete tombstones in Knows dataset"
+    );
+    let delete_rows = read_visible_graph_change_records(path, 1, Some(2)).unwrap();
+    let deleted_edge_rows = delete_rows
+        .iter()
+        .filter(|row| row.op == "delete" && row.entity_kind == "edge" && row.type_name == "Knows")
+        .collect::<Vec<_>>();
+    assert_eq!(deleted_edge_rows.len(), 1);
+    let deleted_edge = deleted_edge_rows[0];
+    assert_eq!(deleted_edge.rowid_if_known, Some(alice_bob_rowid_before));
+    assert_lineage_shadow_cdc_matches_authoritative(path, 1, Some(2));
+    let report = db.doctor().await.unwrap();
+    assert!(
+        report.healthy,
+        "expected healthy report after edge delete: {report:?}"
     );
 }
 
@@ -2531,7 +3545,7 @@ async fn test_cdc_analytics_materialization_writes_dataset_and_preserves_changes
     db.load(test_data_src()).await.unwrap();
 
     let visible_before = read_visible_cdc_entries(path, 0, None).unwrap();
-    let manifest_before = GraphManifest::read(path).unwrap();
+    let manifest_before = read_committed_graph_snapshot(path).unwrap();
 
     let result = db
         .materialize_cdc_analytics(CdcAnalyticsMaterializeOptions {
@@ -2553,7 +3567,7 @@ async fn test_cdc_analytics_materialization_writes_dataset_and_preserves_changes
 
     let visible_after = read_visible_cdc_entries(path, 0, None).unwrap();
     assert_eq!(visible_before, visible_after);
-    let manifest_after = GraphManifest::read(path).unwrap();
+    let manifest_after = read_committed_graph_snapshot(path).unwrap();
     assert_eq!(manifest_after.db_version, manifest_before.db_version);
 }
 

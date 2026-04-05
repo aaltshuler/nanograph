@@ -263,19 +263,11 @@ impl ExecutionPlan for ExpandExec {
 
 impl ExpandExec {
     async fn resolve_edge_indices(&self) -> DFResult<Arc<EdgeIndexPair>> {
-        if let (Some(dataset_path), Some(dataset_version)) = (
-            self.runtime.edge_dataset_path(&self.edge_type),
-            self.runtime.edge_dataset_version(&self.edge_type),
-        ) {
+        if let Some(locator) = self.runtime.edge_dataset_locator(&self.edge_type) {
             return self
                 .runtime
                 .edge_index_cache()
-                .get_or_build(
-                    &self.edge_type,
-                    dataset_path,
-                    dataset_version,
-                    self.runtime.next_node_id(),
-                )
+                .get_or_build(&self.edge_type, locator, self.runtime.next_node_id())
                 .await
                 .map_err(|e| datafusion_common::DataFusionError::Execution(e.to_string()));
         }

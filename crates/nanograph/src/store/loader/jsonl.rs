@@ -1310,10 +1310,10 @@ mod tests {
 
     use serde_json::json;
     use tempfile::TempDir;
-    use url::Url;
 
     use crate::catalog::schema_ir::{build_catalog_from_ir, build_schema_ir};
     use crate::schema::parser::parse_schema;
+    use crate::store::blob_store::{blob_store_dataset_path, parse_managed_blob_id};
 
     use super::*;
 
@@ -1697,17 +1697,8 @@ edge WorksWith: Person -> Person {
             .downcast_ref::<StringArray>()
             .unwrap();
         assert_eq!(mime_col.value(0), "image/png");
-        let parsed = Url::parse(uri_col.value(0)).unwrap();
-        assert_eq!(parsed.scheme(), "file");
-        let imported_path = parsed.to_file_path().unwrap();
-        assert!(imported_path.exists());
-        let media_root = temp.path().join("media").canonicalize().unwrap();
-        assert!(
-            imported_path
-                .strip_prefix(&media_root)
-                .unwrap()
-                .starts_with("photo")
-        );
+        assert!(parse_managed_blob_id(uri_col.value(0)).is_some());
+        assert!(blob_store_dataset_path(&db_path).exists());
     }
 
     #[test]
@@ -1738,6 +1729,12 @@ edge WorksWith: Person -> Person {
             .downcast_ref::<StringArray>()
             .unwrap();
         assert_eq!(mime_col.value(0), "image/png");
+        let uri_col = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(parse_managed_blob_id(uri_col.value(0)).is_some());
     }
 
     #[test]

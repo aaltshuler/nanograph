@@ -380,6 +380,30 @@ impl JsDatabase {
     pub async fn doctor(&self) -> Result<serde_json::Value> {
         let db = self.db().await?;
         let report = db.doctor().await.map_err(to_napi_err)?;
+        let lineage_shadow = report.lineage_shadow.map(|shadow| {
+            serde_json::json!({
+                "windowsConsidered": shadow.windows_considered,
+                "windowsVerified": shadow.windows_verified,
+                "windowsSkipped": shadow.windows_skipped,
+                "windowsMismatched": shadow.windows_mismatched,
+                "missingRowidWindows": shadow.missing_rowid_windows,
+                "windows": shadow.windows.into_iter().map(|window| {
+                    serde_json::json!({
+                        "kind": window.kind,
+                        "typeName": window.type_name,
+                        "graphVersion": window.graph_version,
+                        "previousTableVersion": window.previous_table_version,
+                        "currentTableVersion": window.current_table_version,
+                        "expectedInserts": window.expected_inserts,
+                        "expectedUpdates": window.expected_updates,
+                        "actualInserts": window.actual_inserts,
+                        "actualUpdates": window.actual_updates,
+                        "status": window.status,
+                        "detail": window.detail,
+                    })
+                }).collect::<Vec<_>>(),
+            })
+        });
         Ok(serde_json::json!({
             "healthy": report.healthy,
             "issues": report.issues,
@@ -388,6 +412,7 @@ impl JsDatabase {
             "datasetsChecked": report.datasets_checked,
             "txRows": report.tx_rows,
             "cdcRows": report.cdc_rows,
+            "lineageShadow": lineage_shadow,
         }))
     }
 

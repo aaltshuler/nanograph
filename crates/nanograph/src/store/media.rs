@@ -2,12 +2,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
-use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::error::{NanoError, Result};
-
-const MEDIA_ROOT_ENV: &str = "NANOGRAPH_MEDIA_ROOT";
+use crate::store::blob_store::store_managed_blob_blocking;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedMediaValue {
@@ -39,7 +37,12 @@ pub(crate) fn resolve_media_value(
             detect_mime_from_bytes(&bytes),
             source_path.extension().and_then(|ext| ext.to_str()),
         )?;
-        let uri = import_media_bytes(db_path, type_name, &bytes, &mime_type)?;
+        let uri = store_managed_blob_blocking(
+            db_path,
+            &bytes,
+            &mime_type,
+            Some(&source_path.to_string_lossy()),
+        )?;
         return Ok(ResolvedMediaValue { uri, mime_type });
     }
 
@@ -53,7 +56,12 @@ pub(crate) fn resolve_media_value(
                 ))
             })?;
         let mime_type = choose_mime_type(mime_hint, detect_mime_from_bytes(&bytes), None)?;
-        let uri = import_media_bytes(db_path, type_name, &bytes, &mime_type)?;
+        let uri = store_managed_blob_blocking(
+            db_path,
+            &bytes,
+            &mime_type,
+            Some(&format!("inline-base64:{}:{}", type_name, prop_name)),
+        )?;
         return Ok(ResolvedMediaValue { uri, mime_type });
     }
 
@@ -130,63 +138,6 @@ fn resolve_external_uri_mime(uri: &str, mime_hint: Option<&str>) -> Result<Strin
     ))
 }
 
-fn configured_media_root(db_path: &Path) -> PathBuf {
-    if let Ok(root) = std::env::var(MEDIA_ROOT_ENV) {
-        let root_path = PathBuf::from(root);
-        if root_path.is_absolute() {
-            return root_path;
-        }
-        return db_path.parent().unwrap_or(db_path).join(root_path);
-    }
-    db_path.parent().unwrap_or(db_path).join("media")
-}
-
-fn import_media_bytes(
-    db_path: &Path,
-    type_name: &str,
-    bytes: &[u8],
-    mime_type: &str,
-) -> Result<String> {
-    let root = configured_media_root(db_path);
-    let type_dir = root.join(type_name.to_ascii_lowercase());
-    fs::create_dir_all(&type_dir).map_err(|err| {
-        NanoError::Storage(format!(
-            "failed to create media directory {}: {}",
-            type_dir.display(),
-            err
-        ))
-    })?;
-
-    let hash = Sha256::digest(bytes);
-    let hash_hex = hex_lower(&hash);
-    let ext = mime_to_extension(mime_type).unwrap_or("bin");
-    let dest = type_dir.join(format!("{}.{}", hash_hex, ext));
-    if !dest.exists() {
-        fs::write(&dest, bytes).map_err(|err| {
-            NanoError::Storage(format!(
-                "failed to write imported media {}: {}",
-                dest.display(),
-                err
-            ))
-        })?;
-    }
-
-    let canonical = dest.canonicalize().map_err(|err| {
-        NanoError::Storage(format!(
-            "failed to canonicalize imported media {}: {}",
-            dest.display(),
-            err
-        ))
-    })?;
-    let uri = Url::from_file_path(&canonical).map_err(|_| {
-        NanoError::Storage(format!(
-            "failed to build file URI for imported media {}",
-            canonical.display()
-        ))
-    })?;
-    Ok(uri.to_string())
-}
-
 fn choose_mime_type(
     mime_hint: Option<&str>,
     detected: Option<&'static str>,
@@ -259,29 +210,4 @@ fn extension_to_mime(ext: &str) -> Option<&'static str> {
         "mov" => Some("video/quicktime"),
         _ => None,
     }
-}
-
-fn mime_to_extension(mime_type: &str) -> Option<&'static str> {
-    match mime_type {
-        "image/png" => Some("png"),
-        "image/jpeg" => Some("jpg"),
-        "image/gif" => Some("gif"),
-        "image/webp" => Some("webp"),
-        "application/pdf" => Some("pdf"),
-        "audio/mpeg" => Some("mp3"),
-        "audio/wav" => Some("wav"),
-        "video/mp4" => Some("mp4"),
-        "video/quicktime" => Some("mov"),
-        _ => None,
-    }
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0F) as usize] as char);
-    }
-    out
 }
