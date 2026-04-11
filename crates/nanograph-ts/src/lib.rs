@@ -17,8 +17,8 @@ use nanograph::query::typecheck::{CheckedQuery, typecheck_query_decl};
 use nanograph::store::database::Database;
 
 use convert::{
-    js_object_to_param_map, parse_cleanup_options, parse_compact_options, parse_embed_options,
-    parse_load_mode,
+    js_object_to_param_map, parse_changes_options, parse_cleanup_options,
+    parse_compact_options, parse_embed_options, parse_load_mode,
 };
 
 fn to_napi_err(e: NanoError) -> napi::Error {
@@ -414,6 +414,26 @@ impl JsDatabase {
             "cdcRows": report.cdc_rows,
             "lineageShadow": lineage_shadow,
         }))
+    }
+
+    /// Read committed lineage-native change rows.
+    ///
+    /// ```js
+    /// const rows = await db.changes({ since: 0 });
+    /// ```
+    #[napi]
+    pub async fn changes(&self, options: Option<serde_json::Value>) -> Result<serde_json::Value> {
+        let opts = parse_changes_options(options.as_ref())?;
+        let db = self.db().await?;
+        let rows = db
+            .changes(
+                opts.from_graph_version_exclusive,
+                opts.to_graph_version_inclusive,
+            )
+            .await
+            .map_err(to_napi_err)?;
+        serde_json::to_value(rows)
+            .map_err(|err| napi::Error::from_reason(format!("serialize change rows: {}", err)))
     }
 
     /// Return whether this handle uses an internal tempdir-backed database.

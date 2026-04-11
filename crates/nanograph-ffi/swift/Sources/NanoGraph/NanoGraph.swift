@@ -346,6 +346,21 @@ public final class Database {
         }
     }
 
+    public func changes(options: Any? = nil) throws -> Any {
+        let optionsJSON = try encodeJSON(options)
+        return try lock.withLock {
+            let handle = try requireHandleLocked()
+            let ptr = if let optionsJSON {
+                optionsJSON.withCString { optionsPtr in
+                    nanograph_db_changes(handle, optionsPtr)
+                }
+            } else {
+                nanograph_db_changes(handle, nil)
+            }
+            return try decodeOwnedJSONString(ptr)
+        }
+    }
+
     public func isInMemory() throws -> Bool {
         try lock.withLock {
             let handle = try requireHandleLocked()
@@ -379,6 +394,16 @@ public final class Database {
 
     public func embed<T: Decodable>(_ type: T.Type, options: EmbedOptions? = nil) throws -> T {
         let raw = try embed(options: options)
+        return try decodeValue(type, from: raw)
+    }
+
+    public func doctor<T: Decodable>(_ type: T.Type) throws -> T {
+        let raw = try doctor()
+        return try decodeValue(type, from: raw)
+    }
+
+    public func changes<T: Decodable>(_ type: T.Type, options: Any? = nil) throws -> T {
+        let raw = try changes(options: options)
         return try decodeValue(type, from: raw)
     }
 

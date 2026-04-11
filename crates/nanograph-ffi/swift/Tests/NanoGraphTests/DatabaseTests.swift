@@ -19,6 +19,15 @@ final class DatabaseTests: XCTestCase {
         let edgeTypes: [TypeDef]
     }
 
+    private struct DoctorReport: Decodable {
+        let healthy: Bool
+        let manifestDbVersion: Int
+        let datasetsChecked: Int
+        let txRows: Int
+        let cdcRows: Int
+        let lineageShadow: String?
+    }
+
     private let schema = """
     node Person {
       name: String @key
@@ -47,6 +56,14 @@ final class DatabaseTests: XCTestCase {
 
     query addPerson($name: String, $age: I32) {
       insert Person { name: $name, age: $age }
+    }
+
+    query updatePerson($name: String, $age: I32) {
+      update Person set { age: $age } where name = $name
+    }
+
+    query deletePerson($name: String) {
+      delete Person where name = $name
     }
     """
 
@@ -265,7 +282,7 @@ final class DatabaseTests: XCTestCase {
         defer { try? db.close() }
 
         let checks = try db.check([CheckRow].self, querySource: queries)
-        XCTAssertEqual(checks.count, 3)
+        XCTAssertEqual(checks.count, 5)
         XCTAssertTrue(checks.allSatisfy { $0.status == "ok" })
 
         let describe = try db.describe(DescribeResult.self)
@@ -289,7 +306,7 @@ final class DatabaseTests: XCTestCase {
 
         let raw = try db.check(querySource: queries)
         let checks = try castRows(raw)
-        XCTAssertEqual(checks.count, 3)
+        XCTAssertEqual(checks.count, 5)
         XCTAssertTrue(checks.allSatisfy { ($0["status"] as? String) == "ok" })
         XCTAssertEqual((checks[0]["kind"] as? String), "read")
     }
@@ -312,12 +329,55 @@ final class DatabaseTests: XCTestCase {
         defer { cleanup(dbPath: dbPath) }
         defer { try? db.close() }
 
-        let raw = try db.doctor()
-        let report = try castObject(raw)
-        XCTAssertEqual(report["healthy"] as? Bool, true)
-        XCTAssertNotNil(report["datasetsChecked"] as? Int)
-        XCTAssertNotNil(report["txRows"] as? Int)
-        XCTAssertNotNil(report["cdcRows"] as? Int)
+        let report = try db.doctor(DoctorReport.self)
+        XCTAssertEqual(report.healthy, true)
+        XCTAssertGreaterThanOrEqual(report.manifestDbVersion, 1)
+        XCTAssertGreaterThanOrEqual(report.datasetsChecked, 1)
+        XCTAssertGreaterThanOrEqual(report.txRows, 1)
+        XCTAssertGreaterThanOrEqual(report.cdcRows, 1)
+        XCTAssertNil(report.lineageShadow)
+    }
+
+    func testChangesReturnNamespaceLineageRows() throws {
+        let (db, dbPath) = try freshDatabase()
+        defer { cleanup(dbPath: dbPath) }
+        defer { try? db.close() }
+
+        _ = try db.run(querySource: queries, queryName: "addPerson", params: ["name": "Carol", "age": 28])
+        _ = try db.run(querySource: queries, queryName: "updatePerson", params: ["name": "Alice", "age": 31])
+        _ = try db.run(querySource: queries, queryName: "deletePerson", params: ["name": "Bob"])
+
+        let raw = try db.changes(options: ["since": 0])
+        let rows = try castRows(raw)
+        XCTAssertGreaterThanOrEqual(rows.count, 5)
+        XCTAssertTrue(rows.allSatisfy { $0["db_version"] == nil })
+        XCTAssertTrue(rows.allSatisfy { $0["seq_in_tx"] == nil })
+        XCTAssertTrue(rows.allSatisfy { $0["graph_version"] as? Int != nil })
+        XCTAssertTrue(rows.allSatisfy { $0["tx_id"] as? String != nil })
+        XCTAssertTrue(rows.allSatisfy { $0["table_id"] as? String != nil })
+        XCTAssertTrue(rows.allSatisfy { $0["rowid"] as? Int != nil })
+        XCTAssertTrue(rows.allSatisfy { $0["entity_id"] as? Int != nil })
+        XCTAssertTrue(rows.allSatisfy { $0["logical_key"] as? String != nil })
+        XCTAssertTrue(rows.allSatisfy { $0["row"] as? [String: Any] != nil })
+
+        let insert = try XCTUnwrap(rows.first {
+            ($0["change_kind"] as? String) == "insert"
+                && ($0["row"] as? [String: Any])?["name"] as? String == "Carol"
+        })
+        XCTAssertEqual((insert["previous_graph_version"] as? Int), (insert["graph_version"] as? Int).map { $0 - 1 })
+
+        let update = try XCTUnwrap(rows.first {
+            ($0["change_kind"] as? String) == "update"
+                && ($0["row"] as? [String: Any])?["name"] as? String == "Alice"
+        })
+        XCTAssertEqual((update["row"] as? [String: Any])?["age"] as? Int, 31)
+
+        let delete = try XCTUnwrap(rows.first {
+            ($0["change_kind"] as? String) == "delete"
+                && ($0["row"] as? [String: Any])?["name"] as? String == "Bob"
+        })
+        XCTAssertEqual((delete["row"] as? [String: Any])?["age"] as? Int, 25)
+        XCTAssertNotNil(delete["previous_graph_version"] as? Int)
     }
 
     func testRunArrowReturnsDataForReadQueries() throws {
@@ -456,7 +516,7 @@ final class DatabaseTests: XCTestCase {
             let rows = try castRows(raw)
             XCTAssertEqual(rows.count, 1)
             XCTAssertEqual(rows[0]["mime"] as? String, "image/jpeg")
-            XCTAssertTrue((rows[0]["uri"] as? String)?.hasPrefix("file://") == true)
+            XCTAssertTrue((rows[0]["uri"] as? String)?.hasPrefix("lanceblob://sha256/") == true)
         }
     }
 
@@ -482,7 +542,7 @@ final class DatabaseTests: XCTestCase {
             let rows = try castRows(raw)
             XCTAssertEqual(rows.count, 1)
             XCTAssertEqual(rows[0]["mime"] as? String, "image/jpeg")
-            XCTAssertTrue((rows[0]["uri"] as? String)?.hasPrefix("file://") == true)
+            XCTAssertTrue((rows[0]["uri"] as? String)?.hasPrefix("lanceblob://sha256/") == true)
         }
     }
 

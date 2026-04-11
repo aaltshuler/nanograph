@@ -296,7 +296,10 @@ Prune old dataset versions and log entries.
 let result = try db.cleanup(options: ["retainTxVersions": 10])
 ```
 
-Options: `retainTxVersions` (Int), `retainDatasetVersions` (Int).
+Options:
+
+- `retainTxVersions` (Int) — primary retention control for new `NamespaceLineage` graphs
+- `retainDatasetVersions` (Int) — legacy/advanced override; mostly relevant for older storage generations
 
 ### `db.doctor()`
 
@@ -314,7 +317,61 @@ let report = try db.doctor() as! [String: Any]
 // ]
 ```
 
-`healthy` remains `true` when only warnings are present. Rebuildable graph-mirror conditions are surfaced as warnings rather than hard failures.
+`healthy` remains `true` when only warnings are present. On new `NamespaceLineage` graphs, `lineageShadow` is `nil` because lineage is the actual CDC rail. Structured `lineageShadow` details only appear for legacy `V4Namespace` databases.
+
+### `db.changes(options:)`
+
+Read committed lineage-native change rows.
+
+```swift
+let rows = try db.changes(options: ["since": 0]) as! [[String: Any]]
+// [
+//   [
+//     "graph_version": 1,
+//     "tx_id": "manifest-1",
+//     "change_kind": "insert",
+//     "entity_kind": "node",
+//     "type_name": "Person",
+//     "table_id": "nodes/00000001",
+//     "rowid": 1,
+//     "entity_id": 1,
+//     "logical_key": "id=1",
+//     "row": ["name": "Alice", "age": 30],
+//   ]
+// ]
+```
+
+Options:
+
+- `since` — shorthand for `graph_version > since`
+- `from` / `to` — explicit open/closed window `(from, to]`
+
+Typed overload:
+
+```swift
+struct ChangeRow: Decodable {
+    let graph_version: Int
+    let tx_id: String
+    let change_kind: String
+    let entity_kind: String
+    let type_name: String
+    let table_id: String
+    let rowid: Int
+    let entity_id: Int
+    let logical_key: String
+    let previous_graph_version: Int?
+}
+
+let rows = try db.changes([ChangeRow].self, options: ["since": 0])
+```
+
+The returned rows use the public CDC contract directly:
+
+- `graph_version` instead of legacy `db_version`
+- no `seq_in_tx`
+- deterministic ordering by `graph_version`, `entity_kind`, `type_name`, `rowid`/`logical_key`, `change_kind`
+- insert/update rows include the current row image
+- delete rows include the tombstoned last-visible row image
 
 ### `db.isInMemory()`
 

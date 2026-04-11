@@ -244,7 +244,10 @@ Prune old dataset versions and log entries.
 const result = await db.cleanup({ retainTxVersions: 10 });
 ```
 
-Options: `retainTxVersions` (number), `retainDatasetVersions` (number).
+Options:
+
+- `retainTxVersions` (number) — primary retention control for new `NamespaceLineage` graphs
+- `retainDatasetVersions` (number) — legacy/advanced override; mostly relevant for older storage generations
 
 ### `db.doctor()`
 
@@ -263,7 +266,42 @@ const report = await db.doctor();
 // }
 ```
 
-`healthy` stays `true` when only warnings are present. Recent maintenance warnings can include rebuildable graph-mirror conditions without making the database unhealthy.
+`healthy` stays `true` when only warnings are present. On new `NamespaceLineage` graphs, `lineageShadow` is `null` because lineage is the real CDC rail. Structured `lineageShadow` details are only reported for legacy `V4Namespace` databases.
+
+### `db.changes(options?)`
+
+Read committed lineage-native change rows.
+
+```typescript
+const rows = await db.changes({ since: 0 });
+// [{
+//   graph_version: 1,
+//   tx_id: "manifest-1",
+//   committed_at: "1700000000",
+//   change_kind: "insert",
+//   entity_kind: "node",
+//   type_name: "Person",
+//   table_id: "nodes/00000001",
+//   rowid: 1,
+//   entity_id: 1,
+//   logical_key: "id=1",
+//   row: { name: "Alice", age: 30 },
+//   previous_graph_version: null
+// }]
+```
+
+Options:
+
+- `since` — shorthand for `graph_version > since`
+- `from` / `to` — explicit open/closed window `(from, to]`
+
+Returned rows use the public CDC contract directly:
+
+- `graph_version` instead of legacy `db_version`
+- no `seq_in_tx`
+- deterministic ordering by `graph_version`, `entity_kind`, `type_name`, `rowid`/`logical_key`, `change_kind`
+- insert/update rows include the current row image
+- delete rows include the tombstoned last-visible row image
 
 ### `db.isInMemory()`
 

@@ -161,6 +161,17 @@ async function writeJpegAsset(name) {
   return path;
 }
 
+function compareChangeRows(left, right) {
+  return (
+    left.graph_version - right.graph_version ||
+    String(left.entity_kind).localeCompare(String(right.entity_kind)) ||
+    String(left.type_name).localeCompare(String(right.type_name)) ||
+    Number(left.rowid) - Number(right.rowid) ||
+    String(left.logical_key).localeCompare(String(right.logical_key)) ||
+    String(left.change_kind).localeCompare(String(right.change_kind))
+  );
+}
+
 function runNanograph(args) {
   const debugBinary = join(REPO_ROOT, "target", "debug", CLI_BINARY_NAME);
   const command = existsSync(debugBinary) ? debugBinary : "cargo";
@@ -716,10 +727,66 @@ query coworkers() {
       assert.equal(typeof report.datasetsChecked, "number");
       assert.equal(typeof report.txRows, "number");
       assert.equal(typeof report.cdcRows, "number");
-      assert.ok(report.lineageShadow);
-      assert.equal(typeof report.lineageShadow.windowsConsidered, "number");
-      assert.equal(typeof report.lineageShadow.windowsVerified, "number");
-      assert.ok(Array.isArray(report.lineageShadow.windows));
+      assert.equal(report.lineageShadow, null);
+      await db.close();
+    });
+  });
+
+  // ---- changes ----
+
+  describe("changes", () => {
+    it("should expose NamespaceLineage change rows with the new contract", async () => {
+      const { db } = await freshDb();
+      await db.run(QUERIES, "insertPerson", { name: "Eve", age: 28 });
+      await db.run(QUERIES, "updatePerson", { name: "Alice", age: 31 });
+      await db.run(QUERIES, "deletePerson", { name: "Bob" });
+
+      const rows = await db.changes({ since: 0 });
+      assert.ok(rows.length >= 6);
+      assert.ok(rows.every((row) => !("db_version" in row)));
+      assert.ok(rows.every((row) => !("seq_in_tx" in row)));
+      assert.ok(rows.every((row) => typeof row.graph_version === "number"));
+      assert.ok(rows.every((row) => typeof row.tx_id === "string"));
+      assert.ok(rows.every((row) => typeof row.committed_at === "string"));
+      assert.ok(rows.every((row) => typeof row.table_id === "string"));
+      assert.ok(rows.every((row) => typeof row.rowid === "number"));
+      assert.ok(rows.every((row) => typeof row.entity_id === "number"));
+      assert.ok(rows.every((row) => typeof row.logical_key === "string"));
+      assert.ok(rows.every((row) => row.row && typeof row.row === "object"));
+
+      const eveInsert = rows.find(
+        (row) =>
+          row.change_kind === "insert" &&
+          row.entity_kind === "node" &&
+          row.type_name === "Person" &&
+          row.row.name === "Eve",
+      );
+      assert.ok(eveInsert);
+      assert.equal(eveInsert.previous_graph_version, eveInsert.graph_version - 1);
+
+      const aliceUpdate = rows.find(
+        (row) =>
+          row.change_kind === "update" &&
+          row.entity_kind === "node" &&
+          row.type_name === "Person" &&
+          row.row.name === "Alice",
+      );
+      assert.ok(aliceUpdate);
+      assert.equal(aliceUpdate.row.age, 31);
+
+      const bobDelete = rows.find(
+        (row) =>
+          row.change_kind === "delete" &&
+          row.entity_kind === "node" &&
+          row.type_name === "Person" &&
+          row.row.name === "Bob",
+      );
+      assert.ok(bobDelete);
+      assert.equal(bobDelete.row.age, 25);
+      assert.equal(typeof bobDelete.previous_graph_version, "number");
+
+      const sorted = [...rows].sort(compareChangeRows);
+      assert.deepEqual(rows, sorted);
       await db.close();
     });
   });
@@ -1078,7 +1145,7 @@ query products_from_image_search($q: String) {
         const rows = await db.run(MEDIA_QUERIES, "photo_by_slug", { slug: "hero" });
         assert.equal(rows.length, 1);
         assert.equal(rows[0].mime, "image/jpeg");
-        assert.match(rows[0].uri, /^file:\/\//);
+        assert.match(rows[0].uri, /^lanceblob:\/\/sha256\//);
       });
       await db.close();
     });
@@ -1103,7 +1170,7 @@ query products_from_image_search($q: String) {
         const rows = await db.run(MEDIA_QUERIES, "photo_by_slug", { slug: "inline" });
         assert.equal(rows.length, 1);
         assert.equal(rows[0].mime, "image/jpeg");
-        assert.match(rows[0].uri, /^file:\/\//);
+        assert.match(rows[0].uri, /^lanceblob:\/\/sha256\//);
       });
       await db.close();
     });

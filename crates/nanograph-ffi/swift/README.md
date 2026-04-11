@@ -1,4 +1,4 @@
-# NanoGraph Swift Wrapper (Local)
+# nanograph Swift Wrapper (Local)
 
 This package wraps the `nanograph-ffi` C ABI and links against the Rust library built in this repo.
 
@@ -44,18 +44,19 @@ Debug/test builds link `../../../target/debug`; Swift release builds link `../..
 - `compact(options:)`
 - `cleanup(options:)`
 - `doctor()`
+- `changes(options:)`
 - `isInMemory()`
 - `close()`
 
 All read APIs decode C-returned JSON into Foundation values (`Any`) by default.
-Typed decode overloads are available for `run/check/describe`. `runArrow(...)` returns Arrow IPC as `Data`, and the package also exports:
+Typed decode overloads are available for `run/check/describe/doctor/changes`. `runArrow(...)` returns Arrow IPC as `Data`, and the package also exports:
 
 - `decodeArrow(_ data: Data) -> Any`
 - `decodeArrow(_:from:) -> T`
 
 ## Media nodes and external assets
 
-NanoGraph stores media as external URIs. The Swift wrapper now includes:
+nanograph stores media as external URIs. The Swift wrapper now includes:
 
 - `MediaRef.file(...)`
 - `MediaRef.base64(...)`
@@ -116,4 +117,5 @@ let rows = try db.run(
 ```
 
 `describe()` now includes `mediaMimeProp` for `@media_uri(...)` properties, so SDK callers can detect media URI fields and their sibling mime properties.
-OpenAI embeddings remain text-only today. Use Gemini when you want NanoGraph to generate media embeddings from `@media_uri(...)` sources.
+`changes()` returns the lineage-native CDC contract for new `NamespaceLineage` graphs.
+OpenAI embeddings remain text-only today. Use Gemini when you want nanograph to generate media embeddings from `@media_uri(...)` sources.

@@ -120,6 +120,27 @@ export interface CleanupResult {
   datasetBytesRemoved: number
 }
 
+export interface ChangesOptions {
+  since?: number
+  from?: number
+  to?: number
+}
+
+export interface ChangeRow {
+  graph_version: number
+  tx_id: string
+  committed_at: string
+  change_kind: "insert" | "update" | "delete" | string
+  entity_kind: "node" | "edge" | string
+  type_name: string
+  table_id: string
+  rowid: number
+  entity_id: number
+  logical_key: string
+  row: Record<string, JsonValue>
+  previous_graph_version?: number | null
+}
+
 export interface EmbedOptions {
   typeName?: string
   property?: string
@@ -193,6 +214,7 @@ export declare class Database {
   compact(options?: CompactOptions | null): Promise<CompactResult>
   cleanup(options?: CleanupOptions | null): Promise<CleanupResult>
   doctor(): Promise<DoctorReport>
+  changes(options?: ChangesOptions | null): Promise<ChangeRow[]>
   isInMemory(): Promise<boolean>
   close(): Promise<void>
 }

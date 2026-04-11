@@ -46,6 +46,7 @@ char *nanograph_db_compact(NanoGraphHandle *handle, const char *options_json);
 char *nanograph_db_cleanup(NanoGraphHandle *handle, const char *options_json);
 char *nanograph_db_embed(NanoGraphHandle *handle, const char *options_json);
 char *nanograph_db_doctor(NanoGraphHandle *handle);
+char *nanograph_db_changes(NanoGraphHandle *handle, const char *options_json);
 int32_t nanograph_db_is_in_memory(NanoGraphHandle *handle);
 
 #ifdef __cplusplus

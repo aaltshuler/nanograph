@@ -2,6 +2,11 @@ use nanograph::query::ast::Param;
 use nanograph::store::database::{CleanupOptions, CompactOptions, EmbedOptions, LoadMode};
 use nanograph::{JsonParamMode, ParamMap, json_params_to_param_map};
 
+pub struct ChangesOptions {
+    pub from_graph_version_exclusive: u64,
+    pub to_graph_version_inclusive: Option<u64>,
+}
+
 pub fn js_object_to_param_map(
     params: Option<&serde_json::Value>,
     query_params: &[Param],
@@ -123,6 +128,60 @@ pub fn parse_cleanup_options(opts: Option<&serde_json::Value>) -> napi::Result<C
         })?;
     }
     Ok(result)
+}
+
+pub fn parse_changes_options(opts: Option<&serde_json::Value>) -> napi::Result<ChangesOptions> {
+    let obj = match opts {
+        Some(serde_json::Value::Object(obj)) => obj,
+        Some(serde_json::Value::Null) | None => {
+            return Ok(ChangesOptions {
+                from_graph_version_exclusive: 0,
+                to_graph_version_inclusive: None,
+            });
+        }
+        Some(_) => return Err(napi::Error::from_reason("changes options must be an object")),
+    };
+
+    for key in obj.keys() {
+        match key.as_str() {
+            "since" | "from" | "to" => {}
+            _ => {
+                return Err(napi::Error::from_reason(format!(
+                    "unknown changes option '{}'",
+                    key
+                )));
+            }
+        }
+    }
+
+    if obj.contains_key("since") && obj.contains_key("from") {
+        return Err(napi::Error::from_reason(
+            "changes options must not include both since and from",
+        ));
+    }
+
+    let from_graph_version_exclusive = if let Some(v) = obj.get("since") {
+        v.as_u64()
+            .ok_or_else(|| napi::Error::from_reason("since must be a non-negative integer"))?
+    } else if let Some(v) = obj.get("from") {
+        v.as_u64()
+            .ok_or_else(|| napi::Error::from_reason("from must be a non-negative integer"))?
+    } else {
+        0
+    };
+
+    let to_graph_version_inclusive = obj
+        .get("to")
+        .map(|v| {
+            v.as_u64()
+                .ok_or_else(|| napi::Error::from_reason("to must be a non-negative integer"))
+        })
+        .transpose()?;
+
+    Ok(ChangesOptions {
+        from_graph_version_exclusive,
+        to_graph_version_inclusive,
+    })
 }
 
 pub fn parse_embed_options(opts: Option<&serde_json::Value>) -> napi::Result<EmbedOptions> {

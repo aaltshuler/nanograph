@@ -396,7 +396,21 @@ async fn load_full_batch(
     let Some(locator) = locator else {
         return Ok(None);
     };
-    let batches = read_lance_batches_for_locator(&locator).await?;
+    // Migration wants the exact snapshot-pinned physical table version. For namespace-managed
+    // sources that can be more reliable than reopening through the namespace version surface,
+    // especially after index rebuilds.
+    let direct_locator = crate::store::metadata::DatasetLocator {
+        namespace_managed: false,
+        ..locator.clone()
+    };
+    let batches = if locator.namespace_managed && locator.dataset_path.exists() {
+        match read_lance_batches_for_locator(&direct_locator).await {
+            Ok(batches) => batches,
+            Err(_) => read_lance_batches_for_locator(&locator).await?,
+        }
+    } else {
+        read_lance_batches_for_locator(&locator).await?
+    };
     if batches.is_empty() {
         return Ok(None);
     }

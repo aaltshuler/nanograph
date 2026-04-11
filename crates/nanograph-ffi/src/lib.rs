@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::io::Cursor;
@@ -235,6 +237,40 @@ fn parse_cleanup_options(opts: Option<&serde_json::Value>) -> FfiResult<CleanupO
             .map_err(|_| "retainDatasetVersions is too large for this platform".to_string())?;
     }
     Ok(result)
+}
+
+fn parse_changes_options(opts: Option<&serde_json::Value>) -> FfiResult<(u64, Option<u64>)> {
+    let obj = match opts {
+        Some(serde_json::Value::Object(obj)) => obj,
+        Some(serde_json::Value::Null) | None => return Ok((0, None)),
+        Some(_) => return Err("changes options must be a JSON object".to_string()),
+    };
+    for key in obj.keys() {
+        match key.as_str() {
+            "since" | "from" | "to" => {}
+            _ => return Err(format!("unknown changes option '{}'", key)),
+        }
+    }
+    if obj.contains_key("since") && obj.contains_key("from") {
+        return Err("changes options must not include both since and from".to_string());
+    }
+    let from = if let Some(v) = obj.get("since") {
+        v.as_u64()
+            .ok_or_else(|| "since must be a non-negative integer".to_string())?
+    } else if let Some(v) = obj.get("from") {
+        v.as_u64()
+            .ok_or_else(|| "from must be a non-negative integer".to_string())?
+    } else {
+        0
+    };
+    let to = obj
+        .get("to")
+        .map(|v| {
+            v.as_u64()
+                .ok_or_else(|| "to must be a non-negative integer".to_string())
+        })
+        .transpose()?;
+    Ok((from, to))
 }
 
 fn parse_embed_options(opts: Option<&serde_json::Value>) -> FfiResult<EmbedOptions> {
@@ -892,12 +928,35 @@ pub extern "C" fn nanograph_db_doctor(handle: *mut NanoGraphHandle) -> *mut c_ch
             "healthy": report.healthy,
             "issues": report.issues,
             "warnings": report.warnings,
+            "manifestDbVersion": report.manifest_db_version,
             "datasetsChecked": report.datasets_checked,
             "txRows": report.tx_rows,
             "cdcRows": report.cdc_rows,
             "lineageShadow": lineage_shadow,
         }))
     });
+    json_result_to_ptr(result)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nanograph_db_changes(
+    handle: *mut NanoGraphHandle,
+    options_json: *const c_char,
+) -> *mut c_char {
+    let result = (|| {
+        let options = parse_optional_json(options_json)?;
+        with_handle(handle, |handle| {
+            let (from_graph_version_exclusive, to_graph_version_inclusive) =
+                parse_changes_options(options.as_ref())?;
+            let db = handle.db()?;
+            let rows = handle
+                .runtime
+                .block_on(db.changes(from_graph_version_exclusive, to_graph_version_inclusive))
+                .map_err(to_ffi_err)?;
+            serde_json::to_value(rows)
+                .map_err(|err| format!("failed to serialize changes rows: {}", err))
+        })
+    })();
     json_result_to_ptr(result)
 }
 

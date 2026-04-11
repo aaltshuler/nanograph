@@ -18,9 +18,22 @@ use super::persist::{
 use super::{Database, DatabaseWriteGuard, DeleteOp, DeletePredicate, DeleteResult, MutationPlan};
 use crate::error::{NanoError, Result};
 use crate::store::metadata::DatabaseMetadata;
-use crate::store::txlog::CdcLogEntry;
+use crate::store::txlog::{CdcLogEntry, VisibleChangeRow, read_visible_change_rows};
 
 impl Database {
+    /// Read committed lineage-native change rows for NamespaceLineage storage.
+    pub async fn changes(
+        &self,
+        from_graph_version_exclusive: u64,
+        to_graph_version_inclusive: Option<u64>,
+    ) -> Result<Vec<VisibleChangeRow>> {
+        read_visible_change_rows(
+            self.path(),
+            from_graph_version_exclusive,
+            to_graph_version_inclusive,
+        )
+    }
+
     /// Delete nodes of a given type matching a predicate, cascading incident edges.
     #[instrument(skip(self), fields(type_name = type_name, property = %predicate.property))]
     pub async fn delete_nodes(
