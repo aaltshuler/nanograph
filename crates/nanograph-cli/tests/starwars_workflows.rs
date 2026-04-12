@@ -7,7 +7,7 @@ fn starwars_search_and_mutation_workflows_work() {
     let workspace = ExampleWorkspace::copy(ExampleProject::Starwars);
     workspace.init();
     workspace.load();
-    workspace.check();
+    workspace.lint();
 
     let keyword = workspace.json_rows(&[
         "run",

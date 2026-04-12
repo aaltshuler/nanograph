@@ -7,7 +7,7 @@ fn starwars_example_doc_commands_stay_green() {
     let workspace = ExampleWorkspace::copy(ExampleProject::Starwars);
     workspace.init();
     workspace.load();
-    workspace.check();
+    workspace.lint();
 
     let describe = workspace.json_value(&["describe", "--type", "Character", "--format", "json"]);
     assert_eq!(describe["nodes"][0]["name"], "Character");
@@ -60,7 +60,7 @@ fn revops_example_doc_commands_stay_green() {
     let workspace = ExampleWorkspace::copy(ExampleProject::Revops);
     workspace.init();
     workspace.load();
-    workspace.check();
+    workspace.lint();
     workspace.write_file(
         "contains.gq",
         r#"
@@ -102,7 +102,7 @@ query tagged_clients($tag: String) {
     ]);
     assert!(!signals.is_empty());
 
-    let contains_check = workspace.json_value(&["--json", "check", "--query", "contains.gq"]);
+    let contains_check = workspace.json_value(&["--json", "lint", "--query", "contains.gq"]);
     assert_eq!(contains_check["status"], "ok");
 
     let tagged_clients = workspace.json_rows(&[
@@ -155,10 +155,10 @@ fn human_oriented_command_outputs_smoke_cleanly() {
     assert!(!describe.contains("dataset_version="));
     assert!(!describe.contains("type_id="));
 
-    let check = workspace.run_ok(&["check", "--query", "revops.gq"]).stdout;
+    let check = workspace.run_ok(&["lint", "--query", "revops.gq"]).stdout;
     assert!(check.contains("OK: query `decision_trace` (read)"));
-    assert!(check.contains("INFO: Check complete:"));
-    assert!(check.contains("Check complete:"));
+    assert!(check.contains("INFO: Lint complete:"));
+    assert!(check.contains("Lint complete:"));
 
     let compact = workspace
         .run_ok(&["compact", "--target-rows-per-fragment", "1024"])

@@ -46,7 +46,7 @@ format = "table"
     ]);
     assert_eq!(load["status"], "ok");
 
-    let check = workspace.json_value(&["--json", "check", "--query", "starwars.gq"]);
+    let check = workspace.json_value(&["--json", "lint", "--query", "starwars.gq"]);
     assert_eq!(check["status"], "ok");
 
     let table = workspace

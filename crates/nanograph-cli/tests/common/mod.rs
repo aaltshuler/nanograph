@@ -183,8 +183,8 @@ impl ExampleWorkspace {
         assert_eq!(value["status"], "ok");
     }
 
-    pub fn check(&self) {
-        let value = self.json_value(&["--json", "check", "--query", self.example.query_file()]);
+    pub fn lint(&self) {
+        let value = self.json_value(&["--json", "lint", "--query", self.example.query_file()]);
         assert_eq!(value["status"], "ok");
     }
 

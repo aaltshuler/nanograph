@@ -497,15 +497,15 @@ fn doctor_human_output_shows_storage_formats_only_in_verbose_mode() {
 }
 
 #[test]
-fn check_hints_to_migrate_when_desired_schema_diff_explains_missing_property() {
+fn lint_uses_desired_schema_when_explicitly_provided() {
     let workspace = ExampleWorkspace::copy(ExampleProject::Revops);
     init_bug_db(&workspace);
     workspace.write_file("desired.pg", bug_schema_with_display_name());
     write_schema_drift_query(&workspace);
 
-    let result = workspace.run_fail(&[
+    let result = workspace.run_ok(&[
         "--json",
-        "check",
+        "lint",
         "--db",
         "bug.nano",
         "--query",
@@ -513,24 +513,19 @@ fn check_hints_to_migrate_when_desired_schema_diff_explains_missing_property() {
         "--schema",
         "desired.pg",
     ]);
-    assert!(result.stderr.trim().is_empty());
-
-    let value = serde_json::from_str::<serde_json::Value>(&result.stdout).expect("check json");
-    assert_eq!(value["status"], "error");
-    let error = value["results"][0]["error"].as_str().expect("error string");
-    assert!(error.contains("has no property `displayName`"));
-    assert!(error.contains("desired schema"));
-    assert!(error.contains("run `nanograph migrate"));
+    let value = serde_json::from_str::<serde_json::Value>(&result.stdout).expect("lint json");
+    assert_eq!(value["status"], "ok");
+    assert_eq!(value["errors"], 0);
 }
 
 #[test]
-fn check_and_run_surface_vector_schema_drift_end_to_end() {
+fn lint_and_run_surface_vector_schema_drift_end_to_end() {
     let workspace = ExampleWorkspace::copy(ExampleProject::Revops);
     init_stale_vector_db(&workspace);
 
-    let check = workspace.run_fail(&[
+    let check = workspace.run_ok(&[
         "--json",
-        "check",
+        "lint",
         "--db",
         "stale.nano",
         "--query",
@@ -538,15 +533,9 @@ fn check_and_run_surface_vector_schema_drift_end_to_end() {
         "--schema",
         "desired.pg",
     ]);
-    assert!(check.stderr.trim().is_empty());
-    let check_value = serde_json::from_str::<serde_json::Value>(&check.stdout).expect("check json");
-    assert_eq!(check_value["status"], "error");
-    let check_error = check_value["results"][0]["error"]
-        .as_str()
-        .expect("check error");
-    assert!(check_error.contains("has no property `embedding`"));
-    assert!(check_error.contains("desired schema"));
-    assert!(check_error.contains("run `nanograph migrate"));
+    let check_value = serde_json::from_str::<serde_json::Value>(&check.stdout).expect("lint json");
+    assert_eq!(check_value["status"], "ok");
+    assert_eq!(check_value["errors"], 0);
 
     let run = workspace.run_fail(&[
         "--json",
@@ -686,8 +675,8 @@ fn list_membership_filters_work_end_to_end() {
     let workspace = ExampleWorkspace::copy(ExampleProject::Revops);
     init_list_membership_db(&workspace);
 
-    let check = workspace.run_ok(&["--json", "check", "--db", "list.nano", "--query", "list.gq"]);
-    let check_value = serde_json::from_str::<serde_json::Value>(&check.stdout).expect("check json");
+    let check = workspace.run_ok(&["--json", "lint", "--db", "list.nano", "--query", "list.gq"]);
+    let check_value = serde_json::from_str::<serde_json::Value>(&check.stdout).expect("lint json");
     assert_eq!(check_value["status"], "ok");
 
     let run = workspace.run_ok(&[
@@ -736,7 +725,7 @@ fn list_membership_filters_work_end_to_end() {
 
     let rejected = workspace.run_fail(&[
         "--json",
-        "check",
+        "lint",
         "--db",
         "list.nano",
         "--query",

@@ -33,9 +33,10 @@ mod tests;
 use config::{LoadedConfig, ResolvedRunConfig, TableCellLayout};
 use metadata::{cmd_describe, cmd_export, cmd_version};
 use nanograph::error::{NanoError, ParseDiagnostic};
-use nanograph::query::ast::{Clause, CompOp, Expr, Literal, MatchValue, QueryDecl};
+use nanograph::query::ast::{Clause, CompOp, Expr, Literal, MatchValue, Mutation, QueryDecl};
 use nanograph::query::parser::parse_query_diagnostic;
 use nanograph::query::typecheck::{BindingKind, CheckedQuery, TypeContext, typecheck_query_decl};
+use nanograph::schema::ast::{SchemaDecl, annotation_value, has_annotation};
 use nanograph::schema::parser::parse_schema_diagnostic;
 use nanograph::store::database::{
     CdcAnalyticsMaterializeOptions, CleanupOptions, CompactOptions, Database, DeleteOp,
@@ -52,7 +53,7 @@ use nanograph::store::txlog::{
     CdcLogEntry, VisibleCdcSource, VisibleChangeRow, read_visible_cdc_entries_with_source,
     read_visible_change_rows,
 };
-use nanograph::{ParamMap, lower_query};
+use nanograph::{ParamMap, build_catalog, lower_query};
 use schema_ops::{cmd_migrate, cmd_schema_diff, schema_compatibility_label};
 use ui::{
     StatusTone, format_status_line, stderr_supports_color, stdout_supports_color, style_key,
@@ -306,14 +307,14 @@ enum Commands {
         #[command(subcommand)]
         command: StorageCommands,
     },
-    /// Parse and typecheck query files
-    Check {
+    /// Lint query files against a schema or database
+    Lint {
         /// Database directory
         #[arg(long)]
         db: Option<PathBuf>,
         #[arg(long)]
         query: PathBuf,
-        /// Desired schema file for stale-schema diagnostics
+        /// Schema file to lint against; defaults to <db>/schema.pg when --db is provided
         #[arg(long)]
         schema: Option<PathBuf>,
     },
@@ -617,11 +618,15 @@ async fn dispatch_cli(
                 cmd_storage_migrate(&db_path, target, json, quiet).await
             }
         },
-        Commands::Check { db, query, schema } => {
-            let db = config.resolve_db_path(db)?;
+        Commands::Lint { db, query, schema } => {
+            let db = if db.is_some() {
+                config.resolve_optional_db_path(db)
+            } else {
+                None
+            };
             let query = config.resolve_query_path(&query)?;
             let schema = config.resolve_optional_schema_path(schema);
-            cmd_check(db, &query, schema.as_deref(), json, quiet).await
+            cmd_lint(db, &query, schema.as_deref(), json, quiet).await
         }
         Commands::Run {
             alias,
@@ -1859,6 +1864,169 @@ fn render_check_error(
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+struct LintFinding {
+    severity: String,
+    code: String,
+    message: String,
+    type_name: Option<String>,
+    property: Option<String>,
+    query_names: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct TypeMutationCoverage {
+    update_queries: Vec<String>,
+    update_props: HashMap<String, Vec<String>>,
+}
+
+fn sorted_unique(mut values: Vec<String>) -> Vec<String> {
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn push_unique(target: &mut Vec<String>, value: &str) {
+    if !target.iter().any(|existing| existing == value) {
+        target.push(value.to_string());
+    }
+}
+
+fn record_property_query(
+    by_property: &mut HashMap<String, Vec<String>>,
+    property: &str,
+    query_name: &str,
+) {
+    let entries = by_property.entry(property.to_string()).or_default();
+    push_unique(entries, query_name);
+}
+
+fn load_lint_schema(
+    db_path: Option<&Path>,
+    schema_path: Option<&Path>,
+) -> Result<(PathBuf, nanograph::schema::ast::SchemaFile, Option<SchemaDriftSummary>)> {
+    let (schema_path, schema_source, drift) = match (db_path, schema_path) {
+        (Some(db_path), Some(schema_path)) => (
+            schema_path.to_path_buf(),
+            std::fs::read_to_string(schema_path)
+                .wrap_err_with(|| format!("failed to read schema: {}", schema_path.display()))?,
+            Some(load_schema_drift_summary(db_path, schema_path)?),
+        ),
+        (_, Some(schema_path)) => (
+            schema_path.to_path_buf(),
+            std::fs::read_to_string(schema_path)
+                .wrap_err_with(|| format!("failed to read schema: {}", schema_path.display()))?,
+            None,
+        ),
+        (Some(db_path), None) => {
+            let schema_path = db_path.join("schema.pg");
+            (
+                schema_path.clone(),
+                std::fs::read_to_string(&schema_path).wrap_err_with(|| {
+                    format!("failed to read schema: {}", schema_path.display())
+                })?,
+                None,
+            )
+        }
+        (None, None) => {
+            return Err(eyre!(
+                "lint requires --schema <schema.pg> or --db <db_path>"
+            ));
+        }
+    };
+
+    let schema = parse_schema_or_report(&schema_path, &schema_source)?;
+    Ok((schema_path, schema, drift))
+}
+
+fn collect_type_mutation_coverage(
+    valid_mutations: &[(String, Mutation)],
+) -> HashMap<String, TypeMutationCoverage> {
+    let mut coverage: HashMap<String, TypeMutationCoverage> = HashMap::new();
+
+    for (query_name, mutation) in valid_mutations {
+        match mutation {
+            Mutation::Update(update) => {
+                let entry = coverage.entry(update.type_name.clone()).or_default();
+                push_unique(&mut entry.update_queries, query_name);
+                for assignment in &update.assignments {
+                    record_property_query(&mut entry.update_props, &assignment.property, query_name);
+                }
+            }
+            Mutation::Insert(_) | Mutation::Delete(_) => {}
+        }
+    }
+
+    coverage
+}
+
+fn build_lint_findings(
+    schema: &nanograph::schema::ast::SchemaFile,
+    valid_mutations: &[(String, Mutation)],
+) -> Vec<LintFinding> {
+    let coverage = collect_type_mutation_coverage(valid_mutations);
+    let mut findings = Vec::new();
+
+    for declaration in &schema.declarations {
+        let SchemaDecl::Node(node) = declaration else {
+            continue;
+        };
+        let Some(type_coverage) = coverage.get(&node.name) else {
+            continue;
+        };
+        if type_coverage.update_queries.is_empty() {
+            continue;
+        }
+
+        let derived_media_props = node
+            .properties
+            .iter()
+            .filter_map(|prop| annotation_value(&prop.annotations, "media_uri"))
+            .map(ToOwned::to_owned)
+            .collect::<HashSet<_>>();
+        let query_names = sorted_unique(type_coverage.update_queries.clone());
+
+        for prop in &node.properties {
+            if !prop.prop_type.nullable {
+                continue;
+            }
+            if has_annotation(&prop.annotations, "key") {
+                continue;
+            }
+            if annotation_value(&prop.annotations, "embed").is_some() {
+                continue;
+            }
+            if derived_media_props.contains(&prop.name) {
+                continue;
+            }
+            if type_coverage.update_props.contains_key(&prop.name) {
+                continue;
+            }
+
+            findings.push(LintFinding {
+                severity: "warning".to_string(),
+                code: "L201".to_string(),
+                message: format!(
+                    "{}.{} exists in schema but no update query sets it",
+                    node.name, prop.name
+                ),
+                type_name: Some(node.name.clone()),
+                property: Some(prop.name.clone()),
+                query_names: query_names.clone(),
+            });
+        }
+    }
+
+    findings.sort_by(|left, right| {
+        left.severity
+            .cmp(&right.severity)
+            .then_with(|| left.type_name.cmp(&right.type_name))
+            .then_with(|| left.property.cmp(&right.property))
+            .then_with(|| left.message.cmp(&right.message))
+    });
+    findings
+}
+
 #[derive(Debug, Clone)]
 enum RunExecutionClass {
     LanceFirst(LanceFirstRunPlan),
@@ -2346,26 +2514,27 @@ async fn cmd_doctor(
     }
 }
 
-#[instrument(skip(query_path), fields(db_path = %db_path.display(), query_path = %query_path.display()))]
-async fn cmd_check(
-    db_path: PathBuf,
+#[instrument(skip(query_path), fields(query_path = %query_path.display()))]
+async fn cmd_lint(
+    db_path: Option<PathBuf>,
     query_path: &PathBuf,
-    desired_schema_path: Option<&Path>,
+    schema_path: Option<&Path>,
     json: bool,
     quiet: bool,
 ) -> Result<()> {
     let query_src = std::fs::read_to_string(query_path)
         .wrap_err_with(|| format!("failed to read query: {}", query_path.display()))?;
-    let metadata = DatabaseMetadata::open(&db_path)?;
-    let catalog = metadata.catalog().clone();
-    let schema_drift = desired_schema_path
-        .map(|path| load_schema_drift_summary(&db_path, path))
-        .transpose()?;
+    let (effective_schema_path, schema, schema_drift) =
+        load_lint_schema(db_path.as_deref(), schema_path)?;
+    let catalog = build_catalog(&schema)?;
 
     let queries = parse_query_or_report(query_path, &query_src)?;
 
     let mut error_count = 0;
+    let mut warning_count = 0;
+    let mut info_count = 0;
     let mut checks = Vec::with_capacity(queries.queries.len());
+    let mut valid_mutations = Vec::new();
     for q in &queries.queries {
         let mutation_warning = (q.mutation.is_some() && q.params.is_empty()).then(|| {
             "mutation declares no params; hardcoded mutations are easy to miss".to_string()
@@ -2389,6 +2558,12 @@ async fn cmd_check(
                 }));
             }
             Ok(CheckedQuery::Mutation(_)) => {
+                if let Some(mutation) = &q.mutation {
+                    valid_mutations.push((q.name.clone(), mutation.clone()));
+                }
+                if mutation_warning.is_some() {
+                    warning_count += 1;
+                }
                 if !json && !quiet {
                     println!(
                         "{}",
@@ -2420,7 +2595,11 @@ async fn cmd_check(
                 checks.push(check);
             }
             Err(e) => {
-                let rendered_error = render_check_error(&e, &db_path, schema_drift.as_ref());
+                let rendered_error = if let Some(db_path) = db_path.as_deref() {
+                    render_check_error(&e, db_path, schema_drift.as_ref())
+                } else {
+                    e.to_string()
+                };
                 if !json {
                     let message = format_status_line(
                         StatusTone::Error,
@@ -2448,15 +2627,41 @@ async fn cmd_check(
         }
     }
 
+    let findings = build_lint_findings(&schema, &valid_mutations);
+    for finding in &findings {
+        match finding.severity.as_str() {
+            "error" => error_count += 1,
+            "warning" => warning_count += 1,
+            "info" => info_count += 1,
+            _ => {}
+        }
+
+        if !json && !quiet {
+            let tone = match finding.severity.as_str() {
+                "error" => StatusTone::Error,
+                "warning" => StatusTone::Warn,
+                _ => StatusTone::Info,
+            };
+            println!(
+                "{}",
+                format_status_line(tone, &finding.message, stdout_supports_color())
+            );
+        }
+    }
+
     if json {
         println!(
             "{}",
             serde_json::json!({
                 "status": if error_count == 0 { "ok" } else { "error" },
+                "schema_path": effective_schema_path.display().to_string(),
                 "query_path": query_path.display().to_string(),
                 "queries_processed": queries.queries.len(),
                 "errors": error_count,
+                "warnings": warning_count,
+                "infos": info_count,
                 "results": checks,
+                "findings": findings,
             })
         );
     } else if !quiet {
@@ -2465,8 +2670,11 @@ async fn cmd_check(
             format_status_line(
                 StatusTone::Info,
                 &format!(
-                    "Check complete: {} queries processed",
-                    queries.queries.len()
+                    "Lint complete: {} queries processed ({} error(s), {} warning(s), {} info item(s))",
+                    queries.queries.len(),
+                    error_count,
+                    warning_count,
+                    info_count
                 ),
                 stdout_supports_color()
             )
@@ -2475,10 +2683,10 @@ async fn cmd_check(
     if error_count > 0 {
         if json {
             return Err(
-                RenderedJsonError(format!("{} query(s) failed typecheck", error_count)).into(),
+                RenderedJsonError(format!("lint detected {} error(s)", error_count)).into(),
             );
         }
-        return Err(eyre!("{} query(s) failed typecheck", error_count));
+        return Err(eyre!("lint detected {} error(s)", error_count));
     }
     Ok(())
 }

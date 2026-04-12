@@ -340,7 +340,7 @@ The parser treats many terms as contextual keywords. Avoid using them as identif
 
 ## Type rules
 
-The compiler enforces these rules during `nanograph check`:
+The compiler enforces these rules during `nanograph lint`:
 
 | Rule | What it checks |
 |------|----------------|

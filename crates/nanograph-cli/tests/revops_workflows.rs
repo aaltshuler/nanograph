@@ -7,7 +7,7 @@ fn revops_trace_search_and_mutation_workflows_work() {
     let workspace = ExampleWorkspace::copy(ExampleProject::Revops);
     workspace.init();
     workspace.load();
-    workspace.check();
+    workspace.lint();
 
     let all_clients = workspace.json_rows(&[
         "run",

@@ -14,7 +14,7 @@ cd examples/starwars
 
 nanograph init
 nanograph load --data starwars.jsonl --mode overwrite
-nanograph check --query starwars.gq
+nanograph lint --query starwars.gq
 ```
 
 This example includes:

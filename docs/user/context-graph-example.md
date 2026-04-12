@@ -19,7 +19,7 @@ cd examples/revops
 
 nanograph init
 nanograph load --data revops.jsonl --mode overwrite
-nanograph check --query revops.gq
+nanograph lint --query revops.gq
 ```
 
 The example config gives you:

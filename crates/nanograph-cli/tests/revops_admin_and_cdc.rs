@@ -72,10 +72,10 @@ query delete_task() {
 "#,
     );
 
-    let check = workspace.json_value(&["--json", "check", "--query", "admin_mutations.gq"]);
+    let check = workspace.json_value(&["--json", "lint", "--query", "admin_mutations.gq"]);
     assert_eq!(check["status"], "ok");
 
-    let bad = workspace.run_fail(&["check", "--query", "invalid_enum.gq"]);
+    let bad = workspace.run_fail(&["lint", "--query", "invalid_enum.gq"]);
     assert!(bad.stdout.contains("expects one of"));
 
     let insert = workspace.jsonl_rows(&[
@@ -318,7 +318,7 @@ query delete_task() {
 }
 
 #[test]
-fn check_warns_about_zero_param_mutations() {
+fn lint_warns_about_zero_param_mutations() {
     let workspace = ExampleWorkspace::copy(ExampleProject::Starwars);
     workspace.init();
     workspace.load();
@@ -331,7 +331,7 @@ fn check_warns_about_zero_param_mutations() {
 "#,
     );
 
-    let check = workspace.json_value(&["--json", "check", "--query", "hardcoded_mutation.gq"]);
+    let check = workspace.json_value(&["--json", "lint", "--query", "hardcoded_mutation.gq"]);
     assert_eq!(check["status"], "ok");
     let results = check["results"].as_array().unwrap();
     assert_eq!(results.len(), 1);
@@ -342,8 +342,52 @@ fn check_warns_about_zero_param_mutations() {
     );
 
     let human = workspace
-        .run_ok(&["check", "--query", "hardcoded_mutation.gq"])
+        .run_ok(&["lint", "--query", "hardcoded_mutation.gq"])
         .stdout;
     assert!(human.contains("query `add_training_parent` (mutation)"));
     assert!(human.contains("hardcoded mutations are easy to miss"));
+}
+
+#[test]
+fn lint_warns_when_nullable_schema_field_has_no_update_coverage() {
+    let workspace = ExampleWorkspace::copy(ExampleProject::Starwars);
+
+    workspace.write_file(
+        "policy.pg",
+        r#"node Policy {
+    slug: String @key
+    status: String
+    effectiveTo: DateTime?
+}"#,
+    );
+    workspace.write_file(
+        "policy.gq",
+        r#"query update_policy($slug: String, $status: String) {
+    update Policy set { status: $status } where slug = $slug
+}"#,
+    );
+
+    let lint = workspace.json_value(&[
+        "--json",
+        "lint",
+        "--schema",
+        "policy.pg",
+        "--query",
+        "policy.gq",
+    ]);
+    assert_eq!(lint["status"], "ok");
+    assert_eq!(lint["errors"], 0);
+    assert_eq!(lint["warnings"], 1);
+    let findings = lint["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0]["severity"], "warning");
+    assert_eq!(findings[0]["code"], "L201");
+    assert_eq!(findings[0]["type_name"], "Policy");
+    assert_eq!(findings[0]["property"], "effectiveTo");
+    assert!(
+        findings[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Policy.effectiveTo exists in schema but no update query sets it")
+    );
 }

@@ -131,18 +131,26 @@ Useful modes:
 
 See [embeddings.md](embeddings.md) for provider behavior, media support, and recompute guidance.
 
-### `check`
+### `lint`
 
-Parse and typecheck a query file without executing.
+Lint a query file against a schema without executing it.
 
 ```bash
-nanograph check [--db <db_path>] --query <queries.gq> [--schema <schema.pg>]
+nanograph lint [--db <db_path>] --query <queries.gq> [--schema <schema.pg>]
 ```
 
-If the provided query path is relative and not found directly, `nanograph` also searches the configured `query.roots` from `nanograph.toml`.
-If `db.default_path` is set in `nanograph.toml`, `--db` can be omitted.
-If `schema.default_path` is set in `nanograph.toml`, `check` also uses it for stale-schema diagnostics. When a query references a type or property that is missing from the current DB schema, `--schema` helps `check` tell you whether the desired schema differs and whether you likely need `nanograph migrate`.
-Successful checks warn when a mutation declares zero params, because hardcoded mutations are easy to miss during review and automation.
+`lint` always parses the query file, typechecks every query, and then runs whole-file query coverage checks.
+
+Schema selection works like this:
+
+- If `--schema` is provided, `lint` validates against that schema file directly.
+- Otherwise, if `--db` is provided, `lint` uses `<db>/schema.pg`.
+- If the provided query path is relative and not found directly, `nanograph` also searches the configured `query.roots` from `nanograph.toml`.
+
+Successful lints currently warn when:
+
+- a mutation declares zero params, because hardcoded mutations are easy to miss during review and automation
+- a nullable node property exists in the schema but no valid update query sets it
 
 ### `run`
 

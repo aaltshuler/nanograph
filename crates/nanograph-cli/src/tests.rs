@@ -597,14 +597,14 @@ async fn load_mode_append_and_merge_behave_as_expected() {
 }
 
 #[test]
-fn check_and_run_allow_db_to_be_resolved_later() {
-    let check = Cli::try_parse_from(["nanograph", "check", "--query", "/tmp/q.gq"]).unwrap();
-    match check.command {
-        Commands::Check { db, query, .. } => {
+fn lint_and_run_allow_db_to_be_resolved_later() {
+    let lint = Cli::try_parse_from(["nanograph", "lint", "--query", "/tmp/q.gq"]).unwrap();
+    match lint.command {
+        Commands::Lint { db, query, .. } => {
             assert!(db.is_none());
             assert_eq!(query, PathBuf::from("/tmp/q.gq"));
         }
-        _ => panic!("expected check command"),
+        _ => panic!("expected lint command"),
     }
 
     let run = Cli::try_parse_from(["nanograph", "run", "search", "--param", "q=hello"]).unwrap();
@@ -1443,7 +1443,7 @@ async fn describe_uses_manifest_metadata_without_opening_datasets() {
 }
 
 #[tokio::test]
-async fn check_uses_schema_ir_without_opening_datasets() {
+async fn lint_uses_schema_file_without_opening_datasets() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("db");
     let schema_path = dir.path().join("schema.pg");
@@ -1484,7 +1484,7 @@ query people() {
         .unwrap();
     std::fs::remove_dir_all(db_path.join(dataset_path)).unwrap();
 
-    cmd_check(db_path, &query_path, None, true, true)
+    cmd_lint(Some(db_path), &query_path, None, true, true)
         .await
         .unwrap();
 }

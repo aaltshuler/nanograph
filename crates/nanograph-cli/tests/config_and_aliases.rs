@@ -7,7 +7,7 @@ fn starwars_config_aliases_and_metadata_work() {
     let workspace = ExampleWorkspace::copy(ExampleProject::Starwars);
     workspace.init();
     workspace.load();
-    workspace.check();
+    workspace.lint();
 
     let describe = workspace
         .run_ok(&["describe", "--type", "Character", "--format", "json"])
@@ -55,7 +55,7 @@ fn revops_aliases_and_query_roots_work() {
     let workspace = ExampleWorkspace::copy(ExampleProject::Revops);
     workspace.init();
     workspace.load();
-    workspace.check();
+    workspace.lint();
 
     let table = workspace
         .run_ok(&["run", "why", "opp-stripe-migration"])
@@ -90,7 +90,7 @@ fn revops_mutation_aliases_work() {
     let workspace = ExampleWorkspace::copy(ExampleProject::Revops);
     workspace.init();
     workspace.load();
-    workspace.check();
+    workspace.lint();
 
     let inserted = workspace.jsonl_rows(&["run", "capture"]);
     assert_eq!(scalar_string(&inserted[0]["affected_nodes"]), "1");

@@ -12,7 +12,7 @@ nanograph is designed to give people and agents a safe, structured way to work w
 - Run nanograph commands from the directory where `nanograph.toml` lives so project defaults resolve correctly.
 - Use mutation queries for data changes so updates stay targeted and history remains intact.
 - Put `@key` on every node type so updates, merges, and edge wiring stay reliable.
-- After editing `.gq` or `.pg` files, run `nanograph check --query <file>` before executing anything else.
+- After editing `.gq` or `.pg` files, run `nanograph lint --query <file>` before executing anything else.
 - Use `--json`, `--format json`, or `--format jsonl` when output will be consumed by agents or tooling.
 
 ## Project setup
@@ -118,7 +118,7 @@ This project uses a nanograph database at `app.nano`.
 - Use `nanograph describe --format json` before querying
 - Use mutation queries for data changes — never export/edit/reimport JSONL
 - Use `nanograph run <alias>` instead of constructing raw `--query` / `--name` / `--param` calls
-- After editing `.gq` or `.pg`, run `nanograph check --query <file>`
+- After editing `.gq` or `.pg`, run `nanograph lint --query <file>`
 - Never commit `.env.nano`
 - Use `--format json` or `--format jsonl` for machine-readable output
 ```
@@ -307,7 +307,7 @@ Write these annotations when creating the schema or query. They cost nothing and
 No query or schema edit is complete until `check` passes:
 
 ```bash
-nanograph check --query queries.gq
+nanograph lint --query queries.gq
 ```
 
 This catches wrong property names, type mismatches, invalid traversals, missing parameters, and malformed mutations.
@@ -439,7 +439,7 @@ nanograph embed --only-null --reindex
 Schema and query edits should follow this sequence:
 
 1. Edit `.pg` and/or `.gq`.
-2. Typecheck: `nanograph check --query queries.gq`.
+2. Lint: `nanograph lint --query queries.gq`.
 3. If the schema changed: `nanograph migrate` (preview with `--dry-run` first).
 4. If `@embed(...)` fields changed: `nanograph embed --only-null`.
 5. Smoke test: `nanograph run <alias>`.
@@ -549,7 +549,7 @@ Common mistakes:
 | No aliases or missing alias `format` | Alias every important agent operation |
 | Guessing schema instead of calling `describe` | Run `nanograph describe --format json` first |
 | Global search plus post-filtering | Traverse first, then rank |
-| Editing `.gq`/`.pg` without typechecking | Run `nanograph check` after every edit |
+| Editing `.gq`/`.pg` without linting | Run `nanograph lint` after every edit |
 | Hardcoded values in mutations | Parameterize everything |
 | Missing embeddings after `@embed` changes | Run `nanograph embed --only-null` |
 | Skipping post-change workflow | Edit → check → migrate → embed → smoke test |

@@ -333,7 +333,7 @@ fn load_json_failure_emits_json_to_stdout_only() {
 }
 
 #[test]
-fn check_json_failure_emits_summary_without_stderr_leak() {
+fn lint_json_failure_emits_summary_without_stderr_leak() {
     let workspace = ExampleWorkspace::copy(ExampleProject::Revops);
     workspace.init();
     workspace.load();
@@ -352,7 +352,7 @@ fn check_json_failure_emits_summary_without_stderr_leak() {
 }"#,
     );
 
-    let result = workspace.run_fail(&["--json", "check", "--query", "invalid_enum.gq"]);
+    let result = workspace.run_fail(&["--json", "lint", "--query", "invalid_enum.gq"]);
     let value = parse_json_value(&result.stdout);
     assert_eq!(value["status"], "error");
     assert_eq!(value["errors"], 1);

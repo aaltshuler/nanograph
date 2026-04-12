@@ -95,7 +95,7 @@ nanograph run debut anakin-skywalker
 Queries are typechecked against the schema — wrong property names, type mismatches, and invalid traversals are caught before execution:
 
 ```bash
-nanograph check --query starwars.gq
+nanograph lint --query starwars.gq
 ```
 
 ## Next steps
