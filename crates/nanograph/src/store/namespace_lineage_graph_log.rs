@@ -12,6 +12,7 @@ use crate::store::graph_types::{
 };
 use crate::store::lance_io::{
     append_lance_batch_at_version, cleanup_unpublished_manifest_versions,
+    latest_lance_dataset_version,
 };
 use crate::store::manifest::{DatasetEntry, GraphManifest};
 use crate::store::metadata::DatasetLocator;
@@ -38,11 +39,11 @@ async fn load_existing_internal_entry(
         Ok(location) => location,
         Err(_) => return Ok(None),
     };
+    let location_path = std::path::PathBuf::from(location.strip_prefix("file://").unwrap_or(&location));
+    let version = latest_lance_dataset_version(&location_path).await?;
     let dataset = Dataset::open(&location)
         .await
-        .map_err(|err| NanoError::Lance(format!("open {} error: {}", table_id, err)))?;
-    let version = dataset.version().version;
-    let row_count = dataset
+        .map_err(|err| NanoError::Lance(format!("open {} error: {}", table_id, err)))?
         .checkout_version(version)
         .await
         .map_err(|err| {
@@ -50,7 +51,8 @@ async fn load_existing_internal_entry(
                 "checkout {} version {} error: {}",
                 table_id, version, err
             ))
-        })?
+        })?;
+    let row_count = dataset
         .count_rows(None)
         .await
         .map_err(|err| NanoError::Lance(format!("count {} rows error: {}", table_id, err)))?

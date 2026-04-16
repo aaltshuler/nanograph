@@ -9,7 +9,6 @@ use lance_index::DatasetIndexExt;
 use tempfile::TempDir;
 
 use nanograph::schema::parser::parse_schema;
-use nanograph::schema_ir::SchemaIR;
 use nanograph::store::database::Database;
 use nanograph::store::export::build_export_rows_at_path;
 use nanograph::store::migration::{
@@ -217,6 +216,19 @@ fn sample_data() -> &'static str {
 {"type":"User","data":{"name":"Bob","age":null}}
 {"edge":"knows","from":"Alice","to":"Bob"}
 "#
+}
+
+fn dataset_rel_path_for(
+    manifest: &nanograph::store::manifest::GraphManifest,
+    kind: &str,
+    type_name: &str,
+) -> String {
+    manifest
+        .datasets
+        .iter()
+        .find(|entry| entry.kind == kind && entry.type_name == type_name)
+        .map(|entry| entry.dataset_path.clone())
+        .unwrap()
 }
 
 fn edge_order_bug_base_schema() -> &'static str {
@@ -494,13 +506,8 @@ async fn migration_requires_confirmation_for_drop_property() {
         .expect("apply with auto-approve");
     assert_eq!(applied.status, MigrationStatus::Applied);
 
-    let db = Database::open(&db_path).await.expect("re-open migrated db");
-    let user = db
-        .schema_ir
-        .node_types()
-        .find(|node| node.name == "User")
-        .expect("user node type");
-    let dataset_path = db_path.join("nodes").join(SchemaIR::dir_name(user.type_id));
+    let manifest = read_committed_graph_snapshot(&db_path).expect("read manifest");
+    let dataset_path = db_path.join(dataset_rel_path_for(&manifest, "node", "User"));
     let dataset = Dataset::open(dataset_path.to_string_lossy().as_ref())
         .await
         .expect("open user dataset");
@@ -731,7 +738,8 @@ async fn migration_builds_scalar_indexes_for_indexed_properties() {
         .node_types()
         .find(|n| n.name == "User")
         .expect("user node");
-    let dataset_path = db_path.join("nodes").join(SchemaIR::dir_name(user.type_id));
+    let manifest = read_committed_graph_snapshot(&db_path).expect("read manifest");
+    let dataset_path = db_path.join(dataset_rel_path_for(&manifest, "node", "User"));
     let dataset = Dataset::open(dataset_path.to_string_lossy().as_ref())
         .await
         .expect("open user dataset");

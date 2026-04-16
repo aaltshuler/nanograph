@@ -9,6 +9,7 @@ use std::time::Instant;
 use lance::Dataset;
 use nanograph::store::database::{Database, DeleteOp, DeletePredicate, LoadMode};
 use nanograph::store::manifest::{DatasetEntry, GraphManifest};
+use nanograph::store::snapshot::read_committed_graph_snapshot;
 use tempfile::TempDir;
 
 fn schema_source() -> &'static str {
@@ -284,7 +285,7 @@ async fn setup_db(rows: usize) -> (TempDir, PathBuf, Database) {
 
 async fn run_append_scenario(rows: usize) -> ScenarioMetrics {
     let (_dir, db_path, db) = setup_db(rows).await;
-    let before_manifest = GraphManifest::read(&db_path).expect("read manifest");
+    let before_manifest = read_committed_graph_snapshot(&db_path).expect("read manifest");
     let before_person = snapshot_dataset(&db_path, &before_manifest, "node", "Person").await;
     let before_knows = snapshot_dataset(&db_path, &before_manifest, "edge", "Knows").await;
 
@@ -299,7 +300,7 @@ async fn run_append_scenario(rows: usize) -> ScenarioMetrics {
         .expect("append mutation");
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-    let after_manifest = GraphManifest::read(&db_path).expect("read manifest");
+    let after_manifest = read_committed_graph_snapshot(&db_path).expect("read manifest");
     let after_person = snapshot_dataset(&db_path, &after_manifest, "node", "Person").await;
     let after_knows = snapshot_dataset(&db_path, &after_manifest, "edge", "Knows").await;
 
@@ -319,7 +320,7 @@ async fn run_append_scenario(rows: usize) -> ScenarioMetrics {
 
 async fn run_update_scenario(rows: usize) -> ScenarioMetrics {
     let (_dir, db_path, db) = setup_db(rows).await;
-    let before_manifest = GraphManifest::read(&db_path).expect("read manifest");
+    let before_manifest = read_committed_graph_snapshot(&db_path).expect("read manifest");
     let before_person = snapshot_dataset(&db_path, &before_manifest, "node", "Person").await;
     let before_knows = snapshot_dataset(&db_path, &before_manifest, "edge", "Knows").await;
 
@@ -335,7 +336,7 @@ async fn run_update_scenario(rows: usize) -> ScenarioMetrics {
         .expect("update mutation");
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-    let after_manifest = GraphManifest::read(&db_path).expect("read manifest");
+    let after_manifest = read_committed_graph_snapshot(&db_path).expect("read manifest");
     let after_person = snapshot_dataset(&db_path, &after_manifest, "node", "Person").await;
     let after_knows = snapshot_dataset(&db_path, &after_manifest, "edge", "Knows").await;
 
@@ -355,7 +356,7 @@ async fn run_update_scenario(rows: usize) -> ScenarioMetrics {
 
 async fn run_delete_scenario(rows: usize) -> ScenarioMetrics {
     let (_dir, db_path, db) = setup_db(rows).await;
-    let before_manifest = GraphManifest::read(&db_path).expect("read manifest");
+    let before_manifest = read_committed_graph_snapshot(&db_path).expect("read manifest");
     let before_person = snapshot_dataset(&db_path, &before_manifest, "node", "Person").await;
     let before_knows = snapshot_dataset(&db_path, &before_manifest, "edge", "Knows").await;
 
@@ -373,7 +374,7 @@ async fn run_delete_scenario(rows: usize) -> ScenarioMetrics {
     .expect("delete mutation");
     let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-    let after_manifest = GraphManifest::read(&db_path).expect("read manifest");
+    let after_manifest = read_committed_graph_snapshot(&db_path).expect("read manifest");
     let after_person = snapshot_dataset(&db_path, &after_manifest, "node", "Person").await;
     let after_knows = snapshot_dataset(&db_path, &after_manifest, "edge", "Knows").await;
 

@@ -433,7 +433,12 @@ fn doctor_reports_schema_drift_against_desired_schema() {
     let storage_formats = value["dataset_storage_formats"]
         .as_array()
         .expect("dataset storage formats");
-    assert!(storage_formats.is_empty());
+    assert!(!storage_formats.is_empty());
+    assert!(
+        storage_formats
+            .iter()
+            .all(|dataset| dataset["storage_version"] == "2.2")
+    );
 }
 
 #[test]

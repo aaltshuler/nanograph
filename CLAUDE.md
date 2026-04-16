@@ -157,7 +157,7 @@ Type IDs are FNV-1a hashes of `"node:TypeName"` / `"edge:TypeName"` → u32 hex.
 
 ### CLI Commands
 
-All commands support `--json` global flag for structured output. Core: `init`, `load` (requires `--mode overwrite|append|merge`), `check`, `run` (`--format table|csv|jsonl|json`, `--param key=value`), `delete`, `migrate`. Inspection: `version`, `describe`, `export`. Maintenance: `compact`, `cleanup`, `doctor`, `cdc-materialize`, `changes`. Run `nanograph <command> --help` for full flag details.
+All commands support `--json` global flag for structured output. Core: `init`, `load` (requires `--mode overwrite|append|merge`), `lint` (query static checking against schema/DB), `run` (`--format table|kv|csv|jsonl|json`, `--param key=value`, positional `alias` + args for `[query_aliases]`), `delete`, `embed` (backfill `@embed` properties), `migrate`. Inspection: `version`, `describe`, `export`, `schema-diff`. Maintenance: `compact`, `cleanup`, `doctor`, `cdc-materialize`, `changes`. Storage transitions: `storage migrate --target lance-v4|lineage-native`. The former `check` subcommand was replaced by `lint` — any reference in older docs or the README should be treated as stale. Run `nanograph <command> --help` for full flag details.
 
 ### Type System
 
@@ -221,20 +221,17 @@ See `.env.example` for reference.
 
 ## Version Constraints
 
-Arrow 57, DataFusion 52, Lance 3.0 + lance-index 3.0 — these must stay compatible with each other. Pest 2 for both grammars. napi/napi-derive 2 for TS SDK. Dependencies use sub-crates, not monolithic packages: `arrow-array`, `arrow-schema`, `arrow-select`, `arrow-cast`, `arrow-ord` (not `arrow`); `datafusion-physical-plan`, `datafusion-physical-expr`, `datafusion-execution`, `datafusion-common`, `datafusion-expr`, `datafusion-functions-aggregate` (not `datafusion`). Import accordingly. All dependency versions are centralized in the root `Cargo.toml` under `[workspace.dependencies]` — add or update versions there, then reference with `dep.workspace = true` in crate-level Cargo.toml files.
+Arrow 57, DataFusion 52, Lance 4.0 + lance-index 4.0 + lance-namespace 4.0 — these must stay compatible with each other. Pest 2 for both grammars. napi/napi-derive 2 for TS SDK. Dependencies use sub-crates, not monolithic packages: `arrow-array`, `arrow-schema`, `arrow-select`, `arrow-cast`, `arrow-ord` (not `arrow`); `datafusion-physical-plan`, `datafusion-physical-expr`, `datafusion-execution`, `datafusion-common`, `datafusion-expr`, `datafusion-functions-aggregate` (not `datafusion`). Import accordingly. All dependency versions are centralized in the root `Cargo.toml` under `[workspace.dependencies]` — add or update versions there, then reference with `dep.workspace = true` in crate-level Cargo.toml files.
 
 ## Design Documents
 
 - `grammar.ebnf` — formal grammar for both DSLs, includes type rules (T1-T21; T10-T14 cover mutations, T15-T21 cover search/ordering)
 - `docs/dev/release-checklist.md` — release process steps
-- `docs/dev/fixes.md` — architectural issues and solutions map
-- `docs/dev/cdc-wal-proposal.md` — WAL-first CDC architecture proposal
-- `docs/dev/storage-modes.md` — full graph in memory vs on-demand analysis
-- `docs/dev/dataset-sharding.md` — per-type dataset justification
-- `docs/dev/distributed-architecture.md` — scaling from embedded to distributed
-- `docs/dev/nano-omni.md` — product roadmap (NanoGraph embedded vs Omnigraph repo-native)
+- `docs/dev/embeddings-dev.md` — embedding pipeline internals
+- `docs/dev/swift-sdk.md`, `docs/dev/typescript-sdk.md` — SDK build/release notes
+- `docs/dev/release-notes-v*.md` — per-release notes
 
-User-facing docs live in `docs/user/` — schema, queries, search, config, CLI reference, worked examples, and `best-practices.md` (agent anti-patterns and operational guidelines).
+User-facing docs live in `docs/user/` — `schema.md`, `queries.md`, `search.md`, `config.md`, `cli-reference.md`, `quick-start.md`, `embeddings.md`, `blobs.md`, `lance-migration.md`, `skills.md`, worked examples (`starwars-example.md`, `context-graph-example.md`), and `best-practices.md` (agent anti-patterns and operational guidelines).
 
 Source of truth for behavior is code. Update docs in the same PR when behavior changes.
 
@@ -242,7 +239,7 @@ Source of truth for behavior is code. Update docs in the same PR when behavior c
 
 Test schemas, queries, and data live in `crates/nanograph/tests/fixtures/` (test.pg, test.gq, test.jsonl). Runnable examples in `examples/starwars/` and `examples/revops/`. Library integration tests: `engine_integration.rs` (core query engine), `schema_migration.rs` (schema evolution). Performance harnesses (run with `--ignored`): `index_perf.rs`, `write_amp_perf.rs`, `json_output_perf.rs`.
 
-CLI integration tests (Rust) in `crates/nanograph-cli/tests/` with shared helpers in `common/mod.rs`. Test files: `bootstrap_and_env`, `bug_regressions`, `config_and_aliases`, `config_failures`, `display_formats`, `docs_and_output`, `load_modes_and_export`, `revops_admin_and_cdc`, `revops_workflows`, `schema_analysis`, `starwars_export_roundtrip`, `starwars_workflows`.
+CLI integration tests (Rust) in `crates/nanograph-cli/tests/` with shared helpers in `common/mod.rs`. Test files: `bootstrap_and_env`, `bug_regressions`, `config_and_aliases`, `config_failures`, `display_formats`, `docs_and_output`, `embed_command`, `graph_mirror`, `load_modes_and_export`, `local_gemini_media`, `namespace_lineage`, `revops_admin_and_cdc`, `revops_workflows`, `runtime_values`, `schema_analysis`, `starwars_export_roundtrip`, `starwars_workflows`.
 
 Criterion benchmarks in `crates/nanograph/benches/`: `query_lookup`, `traversal`, `search`, `result_transport`. Shared setup in `benches/common/mod.rs`. Uses synthetic data and checked-in examples (starwars, revops). Legacy perf tests (`tests/*_perf.rs`, run with `--ignored`) are frozen — new benchmark work goes in `benches/`.
 

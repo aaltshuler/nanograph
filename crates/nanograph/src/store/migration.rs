@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
-use arrow_array::{ArrayRef, RecordBatch, UInt64Array, new_null_array};
+use arrow_array::{Array, ArrayRef, RecordBatch, StringArray, UInt64Array, new_null_array};
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::Catalog;
@@ -22,21 +22,29 @@ use crate::store::indexing::{
     rebuild_node_scalar_indexes, rebuild_node_text_indexes, rebuild_node_vector_indexes,
 };
 use crate::store::lance_io::{
-    latest_lance_dataset_version, read_lance_batches_for_locator, write_lance_batch,
+    latest_lance_dataset_version, read_lance_batches_for_locator,
+    read_lance_projected_batches_for_locator, write_lance_batch,
 };
 use crate::store::manifest::{DatasetEntry, GraphManifest, hash_string};
 use crate::store::metadata::{DatabaseMetadata, DatasetLocator};
 use crate::store::namespace::{
+    BLOB_STORE_TABLE_ID, GRAPH_CHANGES_TABLE_ID, GRAPH_DELETES_TABLE_ID, GRAPH_TX_TABLE_ID,
+    batch_publish_namespace_versions, namespace_published_version_for_table,
     open_directory_namespace, resolve_table_location, write_namespace_batch,
 };
-use crate::store::namespace_lineage_internal::merge_namespace_lineage_internal_dataset_entries;
+use crate::store::namespace_lineage_graph_log::{
+    ensure_graph_deletes_table, ensure_namespace_lineage_graph_tx_table,
+};
 use crate::store::snapshot::read_committed_graph_snapshot;
 use crate::store::storage_generation::{StorageGeneration, detect_storage_generation};
 use crate::store::txlog::{
     commit_graph_records_and_manifest_namespace_lineage, commit_manifest_and_logs,
 };
-use crate::store::v4_internal::merge_v4_internal_dataset_entries;
+use crate::store::v4_graph_log::{ensure_graph_changes_table, ensure_graph_tx_table};
 use crate::types::ScalarType;
+use crate::store::blob_store::{
+    ManagedBlobRow, current_blob_store_entry, managed_blob_batch, read_managed_blob_bytes,
+};
 
 const SCHEMA_PG_FILENAME: &str = "schema.pg";
 const SCHEMA_IR_FILENAME: &str = "schema.ir.json";
@@ -2256,6 +2264,7 @@ async fn apply_planned_migration(db_path: &Path, planned: &PlannedMigration) -> 
         std::fs::rename(db_path, &names.backup_path)?;
         let write_result = write_staged_db(
             db_path,
+            &names.backup_path,
             &planned.schema_source,
             &planned.new_ir,
             &new_storage,
@@ -2286,6 +2295,7 @@ async fn apply_planned_migration(db_path: &Path, planned: &PlannedMigration) -> 
     }
     write_staged_db(
         &names.staging_path,
+        db_path,
         &planned.schema_source,
         &planned.new_ir,
         &new_storage,
@@ -2687,6 +2697,7 @@ fn cast_array_if_needed(col: ArrayRef, target_prop: &PropDef) -> Result<ArrayRef
 
 async fn write_staged_db(
     path: &Path,
+    source_db_path: &Path,
     schema_source: &str,
     schema_ir: &SchemaIR,
     storage: &DatasetAccumulator,
@@ -2704,6 +2715,8 @@ async fn write_staged_db(
             std::fs::write(path.join(SCHEMA_PG_FILENAME), schema_source)?;
             std::fs::write(path.join(SCHEMA_IR_FILENAME), &ir_json)?;
             let namespace = open_directory_namespace(path).await?;
+            let blob_store_batch =
+                capture_blob_store_batch_for_migration(source_db_path, manifest_seed).await?;
             let mut dataset_entries = Vec::new();
 
             for node_def in schema_ir.node_types() {
@@ -2779,12 +2792,25 @@ async fn write_staged_db(
             manifest.datasets = dataset_entries;
             match generation {
                 StorageGeneration::V4Namespace => {
-                    merge_v4_internal_dataset_entries(path, &mut manifest.datasets).await?;
+                    preserve_committed_internal_dataset_entries(
+                        path,
+                        manifest_seed,
+                        generation,
+                        blob_store_batch.as_ref(),
+                        &mut manifest.datasets,
+                    )
+                    .await?;
                     commit_manifest_and_logs(path, &manifest, &[], "schema_migration")?;
                 }
                 StorageGeneration::NamespaceLineage => {
-                    merge_namespace_lineage_internal_dataset_entries(path, &mut manifest.datasets)
-                        .await?;
+                    preserve_committed_internal_dataset_entries(
+                        path,
+                        manifest_seed,
+                        generation,
+                        blob_store_batch.as_ref(),
+                        &mut manifest.datasets,
+                    )
+                    .await?;
                     let graph_commit = GraphCommitRecord {
                         tx_id: manifest.last_tx_id.clone().into(),
                         graph_version: manifest.db_version.into(),
@@ -2893,6 +2919,173 @@ async fn write_staged_db(
                 .to_string(),
         )),
     }
+}
+
+async fn preserve_committed_internal_dataset_entries(
+    path: &Path,
+    previous_manifest: &GraphManifest,
+    generation: StorageGeneration,
+    blob_store_batch: Option<&(RecordBatch, u64)>,
+    dataset_entries: &mut Vec<DatasetEntry>,
+) -> Result<()> {
+    match generation {
+        StorageGeneration::V4Namespace => {
+            dataset_entries.retain(|entry| {
+                !matches!(
+                    entry.effective_table_id(),
+                    GRAPH_TX_TABLE_ID | GRAPH_CHANGES_TABLE_ID | BLOB_STORE_TABLE_ID
+                )
+            });
+            dataset_entries.push(ensure_graph_tx_table(path).await?);
+            dataset_entries.push(ensure_graph_changes_table(path).await?);
+        }
+        StorageGeneration::NamespaceLineage => {
+            dataset_entries.retain(|entry| {
+                !matches!(
+                    entry.effective_table_id(),
+                    GRAPH_TX_TABLE_ID | GRAPH_DELETES_TABLE_ID | BLOB_STORE_TABLE_ID
+                )
+            });
+            dataset_entries.push(ensure_namespace_lineage_graph_tx_table(path).await?);
+            dataset_entries.push(ensure_graph_deletes_table(path).await?);
+        }
+    }
+
+    if let Some(blob_entry) = previous_manifest
+        .datasets
+        .iter()
+        .find(|entry| entry.effective_table_id() == BLOB_STORE_TABLE_ID)
+        .cloned()
+    {
+        dataset_entries.retain(|entry| entry.effective_table_id() != BLOB_STORE_TABLE_ID);
+        dataset_entries.push(
+            rewrite_blob_store_entry_for_migration(path, &blob_entry, blob_store_batch).await?,
+        );
+    }
+
+    Ok(())
+}
+
+async fn capture_blob_store_batch_for_migration(
+    source_db_path: &Path,
+    previous_manifest: &GraphManifest,
+) -> Result<Option<(RecordBatch, u64)>> {
+    let Some(previous_blob_entry) = previous_manifest
+        .datasets
+        .iter()
+        .find(|entry| entry.effective_table_id() == BLOB_STORE_TABLE_ID)
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    if previous_blob_entry.row_count == 0 {
+        return Ok(None);
+    }
+
+    let dataset_path = source_db_path.join(&previous_blob_entry.dataset_path);
+    let locator = DatasetLocator {
+        db_path: source_db_path.to_path_buf(),
+        table_id: BLOB_STORE_TABLE_ID.to_string(),
+        dataset_path,
+        dataset_version: previous_blob_entry.dataset_version,
+        row_count: previous_blob_entry.row_count,
+        namespace_managed: false,
+    };
+    let batches = read_lance_projected_batches_for_locator(
+        &locator,
+        &["blob_id", "mime", "source_hint", "created_at"],
+    )
+    .await?;
+    if batches.is_empty() {
+        return Err(NanoError::Storage(
+            "blob store migration capture found no batches".to_string(),
+        ));
+    }
+    let mut managed_rows = Vec::with_capacity(previous_blob_entry.row_count as usize);
+    for batch in batches {
+        let blob_ids = batch
+            .column_by_name("blob_id")
+            .ok_or_else(|| NanoError::Storage("blob store batch missing blob_id".to_string()))?
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| NanoError::Storage("blob_id column is not Utf8".to_string()))?;
+        let mimes = batch
+            .column_by_name("mime")
+            .ok_or_else(|| NanoError::Storage("blob store batch missing mime".to_string()))?
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| NanoError::Storage("mime column is not Utf8".to_string()))?;
+        let source_hints = batch
+            .column_by_name("source_hint")
+            .ok_or_else(|| NanoError::Storage("blob store batch missing source_hint".to_string()))?
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| NanoError::Storage("source_hint column is not Utf8".to_string()))?;
+        let created_ats = batch
+            .column_by_name("created_at")
+            .ok_or_else(|| NanoError::Storage("blob store batch missing created_at".to_string()))?
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| NanoError::Storage("created_at column is not Utf8".to_string()))?;
+
+        for row_idx in 0..batch.num_rows() {
+            let blob_id = blob_ids.value(row_idx);
+            let bytes = read_managed_blob_bytes(source_db_path, blob_id).await?;
+            managed_rows.push(ManagedBlobRow {
+                blob_id: blob_id.to_string(),
+                mime: mimes.value(row_idx).to_string(),
+                bytes,
+                source_hint: if source_hints.is_null(row_idx) {
+                    None
+                } else {
+                    Some(source_hints.value(row_idx).to_string())
+                },
+                created_at: created_ats.value(row_idx).to_string(),
+            });
+        }
+    }
+    let batch = managed_blob_batch(&managed_rows)?;
+    Ok(Some((batch, managed_rows.len() as u64)))
+}
+
+async fn rewrite_blob_store_entry_for_migration(
+    path: &Path,
+    previous_blob_entry: &DatasetEntry,
+    blob_store_batch: Option<&(RecordBatch, u64)>,
+) -> Result<DatasetEntry> {
+    if previous_blob_entry.row_count == 0 || blob_store_batch.is_none() {
+        return current_blob_store_entry(path).await?.ok_or_else(|| {
+            NanoError::Storage(format!(
+                "blob store table {} missing from staged migration database {}",
+                BLOB_STORE_TABLE_ID,
+                path.display()
+            ))
+        });
+    }
+
+    let (batch, row_count) = blob_store_batch.unwrap();
+    let namespace = open_directory_namespace(path).await?;
+    let version = write_namespace_batch(
+        namespace.clone(),
+        BLOB_STORE_TABLE_ID,
+        batch.clone(),
+        lance::dataset::WriteMode::Overwrite,
+        None,
+    )
+    .await?;
+    if let Some(published) =
+        namespace_published_version_for_table(path, BLOB_STORE_TABLE_ID, version.version).await?
+    {
+        batch_publish_namespace_versions(path, &[published]).await?;
+    }
+    let dataset_rel_path =
+        resolve_manifest_dataset_path(path, namespace, BLOB_STORE_TABLE_ID).await?;
+    Ok(DatasetEntry::internal(
+        BLOB_STORE_TABLE_ID,
+        dataset_rel_path,
+        version.version,
+        *row_count,
+    ))
 }
 
 fn build_touched_table_windows_for_migration(

@@ -289,6 +289,7 @@ impl Database {
                                 input: EmbedInput::Media {
                                     uri: source_uri.to_string(),
                                     mime_type: mime_type.to_string(),
+                                    immediate_source: None,
                                 },
                                 dim: prop.dim,
                             }

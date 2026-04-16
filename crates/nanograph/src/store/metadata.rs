@@ -88,6 +88,7 @@ impl DatabaseMetadata {
     }
 
     fn open_namespace(db_path: &Path) -> Result<Self> {
+        reconcile_migration_sidecars(db_path)?;
         if !db_path.exists() {
             return Err(NanoError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,

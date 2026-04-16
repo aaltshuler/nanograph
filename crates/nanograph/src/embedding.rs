@@ -48,6 +48,11 @@ pub(crate) enum MediaSource {
         mime_type: String,
         size_bytes: u64,
     },
+    InlineBytes {
+        label: String,
+        mime_type: String,
+        bytes: Vec<u8>,
+    },
     ManagedBlob {
         db_path: PathBuf,
         blob_id: String,
@@ -63,6 +68,7 @@ impl MediaSource {
     pub(crate) fn mime_type(&self) -> &str {
         match self {
             Self::LocalFile { mime_type, .. }
+            | Self::InlineBytes { mime_type, .. }
             | Self::ManagedBlob { mime_type, .. }
             | Self::RemoteUri { mime_type, .. } => mime_type,
         }
@@ -75,6 +81,11 @@ impl MediaSource {
                 mime_type,
                 size_bytes,
             } => format!("local:{}:{}:{}", path.display(), mime_type, size_bytes),
+            Self::InlineBytes {
+                label,
+                mime_type,
+                bytes,
+            } => format!("inline:{}:{}:{}", label, mime_type, bytes.len()),
             Self::ManagedBlob {
                 db_path,
                 blob_id,
@@ -714,6 +725,19 @@ impl EmbeddingClient {
                         },
                     }
                 }
+                MediaSource::InlineBytes {
+                    label,
+                    mime_type,
+                    bytes,
+                } => {
+                    validate_gemini_media_bytes(media_kind, mime_type, bytes, label)?;
+                    GeminiPart::InlineData {
+                        inline_data: GeminiInlineData {
+                            mime_type: mime_type.clone(),
+                            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                        },
+                    }
+                }
                 MediaSource::RemoteUri { uri, mime_type } => {
                     let parsed = reqwest::Url::parse(uri).map_err(|err| EmbedCallError {
                         message: format!("invalid media URI {}: {}", uri, err),
@@ -1249,6 +1273,7 @@ fn normalize_mock_media_key(input: &MediaSource) -> String {
             .file_stem()
             .and_then(|stem| stem.to_str())
             .map(str::to_string),
+        MediaSource::InlineBytes { label, .. } => Some(label.clone()),
         MediaSource::ManagedBlob { blob_id, .. } => Some(blob_id.clone()),
         MediaSource::RemoteUri { uri, .. } => {
             let parsed = reqwest::Url::parse(uri).ok();

@@ -17,14 +17,23 @@ use crate::store::lance_io::{
 };
 use crate::store::manifest::DatasetEntry;
 use crate::store::namespace::{
-    BLOB_STORE_TABLE_ID, namespace_latest_version, open_directory_namespace,
-    resolve_table_location, write_namespace_batch,
+    BLOB_STORE_TABLE_ID, batch_publish_namespace_versions, namespace_published_version_for_table,
+    open_directory_namespace, resolve_table_location, write_namespace_batch,
 };
+use crate::store::snapshot::read_committed_graph_snapshot;
 use crate::store::storage_generation::{StorageGeneration, detect_storage_generation};
 
 pub(crate) const BLOB_STORE_DATASET_DIR: &str = "__blob_store";
 const MANAGED_BLOB_URI_PREFIX: &str = "lanceblob://sha256/";
 const BLOB_COLUMN_NAME: &str = "blob";
+
+pub(crate) struct ManagedBlobRow {
+    pub(crate) blob_id: String,
+    pub(crate) mime: String,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) source_hint: Option<String>,
+    pub(crate) created_at: String,
+}
 
 pub(crate) fn blob_store_dataset_path(db_path: &Path) -> PathBuf {
     db_path.join(BLOB_STORE_DATASET_DIR)
@@ -89,7 +98,7 @@ pub(crate) async fn store_managed_blob(
     match detect_storage_generation(db_path)? {
         Some(StorageGeneration::V4Namespace | StorageGeneration::NamespaceLineage) => {
             let namespace = open_directory_namespace(db_path).await?;
-            write_namespace_batch(
+            let version = write_namespace_batch(
                 namespace,
                 BLOB_STORE_TABLE_ID,
                 batch,
@@ -97,6 +106,12 @@ pub(crate) async fn store_managed_blob(
                 None,
             )
             .await?;
+            if let Some(published) =
+                namespace_published_version_for_table(db_path, BLOB_STORE_TABLE_ID, version.version)
+                    .await?
+            {
+                batch_publish_namespace_versions(db_path, &[published]).await?;
+            }
         }
         None => {
             let path = blob_store_dataset_path(db_path);
@@ -146,41 +161,31 @@ pub(crate) async fn read_managed_blob_bytes(db_path: &Path, blob_id: &str) -> Re
 }
 
 async fn find_blob_row_index(db_path: &Path, blob_id: &str) -> Result<Option<(u64, usize)>> {
-    let (version, batches) = match detect_storage_generation(db_path)? {
+    let Some(entry) = readable_blob_store_entry(db_path).await? else {
+        return Ok(None);
+    };
+
+    let version = entry.dataset_version;
+    let batches = match detect_storage_generation(db_path)? {
         Some(StorageGeneration::V4Namespace | StorageGeneration::NamespaceLineage) => {
-            let namespace = open_directory_namespace(db_path).await?;
-            let version =
-                match namespace_latest_version(namespace.clone(), BLOB_STORE_TABLE_ID).await {
-                    Ok(version) => version.version,
-                    Err(_) => return Ok(None),
-                };
+            let dataset_path = db_path.join(&entry.dataset_path);
             let locator = crate::store::metadata::DatasetLocator {
                 db_path: db_path.to_path_buf(),
                 table_id: BLOB_STORE_TABLE_ID.to_string(),
-                dataset_path: PathBuf::new(),
+                dataset_path,
                 dataset_version: version,
-                row_count: 0,
-                namespace_managed: true,
+                row_count: entry.row_count,
+                namespace_managed: false,
             };
-            (
-                version,
-                crate::store::lance_io::read_lance_projected_batches_for_locator(
-                    &locator,
-                    &["blob_id"],
-                )
-                .await?,
-            )
+            crate::store::lance_io::read_lance_projected_batches_for_locator(&locator, &["blob_id"])
+                .await?
         }
         None => {
             let path = blob_store_dataset_path(db_path);
             if !path.exists() {
                 return Ok(None);
             }
-            let version = latest_lance_dataset_version(&path).await?;
-            (
-                version,
-                read_lance_projected_batches(&path, version, &["blob_id"]).await?,
-            )
+            read_lance_projected_batches(&path, version, &["blob_id"]).await?
         }
     };
     let mut row_base = 0usize;
@@ -207,7 +212,7 @@ async fn find_blob_row_index(db_path: &Path, blob_id: &str) -> Result<Option<(u6
 }
 
 pub(crate) async fn ensure_blob_store_table(db_path: &Path) -> Result<DatasetEntry> {
-    if let Some(entry) = blob_store_manifest_entry(db_path).await? {
+    if let Some(entry) = current_blob_store_entry(db_path).await? {
         return Ok(entry);
     }
 
@@ -242,18 +247,17 @@ pub(crate) async fn ensure_blob_store_table(db_path: &Path) -> Result<DatasetEnt
                 )
                 .await?;
             }
-            let version = latest_lance_dataset_version(&path).await?;
-            Ok(DatasetEntry::internal(
-                BLOB_STORE_TABLE_ID,
-                BLOB_STORE_DATASET_DIR,
-                version,
-                0,
-            ))
+            current_blob_store_entry(db_path).await?.ok_or_else(|| {
+                NanoError::Storage(format!(
+                    "blob store table {} was created but could not be reopened",
+                    BLOB_STORE_TABLE_ID
+                ))
+            })
         }
     }
 }
 
-pub(crate) async fn blob_store_manifest_entry(db_path: &Path) -> Result<Option<DatasetEntry>> {
+pub(crate) async fn current_blob_store_entry(db_path: &Path) -> Result<Option<DatasetEntry>> {
     match detect_storage_generation(db_path)? {
         Some(StorageGeneration::V4Namespace | StorageGeneration::NamespaceLineage) => {
             let namespace = open_directory_namespace(db_path).await?;
@@ -262,22 +266,19 @@ pub(crate) async fn blob_store_manifest_entry(db_path: &Path) -> Result<Option<D
                     Ok(location) => location,
                     Err(_) => return Ok(None),
                 };
-            let version = namespace_latest_version(namespace.clone(), BLOB_STORE_TABLE_ID)
-                .await?
-                .version;
-            let dataset = Dataset::open(&location)
-                .await
-                .map_err(|err| {
-                    NanoError::Lance(format!("open namespace blob store error: {}", err))
-                })?
-                .checkout_version(version)
-                .await
-                .map_err(|err| {
-                    NanoError::Lance(format!(
-                        "checkout namespace blob store version {} error: {}",
-                        version, err
-                    ))
-                })?;
+            let location_path = PathBuf::from(location.strip_prefix("file://").unwrap_or(&location));
+            let version = latest_lance_dataset_version(&location_path).await?;
+            let dataset = Dataset::open(&location).await.map_err(|err| {
+                NanoError::Lance(format!("open namespace blob store error: {}", err))
+            })?
+            .checkout_version(version)
+            .await
+            .map_err(|err| {
+                NanoError::Lance(format!(
+                    "checkout namespace blob store version {} error: {}",
+                    version, err
+                ))
+            })?;
             let row_count =
                 dataset.count_rows(None).await.map_err(|err| {
                     NanoError::Lance(format!("count blob store rows error: {}", err))
@@ -320,6 +321,23 @@ pub(crate) async fn blob_store_manifest_entry(db_path: &Path) -> Result<Option<D
     }
 }
 
+async fn readable_blob_store_entry(db_path: &Path) -> Result<Option<DatasetEntry>> {
+    match detect_storage_generation(db_path)? {
+        Some(StorageGeneration::V4Namespace | StorageGeneration::NamespaceLineage) => {
+            let snapshot = read_committed_graph_snapshot(db_path)?;
+            if let Some(entry) = snapshot
+                .datasets
+                .into_iter()
+                .find(|entry| entry.effective_table_id() == BLOB_STORE_TABLE_ID)
+            {
+                return Ok(Some(entry));
+            }
+            current_blob_store_entry(db_path).await
+        }
+        None => current_blob_store_entry(db_path).await,
+    }
+}
+
 fn empty_blob_store_batch() -> RecordBatch {
     RecordBatch::new_empty(managed_blob_schema())
 }
@@ -345,6 +363,26 @@ fn manifest_dataset_path(db_path: &Path, location: &str, fallback: &str) -> Stri
 async fn open_blob_store_dataset(db_path: &Path, version: u64) -> Result<Dataset> {
     match detect_storage_generation(db_path)? {
         Some(StorageGeneration::V4Namespace | StorageGeneration::NamespaceLineage) => {
+            if let Some(entry) = readable_blob_store_entry(db_path).await?
+                && entry.dataset_version == version
+                && !entry.dataset_path.is_empty()
+            {
+                let path = db_path.join(&entry.dataset_path);
+                let uri = path.to_string_lossy().to_string();
+                let dataset = Dataset::open(&uri).await.map_err(|err| {
+                    NanoError::Lance(format!(
+                        "open committed blob store {} error: {}",
+                        path.display(),
+                        err
+                    ))
+                })?;
+                return dataset.checkout_version(version).await.map_err(|err| {
+                    NanoError::Lance(format!(
+                        "checkout committed blob store version {} error: {}",
+                        version, err
+                    ))
+                });
+            }
             let namespace = open_directory_namespace(db_path).await?;
             let location = resolve_table_location(namespace, BLOB_STORE_TABLE_ID).await?;
             Dataset::open(&location)
@@ -383,29 +421,55 @@ fn managed_blob_record_batch(
     mime_type: &str,
     source_hint: Option<&str>,
 ) -> Result<RecordBatch> {
-    let mut blob_builder = BlobArrayBuilder::new(1);
-    blob_builder
-        .push_bytes(bytes)
-        .map_err(|err| NanoError::Storage(format!("build managed blob column: {}", err)))?;
+    let created_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string());
+
+    managed_blob_batch(&[ManagedBlobRow {
+        blob_id: blob_id.to_string(),
+        mime: mime_type.to_string(),
+        bytes: bytes.to_vec(),
+        source_hint: source_hint.map(str::to_string),
+        created_at,
+    }])
+}
+
+pub(crate) fn managed_blob_batch(rows: &[ManagedBlobRow]) -> Result<RecordBatch> {
+    let mut blob_builder = BlobArrayBuilder::new(rows.len());
+    for row in rows {
+        blob_builder
+            .push_bytes(&row.bytes)
+            .map_err(|err| NanoError::Storage(format!("build managed blob column: {}", err)))?;
+    }
     let blob_array = blob_builder
         .finish()
         .map_err(|err| NanoError::Storage(format!("finalize managed blob column: {}", err)))?;
 
     let schema = managed_blob_schema();
 
-    let created_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs().to_string())
-        .unwrap_or_else(|_| "0".to_string());
-
     RecordBatch::try_new(
         schema,
         vec![
-            Arc::new(StringArray::from(vec![blob_id.to_string()])),
-            Arc::new(StringArray::from(vec![mime_type.to_string()])),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.blob_id.clone())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.mime.clone()).collect::<Vec<_>>(),
+            )),
             blob_array,
-            Arc::new(StringArray::from(vec![source_hint.map(str::to_string)])),
-            Arc::new(StringArray::from(vec![created_at])),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.source_hint.clone())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row.created_at.clone())
+                    .collect::<Vec<_>>(),
+            )),
         ],
     )
     .map_err(|err| NanoError::Storage(format!("build managed blob batch: {}", err)))
@@ -426,6 +490,14 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::store::database::Database;
+    use crate::store::database::LoadMode;
+    use crate::store::lance_io::latest_lance_dataset_version;
+    use crate::store::migration::{MigrationStatus, execute_schema_migration};
+    use crate::store::namespace::{namespace_latest_version, open_directory_namespace};
+    use crate::store::namespace_lineage_internal::merge_namespace_lineage_internal_dataset_entries;
+    use crate::store::snapshot::read_committed_graph_snapshot;
+    use crate::{ParamMap, RunResult};
 
     #[tokio::test]
     async fn managed_blob_store_round_trips_bytes() {
@@ -464,5 +536,257 @@ mod tests {
                 .unwrap();
         let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
         assert_eq!(total_rows, 1);
+    }
+
+    #[tokio::test]
+    async fn namespace_lineage_internal_entries_track_latest_blob_store_version() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("db.nano");
+        Database::init(
+            &db_path,
+            r#"
+node Note {
+    slug: String @key
+}
+"#,
+        )
+        .await
+        .unwrap();
+
+        let committed = read_committed_graph_snapshot(&db_path).unwrap();
+        let committed_blob = committed
+            .datasets
+            .iter()
+            .find(|entry| entry.effective_table_id() == BLOB_STORE_TABLE_ID)
+            .unwrap()
+            .clone();
+
+        let uri = store_managed_blob(&db_path, b"hello", "text/plain", Some("unit-test"))
+            .await
+            .unwrap();
+        assert!(uri.starts_with("lanceblob://sha256/"));
+
+        let mut merged_entries = committed.datasets.clone();
+        merge_namespace_lineage_internal_dataset_entries(&db_path, &mut merged_entries)
+            .await
+            .unwrap();
+        let merged_blob = merged_entries
+            .iter()
+            .find(|entry| entry.effective_table_id() == BLOB_STORE_TABLE_ID)
+            .unwrap();
+
+        assert!(merged_blob.dataset_version > committed_blob.dataset_version);
+        assert_eq!(merged_blob.row_count, 1);
+    }
+
+    #[tokio::test]
+    async fn namespace_lineage_commits_blob_store_rows_visible_after_load() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("db.nano");
+        let fixture_dir = temp.path().join("fixtures");
+        std::fs::create_dir_all(&fixture_dir).unwrap();
+        let image_path = fixture_dir.join("space.png");
+        std::fs::write(&image_path, b"\x89PNG\r\n\x1a\nblob-store-visible-after-load").unwrap();
+        let data_path = fixture_dir.join("data.jsonl");
+        std::fs::write(
+            &data_path,
+            format!(
+                "{{\"type\":\"Asset\",\"data\":{{\"slug\":\"space\",\"uri\":\"@file:{}\"}}}}\n",
+                image_path.display()
+            ),
+        )
+        .unwrap();
+
+        let db = Database::init(
+            &db_path,
+            r#"
+node Asset {
+    slug: String @key
+    uri: String @media_uri(mime)
+    mime: String
+    embedding: Vector(16)?
+}
+"#,
+        )
+        .await
+        .unwrap();
+        db.load_file_with_mode(&data_path, LoadMode::Overwrite)
+            .await
+            .unwrap();
+        drop(db);
+
+        let committed = read_committed_graph_snapshot(&db_path).unwrap();
+        let committed_blob = committed
+            .datasets
+            .iter()
+            .find(|entry| entry.effective_table_id() == BLOB_STORE_TABLE_ID)
+            .unwrap();
+        let latest_blob = current_blob_store_entry(&db_path).await.unwrap().unwrap();
+        let published_blob = namespace_latest_version(
+            open_directory_namespace(&db_path).await.unwrap(),
+            BLOB_STORE_TABLE_ID,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            committed_blob.dataset_version, latest_blob.dataset_version,
+            "committed snapshot pinned blob store version {} but latest local version is {}",
+            committed_blob.dataset_version, latest_blob.dataset_version
+        );
+        assert_eq!(
+            committed_blob.dataset_version, published_blob.version,
+            "blob store version after load is not published: committed={} published={}",
+            committed_blob.dataset_version, published_blob.version
+        );
+        assert_eq!(committed_blob.row_count, 1);
+
+        let reopened = Database::open(&db_path).await.unwrap();
+        let rows = match reopened
+            .run(
+                r#"
+query asset_uri($slug: String) {
+    match { $asset: Asset { slug: $slug } }
+    return { $asset.uri as uri }
+}
+"#,
+                "asset_uri",
+                &ParamMap::from([(
+                    "slug".to_string(),
+                    crate::query::ast::Literal::String("space".to_string()),
+                )]),
+            )
+            .await
+            .unwrap()
+        {
+            RunResult::Query(rows) => rows.to_rust_json(),
+            other => panic!("expected query rows, got {:?}", other),
+        };
+        let uri = rows[0]["uri"].as_str().unwrap();
+        let blob_id = parse_managed_blob_id(uri).unwrap();
+        let bytes = read_managed_blob_bytes(&db_path, blob_id).await.unwrap();
+        assert_eq!(bytes, b"\x89PNG\r\n\x1a\nblob-store-visible-after-load");
+    }
+
+    #[tokio::test]
+    async fn namespace_lineage_preserves_blob_store_rows_across_schema_migration() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("db.nano");
+        let fixture_dir = temp.path().join("fixtures");
+        std::fs::create_dir_all(&fixture_dir).unwrap();
+        let image_path = fixture_dir.join("space.png");
+        std::fs::write(&image_path, b"\x89PNG\r\n\x1a\nblob-store-after-migration").unwrap();
+        let data_path = fixture_dir.join("data.jsonl");
+        std::fs::write(
+            &data_path,
+            format!(
+                "{{\"type\":\"Asset\",\"data\":{{\"slug\":\"space\",\"uri\":\"@file:{}\"}}}}\n",
+                image_path.display()
+            ),
+        )
+        .unwrap();
+
+        let plain_schema = r#"
+node Asset {
+    slug: String @key
+    uri: String @media_uri(mime)
+    mime: String
+    embedding: Vector(16)?
+}
+"#;
+        let embed_schema = r#"
+node Asset {
+    slug: String @key
+    uri: String @media_uri(mime)
+    mime: String
+    embedding: Vector(16)? @embed(uri)
+}
+"#;
+        let db = Database::init(&db_path, plain_schema).await.unwrap();
+        db.load_file_with_mode(&data_path, LoadMode::Overwrite)
+            .await
+            .unwrap();
+        drop(db);
+        let committed_before = read_committed_graph_snapshot(&db_path).unwrap();
+        let committed_blob_before = committed_before
+            .datasets
+            .iter()
+            .find(|entry| entry.effective_table_id() == BLOB_STORE_TABLE_ID)
+            .unwrap()
+            .clone();
+        let reopened_before = Database::open(&db_path).await.unwrap();
+        let rows_before = match reopened_before
+            .run(
+                r#"
+query asset_uri($slug: String) {
+    match { $asset: Asset { slug: $slug } }
+    return { $asset.uri as uri }
+}
+"#,
+                "asset_uri",
+                &ParamMap::from([(
+                    "slug".to_string(),
+                    crate::query::ast::Literal::String("space".to_string()),
+                )]),
+            )
+            .await
+            .unwrap()
+        {
+            RunResult::Query(rows) => rows.to_rust_json(),
+            other => panic!("expected query rows, got {:?}", other),
+        };
+        let blob_id_before = parse_managed_blob_id(rows_before[0]["uri"].as_str().unwrap()).unwrap();
+        let bytes_before = read_managed_blob_bytes(&db_path, blob_id_before).await.unwrap();
+        assert_eq!(bytes_before, b"\x89PNG\r\n\x1a\nblob-store-after-migration");
+
+        std::fs::write(db_path.join("schema.pg"), embed_schema).unwrap();
+        let migration = execute_schema_migration(&db_path, None, false, true)
+            .await
+            .unwrap();
+        assert_eq!(migration.status, MigrationStatus::Applied);
+        let committed_after = read_committed_graph_snapshot(&db_path).unwrap();
+        let committed_blob_after = committed_after
+            .datasets
+            .iter()
+            .find(|entry| entry.effective_table_id() == BLOB_STORE_TABLE_ID)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            committed_blob_after.row_count, 1,
+            "blob store row count after migration: {:?}",
+            committed_blob_after
+        );
+        assert_eq!(
+            committed_blob_after.dataset_version,
+            committed_blob_before.dataset_version,
+            "blob store version changed across schema migration: before={} after={}",
+            committed_blob_before.dataset_version,
+            committed_blob_after.dataset_version
+        );
+
+        let reopened = Database::open(&db_path).await.unwrap();
+        let rows = match reopened
+            .run(
+                r#"
+query asset_uri($slug: String) {
+    match { $asset: Asset { slug: $slug } }
+    return { $asset.uri as uri }
+}
+"#,
+                "asset_uri",
+                &ParamMap::from([(
+                    "slug".to_string(),
+                    crate::query::ast::Literal::String("space".to_string()),
+                )]),
+            )
+            .await
+            .unwrap()
+        {
+            RunResult::Query(rows) => rows.to_rust_json(),
+            other => panic!("expected query rows, got {:?}", other),
+        };
+        let uri = rows[0]["uri"].as_str().unwrap();
+        let blob_id = parse_managed_blob_id(uri).unwrap();
+        let bytes = read_managed_blob_bytes(&db_path, blob_id).await.unwrap();
+        assert_eq!(bytes, b"\x89PNG\r\n\x1a\nblob-store-after-migration");
     }
 }

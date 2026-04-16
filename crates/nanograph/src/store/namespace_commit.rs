@@ -18,9 +18,10 @@ use crate::store::lance_io::{
 };
 use crate::store::manifest::{DatasetEntry, GraphManifest};
 use crate::store::namespace::{
-    GRAPH_CHANGES_TABLE_ID, GRAPH_SNAPSHOT_TABLE_ID, GRAPH_TX_TABLE_ID, NamespacePublishedVersion,
-    StagedNamespaceTable, batch_publish_namespace_versions, dedup_namespace_published_versions,
-    namespace_latest_version, namespace_published_version_for_table, open_directory_namespace,
+    BLOB_STORE_TABLE_ID, GRAPH_CHANGES_TABLE_ID, GRAPH_SNAPSHOT_TABLE_ID, GRAPH_TX_TABLE_ID,
+    NamespacePublishedVersion, StagedNamespaceTable, batch_publish_namespace_versions,
+    dedup_namespace_published_versions, namespace_latest_version,
+    namespace_published_version_for_table, open_directory_namespace,
     resolve_or_declare_table_location,
 };
 use crate::store::v4_graph_log::{stage_graph_change_records, stage_graph_commit_record};
@@ -481,6 +482,9 @@ async fn build_snapshot_bundle_with_staged_entries_async(
     let mut published_versions = Vec::new();
     for entry in &snapshot.datasets {
         let table_id = entry.effective_table_id();
+        if table_id == BLOB_STORE_TABLE_ID {
+            continue;
+        }
         if let Some(staged) = staged_entries_by_id.get(table_id) {
             published_versions.push(staged.published_version.clone());
             continue;

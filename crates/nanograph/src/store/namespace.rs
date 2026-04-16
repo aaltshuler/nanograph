@@ -309,12 +309,15 @@ pub(crate) async fn namespace_published_version_for_table(
     table_id: &str,
     version: u64,
 ) -> Result<Option<NamespacePublishedVersion>> {
-    let namespace = open_directory_namespace(db_path).await?;
-    if let Ok(current) = namespace_latest_version(namespace.clone(), table_id).await
-        && current.version >= version
+    let manifest_ns = open_manifest_namespace(db_path).await?;
+    if manifest_ns
+        .describe_table_version(&table_id_parts(table_id), version as i64)
+        .await
+        .is_ok()
     {
         return Ok(None);
     }
+    let namespace = open_directory_namespace(db_path).await?;
     let location = resolve_or_declare_table_location(namespace, table_id).await?;
     let dataset = Dataset::open(&location)
         .await

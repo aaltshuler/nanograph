@@ -7,6 +7,7 @@ use arrow_schema::{DataType, Field, Schema};
 use nanograph::store::metadata::DatabaseMetadata;
 use nanograph::store::txlog::{
     VisibleCdcSource, read_visible_cdc_entries, read_visible_cdc_entries_with_source,
+    read_visible_change_rows,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -18,6 +19,27 @@ static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
 fn write_file(path: &Path, content: &str) {
     std::fs::write(path, content).unwrap();
+}
+
+fn version_dataset_entries(payload: &serde_json::Value) -> Vec<&serde_json::Value> {
+    payload["db"]["dataset_versions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .collect()
+}
+
+fn version_data_dataset_path(
+    payload: &serde_json::Value,
+    kind: &str,
+    type_name: &str,
+) -> String {
+    version_dataset_entries(payload)
+        .into_iter()
+        .find(|entry| entry["kind"] == kind && entry["type_name"] == type_name)
+        .and_then(|entry| entry["dataset_path"].as_str())
+        .unwrap()
+        .to_string()
 }
 
 #[test]
@@ -1175,11 +1197,16 @@ edge Knows: Person -> Person"#,
         Some(1),
         "expected one committed load version"
     );
-    assert_eq!(version["db"]["dataset_count"].as_u64(), Some(2));
+    let dataset_versions = version_dataset_entries(&version);
     assert_eq!(
-        version["db"]["dataset_versions"].as_array().unwrap().len(),
-        2
+        version["db"]["dataset_count"].as_u64(),
+        Some(dataset_versions.len() as u64)
     );
+    let user_datasets = dataset_versions
+        .iter()
+        .filter(|entry| matches!(entry["kind"].as_str(), Some("node" | "edge")))
+        .count();
+    assert_eq!(user_datasets, 2);
 
     let metadata = DatabaseMetadata::open(&db_path).unwrap();
     let describe = build_describe_payload(&db_path, &metadata, None).unwrap();
@@ -1308,7 +1335,12 @@ query image_embedding($slug: String) {
         .as_object()
         .unwrap();
     assert_eq!(image["mime"].as_str(), Some("image/png"));
-    assert!(image["uri"].as_str().unwrap().starts_with("file://"));
+    assert!(
+        image["uri"]
+            .as_str()
+            .unwrap()
+            .starts_with("lanceblob://sha256/")
+    );
     let embedding_values = image["embedding"]
         .as_array()
         .unwrap()
@@ -1432,9 +1464,7 @@ async fn describe_uses_manifest_metadata_without_opening_datasets() {
         .unwrap();
 
     let manifest = build_version_payload(Some(&db_path)).unwrap();
-    let dataset_path = manifest["db"]["dataset_versions"][0]["dataset_path"]
-        .as_str()
-        .unwrap();
+    let dataset_path = version_data_dataset_path(&manifest, "node", "Person");
     std::fs::remove_dir_all(db_path.join(dataset_path)).unwrap();
 
     let metadata = DatabaseMetadata::open(&db_path).unwrap();
@@ -1479,9 +1509,7 @@ query people() {
         .unwrap();
 
     let manifest = build_version_payload(Some(&db_path)).unwrap();
-    let dataset_path = manifest["db"]["dataset_versions"][0]["dataset_path"]
-        .as_str()
-        .unwrap();
+    let dataset_path = version_data_dataset_path(&manifest, "node", "Person");
     std::fs::remove_dir_all(db_path.join(dataset_path)).unwrap();
 
     cmd_lint(Some(db_path), &query_path, None, true, true)
@@ -1490,7 +1518,7 @@ query people() {
 }
 
 #[tokio::test]
-async fn changes_no_embeddings_uses_schema_ir_without_opening_datasets() {
+async fn changes_no_embeddings_still_requires_visible_cdc_history() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("db");
     let schema_path = dir.path().join("schema.pg");
@@ -1509,7 +1537,7 @@ async fn changes_no_embeddings_uses_schema_ir_without_opening_datasets() {
         r#"{"type":"Person","data":{"slug":"alice","summary":"Alpha","embedding":[1.0,0.0,0.0]}}"#,
     );
 
-    cmd_init(&db_path, &schema_path, false, false)
+    Database::init_with_generation(&db_path, &std::fs::read_to_string(&schema_path).unwrap(), StorageGeneration::V4Namespace)
         .await
         .unwrap();
     cmd_load(&db_path, &data_path, LoadModeArg::Overwrite, false, false)
@@ -1517,12 +1545,10 @@ async fn changes_no_embeddings_uses_schema_ir_without_opening_datasets() {
         .unwrap();
 
     let manifest = build_version_payload(Some(&db_path)).unwrap();
-    let dataset_path = manifest["db"]["dataset_versions"][0]["dataset_path"]
-        .as_str()
-        .unwrap();
+    let dataset_path = version_data_dataset_path(&manifest, "node", "Person");
     std::fs::remove_dir_all(db_path.join(dataset_path)).unwrap();
 
-    cmd_changes(
+    let err = cmd_changes(
         &db_path,
         None,
         None,
@@ -1533,7 +1559,13 @@ async fn changes_no_embeddings_uses_schema_ir_without_opening_datasets() {
         VisibleCdcSource::Authoritative,
     )
     .await
-    .unwrap();
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("lineage-backed CDC is incomplete")
+            || err
+                .to_string()
+                .contains("historical table versions are unavailable")
+    );
 }
 
 #[tokio::test]
@@ -1961,11 +1993,11 @@ query rename_person($slug: String, $name: String) {
         .unwrap();
     assert_eq!(affected_nodes.value(0), 1);
 
-    let cdc_rows = read_visible_cdc_entries(&db_path, 0, None).unwrap();
-    let update_row = cdc_rows.last().unwrap();
-    assert_eq!(update_row.op, "update");
+    let change_rows = read_visible_change_rows(&db_path, 1, None).unwrap();
+    let update_row = change_rows.last().unwrap();
+    assert_eq!(update_row.change_kind, "update");
     assert_eq!(update_row.type_name, "Person");
-    assert_eq!(update_row.payload["after"]["name"], "Alice Cooper");
+    assert_eq!(update_row.row["name"], "Alice Cooper");
 }
 
 #[tokio::test]
@@ -2127,9 +2159,9 @@ query remove_work($from: String) {
     let works_at = build_describe_payload(&db_path, &metadata, Some("WorksAt")).unwrap();
     assert_eq!(works_at["edges"][0]["rows"].as_u64(), Some(0));
 
-    let cdc_rows = read_visible_cdc_entries(&db_path, 0, None).unwrap();
-    let delete_row = cdc_rows.last().unwrap();
-    assert_eq!(delete_row.op, "delete");
+    let change_rows = read_visible_change_rows(&db_path, 1, None).unwrap();
+    let delete_row = change_rows.last().unwrap();
+    assert_eq!(delete_row.change_kind, "delete");
     assert_eq!(delete_row.type_name, "WorksAt");
 }
 
@@ -2211,9 +2243,9 @@ query remove_project($slug: String) {
     let projects = build_describe_payload(&db_path, &metadata, Some("Project")).unwrap();
     assert_eq!(projects["nodes"][0]["rows"].as_u64(), Some(0));
 
-    let cdc_rows = read_visible_cdc_entries(&db_path, 0, None).unwrap();
-    let delete_row = cdc_rows.last().unwrap();
-    assert_eq!(delete_row.op, "delete");
+    let change_rows = read_visible_change_rows(&db_path, 1, None).unwrap();
+    let delete_row = change_rows.last().unwrap();
+    assert_eq!(delete_row.change_kind, "delete");
     assert_eq!(delete_row.type_name, "Project");
 }
 
@@ -2393,5 +2425,8 @@ async fn storage_migrate_rejects_already_v4_database() {
     let err = cmd_storage_migrate(&db_path, StorageTargetArg::LanceV4, false, true)
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("already uses lance-v4 storage"));
+    assert!(
+        err.to_string()
+            .contains("already uses NamespaceLineage storage")
+    );
 }

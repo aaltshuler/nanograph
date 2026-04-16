@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use base64::Engine;
 use url::Url;
 
+use crate::embedding::MediaSource;
 use crate::error::{NanoError, Result};
 use crate::store::blob_store::store_managed_blob_blocking;
 
@@ -11,6 +12,7 @@ use crate::store::blob_store::store_managed_blob_blocking;
 pub(crate) struct ResolvedMediaValue {
     pub(crate) uri: String,
     pub(crate) mime_type: String,
+    pub(crate) embed_source: Option<MediaSource>,
 }
 
 pub(crate) fn resolve_media_value(
@@ -43,7 +45,15 @@ pub(crate) fn resolve_media_value(
             &mime_type,
             Some(&source_path.to_string_lossy()),
         )?;
-        return Ok(ResolvedMediaValue { uri, mime_type });
+        return Ok(ResolvedMediaValue {
+            uri,
+            mime_type: mime_type.clone(),
+            embed_source: Some(MediaSource::LocalFile {
+                path: source_path,
+                mime_type,
+                size_bytes: bytes.len() as u64,
+            }),
+        });
     }
 
     if let Some(data) = raw_value.strip_prefix("@base64:") {
@@ -62,7 +72,16 @@ pub(crate) fn resolve_media_value(
             &mime_type,
             Some(&format!("inline-base64:{}:{}", type_name, prop_name)),
         )?;
-        return Ok(ResolvedMediaValue { uri, mime_type });
+        let label = format!("inline-base64:{}:{}", type_name, prop_name);
+        return Ok(ResolvedMediaValue {
+            uri,
+            mime_type: mime_type.clone(),
+            embed_source: Some(MediaSource::InlineBytes {
+                label,
+                mime_type,
+                bytes,
+            }),
+        });
     }
 
     if let Some(uri) = raw_value.strip_prefix("@uri:") {
@@ -82,6 +101,7 @@ pub(crate) fn resolve_media_value(
         return Ok(ResolvedMediaValue {
             uri: uri.to_string(),
             mime_type,
+            embed_source: None,
         });
     }
 

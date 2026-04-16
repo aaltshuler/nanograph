@@ -55,7 +55,7 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Rust toolchain
-        run: rustup toolchain install 1.91.0 --profile minimal --component clippy
+        run: rustup toolchain install 1.94.1 --profile minimal --component clippy
 
       - name: Cache cargo registry and build
         uses: actions/cache@v4
@@ -94,7 +94,7 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Rust toolchain
-        run: rustup toolchain install 1.91.0 --profile minimal
+        run: rustup toolchain install 1.94.1 --profile minimal
 
       - name: Cache cargo registry and build
         uses: actions/cache@v4
@@ -129,7 +129,7 @@ jobs:
           node-version: "20"
 
       - name: Install Rust toolchain
-        run: rustup toolchain install 1.91.0 --profile minimal
+        run: rustup toolchain install 1.94.1 --profile minimal
 
       - name: Cache cargo registry and build
         uses: actions/cache@v4
@@ -175,7 +175,7 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Rust toolchain
-        run: rustup toolchain install 1.91.0 --profile minimal
+        run: rustup toolchain install 1.94.1 --profile minimal
 
       - name: Cache cargo registry and build
         uses: actions/cache@v4

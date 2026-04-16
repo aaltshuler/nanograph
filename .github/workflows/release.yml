@@ -22,7 +22,7 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Rust toolchain
-        run: rustup toolchain install 1.91.0 --profile minimal
+        run: rustup toolchain install 1.94.1 --profile minimal
 
       - name: Install macOS Rust target
         run: rustup target add aarch64-apple-darwin

@@ -46,7 +46,11 @@ pub(crate) enum EmbedSourceKind {
 #[derive(Debug, Clone)]
 pub(crate) enum EmbedInput {
     Text(String),
-    Media { uri: String, mime_type: String },
+    Media {
+        uri: String,
+        mime_type: String,
+        immediate_source: Option<MediaSource>,
+    },
 }
 
 impl EmbedValueRequest {
@@ -59,7 +63,7 @@ impl EmbedValueRequest {
                 chunk_chars: chunking.chunk_chars,
                 chunk_overlap_chars: chunking.chunk_overlap_chars,
             },
-            EmbedInput::Media { uri, mime_type } => CacheKey {
+            EmbedInput::Media { uri, mime_type, .. } => CacheKey {
                 model: model.to_string(),
                 dim: self.dim,
                 content_hash: hash_string(&format!("media:{}:{}", mime_type, uri)),
@@ -280,8 +284,14 @@ async fn resolve_embedding_requests_with_chunking(
                     entries.push((key, source_text.clone()));
                 }
             }
-            EmbedInput::Media { uri, mime_type } => {
-                let media = media_source_from_uri(db_path, uri, mime_type)?;
+            EmbedInput::Media {
+                uri,
+                mime_type,
+                immediate_source,
+            } => {
+                let media = immediate_source
+                    .clone()
+                    .unwrap_or(media_source_from_uri(db_path, uri, mime_type)?);
                 let entries = missing_media_by_dim.entry(request.dim).or_default();
                 if !entries.iter().any(|(existing, _)| existing == &key) {
                     entries.push((key, media));
@@ -644,8 +654,14 @@ async fn materialize_embeddings_for_load_inner_with_chunking(
                     entries.push((key, source_text.clone()));
                 }
             }
-            EmbedInput::Media { uri, mime_type } => {
-                let media = media_source_from_uri(db_path, uri, mime_type)?;
+            EmbedInput::Media {
+                uri,
+                mime_type,
+                immediate_source,
+            } => {
+                let media = immediate_source
+                    .clone()
+                    .unwrap_or(media_source_from_uri(db_path, uri, mime_type)?);
                 let entries = missing_media_by_dim
                     .entry(assignment.request.dim)
                     .or_default();
@@ -956,6 +972,7 @@ fn build_embed_request_for_data_obj(
                 input: EmbedInput::Media {
                     uri: resolved.uri,
                     mime_type: resolved.mime_type,
+                    immediate_source: resolved.embed_source,
                 },
                 dim: spec.dim,
             }))
@@ -1043,9 +1060,15 @@ async fn resolve_pending_stream_batch(
         if seen_keys.insert(cache_key.clone()) {
             match &assignment.request.input {
                 EmbedInput::Text(text) => unique_text_entries.push((cache_key, text.clone())),
-                EmbedInput::Media { uri, mime_type } => unique_media_entries.push((
+                EmbedInput::Media {
+                    uri,
+                    mime_type,
+                    immediate_source,
+                } => unique_media_entries.push((
                     cache_key,
-                    media_source_from_uri(runtime.db_path, uri, mime_type)?,
+                    immediate_source
+                        .clone()
+                        .unwrap_or(media_source_from_uri(runtime.db_path, uri, mime_type)?),
                 )),
             }
         }

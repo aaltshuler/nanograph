@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use crate::error::Result;
-use crate::store::blob_store::{blob_store_manifest_entry, ensure_blob_store_table};
+use crate::store::blob_store::{current_blob_store_entry, ensure_blob_store_table};
 use crate::store::manifest::DatasetEntry;
 use crate::store::storage_generation::{StorageGeneration, detect_storage_generation};
 use crate::store::v4_graph_log::{ensure_graph_changes_table, ensure_graph_tx_table};
@@ -20,7 +20,7 @@ pub(crate) async fn ensure_v4_internal_dataset_entries(
     entries.push(ensure_graph_tx_table(db_path).await?);
     entries.push(ensure_graph_changes_table(db_path).await?);
     entries.push(
-        blob_store_manifest_entry(db_path)
+        current_blob_store_entry(db_path)
             .await?
             .unwrap_or(ensure_blob_store_table(db_path).await?),
     );

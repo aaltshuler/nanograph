@@ -12,10 +12,10 @@ use url::Url;
 use nanograph::query::parser::parse_query;
 use nanograph::query::typecheck::{CheckedQuery, typecheck_query, typecheck_query_decl};
 use nanograph::schema::parser::parse_schema;
-use nanograph::schema_ir::SchemaIR;
 use nanograph::store::database::{Database, LoadMode};
 use nanograph::store::export::build_export_rows_at_path;
 use nanograph::store::manifest::GraphManifest;
+use nanograph::store::snapshot::read_committed_graph_snapshot;
 use nanograph::store::txlog::read_visible_cdc_entries;
 use nanograph::store::{scalar_index_name, text_index_name, vector_index_name};
 use nanograph::{MutationExecResult, ParamMap, build_catalog};
@@ -187,6 +187,27 @@ fn manifest_dataset_version(manifest: &GraphManifest, kind: &str, type_name: &st
         .find(|entry| entry.kind == kind && entry.type_name == type_name)
         .map(|entry| entry.dataset_version)
         .unwrap()
+}
+
+fn manifest_dataset_rel_path(manifest: &GraphManifest, kind: &str, type_name: &str) -> String {
+    manifest
+        .datasets
+        .iter()
+        .find(|entry| entry.kind == kind && entry.type_name == type_name)
+        .map(|entry| entry.dataset_path.clone())
+        .unwrap()
+}
+
+fn dataset_uri_for_db(
+    db_path: &std::path::Path,
+    manifest: &GraphManifest,
+    kind: &str,
+    type_name: &str,
+) -> String {
+    db_path
+        .join(manifest_dataset_rel_path(manifest, kind, type_name))
+        .to_string_lossy()
+        .to_string()
 }
 
 async fn run_query_test(query_str: &str, db: &Database) -> Vec<RecordBatch> {
@@ -568,10 +589,8 @@ async fn test_indexed_point_lookup_after_persist_and_reopen() {
         .node_types()
         .find(|n| n.name == "Person")
         .unwrap();
-    let dataset_path = db_path
-        .join("nodes")
-        .join(SchemaIR::dir_name(person.type_id));
-    let dataset = Dataset::open(dataset_path.to_string_lossy().as_ref())
+    let manifest = read_committed_graph_snapshot(&db_path).unwrap();
+    let dataset = Dataset::open(&dataset_uri_for_db(&db_path, &manifest, "node", "Person"))
         .await
         .unwrap();
     let index_names: HashSet<String> = dataset
@@ -622,8 +641,8 @@ async fn test_nearest_query_on_indexed_vectors() {
     db.load(vector_test_data()).await.unwrap();
 
     let doc = db.schema_ir.node_types().find(|n| n.name == "Doc").unwrap();
-    let dataset_path = db_path.join("nodes").join(SchemaIR::dir_name(doc.type_id));
-    let dataset = Dataset::open(dataset_path.to_string_lossy().as_ref())
+    let manifest = read_committed_graph_snapshot(&db_path).unwrap();
+    let dataset = Dataset::open(&dataset_uri_for_db(&db_path, &manifest, "node", "Doc"))
         .await
         .unwrap();
     let index_names: HashSet<String> = dataset
@@ -682,8 +701,8 @@ async fn test_native_text_index_created_and_queries_work_after_reopen() {
     db.load(text_search_test_data()).await.unwrap();
 
     let doc = db.schema_ir.node_types().find(|n| n.name == "Doc").unwrap();
-    let dataset_path = db_path.join("nodes").join(SchemaIR::dir_name(doc.type_id));
-    let dataset = Dataset::open(dataset_path.to_string_lossy().as_ref())
+    let manifest = read_committed_graph_snapshot(&db_path).unwrap();
+    let dataset = Dataset::open(&dataset_uri_for_db(&db_path, &manifest, "node", "Doc"))
         .await
         .unwrap();
     let index_names: HashSet<String> = dataset
@@ -1557,7 +1576,7 @@ async fn test_update_mutation_query_preserves_id_and_edges() {
         .await
         .unwrap();
     db.load(keyed_mutation_data()).await.unwrap();
-    let manifest_before = GraphManifest::read(&db_path).unwrap();
+    let manifest_before = read_committed_graph_snapshot(&db_path).unwrap();
 
     let before_rows = export_rows_for_db(&db).await;
     let alice_id_before = before_rows
@@ -1618,7 +1637,7 @@ query q() {
         "edge_count",
     );
     assert_eq!(edge_count, vec![1]);
-    let manifest_after = GraphManifest::read(&db_path).unwrap();
+    let manifest_after = read_committed_graph_snapshot(&db_path).unwrap();
     assert!(
         manifest_dataset_version(&manifest_after, "node", "Person")
             > manifest_dataset_version(&manifest_before, "node", "Person")

@@ -466,6 +466,22 @@ impl Database {
         ))
     }
 
+    /// Build a database handle from already-open metadata without reopening
+    /// or validating unrelated datasets again.
+    pub fn open_from_metadata(metadata: DatabaseMetadata) -> Result<Self> {
+        let schema_ir = metadata.schema_ir().clone();
+        let catalog = metadata.catalog().clone();
+        let runtime = Arc::new(DatabaseRuntime::from_metadata(&metadata));
+
+        Ok(Self::from_parts(
+            metadata.path().to_path_buf(),
+            schema_ir,
+            catalog,
+            runtime,
+            None,
+        ))
+    }
+
     fn from_parts(
         path: PathBuf,
         schema_ir: SchemaIR,

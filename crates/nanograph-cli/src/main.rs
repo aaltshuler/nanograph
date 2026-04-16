@@ -625,7 +625,11 @@ async fn dispatch_cli(
                 None
             };
             let query = config.resolve_query_path(&query)?;
-            let schema = config.resolve_optional_schema_path(schema);
+            let schema = if schema.is_some() || db.is_none() {
+                config.resolve_optional_schema_path(schema)
+            } else {
+                None
+            };
             cmd_lint(db, &query, schema.as_deref(), json, quiet).await
         }
         Commands::Run {
@@ -2259,7 +2263,7 @@ async fn execute_lance_first_query(
     params: &ParamMap,
 ) -> Result<Vec<RecordBatch>> {
     let _ = lower_query(metadata.catalog(), query, &plan.type_ctx)?;
-    let db = Database::open(metadata.path()).await?;
+    let db = Database::open_from_metadata(metadata.clone())?;
     let runtime_params = params_with_runtime_now(params)?;
     match db.run_query(query, &runtime_params).await? {
         nanograph::RunResult::Query(result) => Ok(result.into_batches()),
