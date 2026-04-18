@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use arrow_array::builder::BooleanBuilder;
-use arrow_array::{Array, BooleanArray, RecordBatch, StringArray, UInt64Array};
+use arrow_array::{Array, BooleanArray, RecordBatch, UInt64Array};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use tracing::{debug, info, warn};
 
@@ -1012,7 +1012,7 @@ pub async fn run_mutation_query_sparse(
                 else {
                     return Ok(MutationResult::default());
                 };
-                let delete_pred = map_sparse_edge_delete_predicate(
+                let Some(delete_pred) = map_sparse_edge_delete_predicate(
                     &metadata,
                     &delete.type_name,
                     &delete.predicate.property,
@@ -1020,7 +1020,10 @@ pub async fn run_mutation_query_sparse(
                     &delete.predicate.value,
                     &runtime_params,
                 )
-                .await?;
+                .await?
+                else {
+                    return Ok(MutationResult::default());
+                };
                 let delete_mask = crate::store::database::build_delete_mask_for_mutation(
                     &target_batch,
                     &delete_pred,
@@ -1809,7 +1812,7 @@ async fn map_sparse_edge_delete_predicate(
     op: CompOp,
     value: &MatchValue,
     params: &crate::ParamMap,
-) -> Result<DeletePredicate> {
+) -> Result<Option<DeletePredicate>> {
     let delete_op = comp_op_to_delete_op(op)?;
     match property {
         "from" => {
@@ -1819,17 +1822,20 @@ async fn map_sparse_edge_delete_predicate(
                 .get(edge_type_name)
                 .ok_or_else(|| {
                     NanoError::Execution(format!("unknown edge type `{}`", edge_type_name))
-                })?;
+            })?;
             let endpoint = resolve_mutation_match_value(value, params)?;
             let endpoint_name = literal_to_endpoint_name(&endpoint, "from")?;
-            let src_id =
+            let Some(src_id) =
                 resolve_sparse_node_id_by_name(metadata, &edge_type.from_type, &endpoint_name)
-                    .await?;
-            Ok(DeletePredicate {
+                    .await?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(DeletePredicate {
                 property: "src".to_string(),
                 op: delete_op,
                 value: src_id.to_string(),
-            })
+            }))
         }
         "to" => {
             let edge_type = metadata
@@ -1838,23 +1844,26 @@ async fn map_sparse_edge_delete_predicate(
                 .get(edge_type_name)
                 .ok_or_else(|| {
                     NanoError::Execution(format!("unknown edge type `{}`", edge_type_name))
-                })?;
+            })?;
             let endpoint = resolve_mutation_match_value(value, params)?;
             let endpoint_name = literal_to_endpoint_name(&endpoint, "to")?;
-            let dst_id =
+            let Some(dst_id) =
                 resolve_sparse_node_id_by_name(metadata, &edge_type.to_type, &endpoint_name)
-                    .await?;
-            Ok(DeletePredicate {
+                    .await?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(DeletePredicate {
                 property: "dst".to_string(),
                 op: delete_op,
                 value: dst_id.to_string(),
-            })
+            }))
         }
-        _ => Ok(DeletePredicate {
+        _ => Ok(Some(DeletePredicate {
             property: property.to_string(),
             op: delete_op,
             value: literal_to_predicate_string(&resolve_mutation_match_value(value, params)?)?,
-        }),
+        })),
     }
 }
 
@@ -1862,12 +1871,16 @@ pub(crate) async fn resolve_sparse_node_id_by_name(
     metadata: &DatabaseMetadata,
     node_type: &str,
     node_name: &str,
-) -> Result<u64> {
-    let batch = read_sparse_node_batch(metadata, node_type)
-        .await?
+) -> Result<Option<u64>> {
+    let Some(batch) = read_sparse_node_batch(metadata, node_type).await? else {
+        return Ok(None);
+    };
+    let key_prop = metadata
+        .schema_ir()
+        .node_key_property_name(node_type)
         .ok_or_else(|| {
             NanoError::Execution(format!(
-                "edge endpoint lookup failed: node type `{}` has no rows",
+                "edge endpoint lookup requires node type `{}` to declare @key",
                 node_type
             ))
         })?;
@@ -1878,33 +1891,22 @@ pub(crate) async fn resolve_sparse_node_id_by_name(
         .as_any()
         .downcast_ref::<UInt64Array>()
         .ok_or_else(|| NanoError::Execution("node id column is not UInt64".to_string()))?;
-    let name_col = batch
-        .column_by_name("name")
+    let key_col = batch
+        .column_by_name(key_prop)
         .ok_or_else(|| {
             NanoError::Execution(format!(
-                "edge endpoint lookup requires node type `{}` to have `name` property",
-                node_type
-            ))
-        })?
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| {
-            NanoError::Execution(format!(
-                "edge endpoint lookup requires `{}`.name to be String",
-                node_type
+                "edge endpoint lookup requires node type `{}` to materialize @key property `{}`",
+                node_type, key_prop
             ))
         })?;
 
     for row in 0..batch.num_rows() {
-        if !name_col.is_null(row) && name_col.value(row) == node_name {
-            return Ok(id_col.value(row));
+        if edge_endpoint_lookup_value(key_col, row).as_deref() == Some(node_name) {
+            return Ok(Some(id_col.value(row)));
         }
     }
 
-    Err(NanoError::Execution(format!(
-        "edge endpoint node not found: {}:{}",
-        node_type, node_name
-    )))
+    Ok(None)
 }
 
 fn resolve_mutation_match_value(value: &MatchValue, params: &crate::ParamMap) -> Result<Literal> {
@@ -1969,10 +1971,25 @@ fn literal_to_predicate_string(lit: &Literal) -> Result<String> {
 fn literal_to_endpoint_name(lit: &Literal, endpoint: &str) -> Result<String> {
     match lit {
         Literal::String(s) => Ok(s.clone()),
+        Literal::Integer(i) => Ok(i.to_string()),
+        Literal::Float(f) => Ok(f.to_string()),
+        Literal::Bool(b) => Ok(b.to_string()),
+        Literal::Date(s) => Ok(s.clone()),
+        Literal::DateTime(s) => Ok(s.clone()),
         _ => Err(NanoError::Execution(format!(
-            "edge endpoint `{}` must be a String literal or String parameter",
+            "edge endpoint `{}` must be a scalar literal or scalar parameter",
             endpoint
         ))),
+    }
+}
+
+fn edge_endpoint_lookup_value(array: &arrow_array::ArrayRef, row: usize) -> Option<String> {
+    match array_value_to_json(array, row) {
+        JsonValue::Null => None,
+        JsonValue::String(value) => Some(value),
+        JsonValue::Number(value) => Some(value.to_string()),
+        JsonValue::Bool(value) => Some(value.to_string()),
+        JsonValue::Array(_) | JsonValue::Object(_) => None,
     }
 }
 
