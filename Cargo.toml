@@ -5,6 +5,7 @@ members = [
     "crates/nanograph-cli",
     "crates/nanograph-ts",
     "crates/nanograph-ffi",
+    "crates/nanograph-py",
 ]
 default-members = [
     "crates/nanograph",
